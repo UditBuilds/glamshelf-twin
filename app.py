@@ -453,7 +453,13 @@ def webhook():
         message_type = (data.get("type") or "").strip().lower()
         wa_id = (data.get("waId") or "").strip()
         sender_name = (data.get("senderName") or "").strip()
-        text_body = ((data.get("text") or {}).get("body") or "").strip()
+        # WATI sometimes sends `text` as a dict ({"body": "..."}) and sometimes
+        # as a plain string. Handle both shapes defensively.
+        text_field = data.get("text")
+        if isinstance(text_field, dict):
+            text_body = (text_field.get("body") or "").strip()
+        else:
+            text_body = (text_field or "").strip()
         msg_id = (data.get("id") or "").strip()
 
         print(
