@@ -14,8 +14,9 @@ Auth: ANTHROPIC_API_KEY environment variable.
 import json
 import os
 import sys
+import tempfile
+import time
 import traceback
-from collections import deque
 from functools import wraps
 from pathlib import Path
 
@@ -85,12 +86,71 @@ BUSINESS_NUMBER = os.environ.get("BUSINESS_NUMBER", "919217470151")
 # blocked from receiving auto-replies, both are skipped on inbound.
 OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "919217470151")
 
-# In-memory dedup of recent inbound message IDs. Best-effort:
-#   - Doesn't survive worker restarts
-#   - Isn't shared across gunicorn workers (Render uses 1 worker by default)
-# But it stops the common loop case (WATI re-firing the same message id)
-# within a single worker, which is what we observed in the spam logs.
-_seen_ids: deque = deque(maxlen=500)
+# Recent message-id dedup. Backed by a short-lived cache file in the OS
+# temp dir so the dedup set survives worker restarts within a single
+# deploy — without this, every Render worker recycle re-opens the
+# WATI echo loop because in-memory state is gone.
+#
+# Caveats:
+#   - File is wiped on Render redeploy (ephemeral filesystem) — that's fine,
+#     a redeploy means new code anyway.
+#   - Not synchronised across multiple gunicorn workers, but Render uses 1
+#     by default. With concurrent workers worst-case is occasional duplicate
+#     processing, not a true loop.
+DEDUP_CACHE_FILE = os.path.join(tempfile.gettempdir(), "glamshelf_seen_ids.txt")
+DEDUP_MAX_AGE_SECONDS = 60 * 60  # 1 hour — long enough to cover the loop window
+
+
+def _load_seen_ids() -> set[str]:
+    """Read recent message IDs from the cache file and prune anything older
+    than DEDUP_MAX_AGE_SECONDS. Rewrites the file with only the valid
+    entries so it doesn't grow unbounded across restarts.
+
+    File format: one entry per line, "<unix_timestamp>\t<msg_id>".
+    """
+    if not os.path.exists(DEDUP_CACHE_FILE):
+        return set()
+    cutoff = time.time() - DEDUP_MAX_AGE_SECONDS
+    valid: list[tuple[str, str]] = []
+    try:
+        with open(DEDUP_CACHE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t", 1)
+                if len(parts) != 2:
+                    continue
+                ts_str, mid = parts
+                try:
+                    if float(ts_str) >= cutoff:
+                        valid.append((ts_str, mid))
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"[DEDUP] Failed to load cache: {type(e).__name__}: {e}")
+        return set()
+
+    # Rewrite with only the still-valid entries (best effort — silently
+    # ignore failures so a corrupt cache never breaks the webhook).
+    try:
+        with open(DEDUP_CACHE_FILE, "w", encoding="utf-8") as f:
+            for ts_str, mid in valid:
+                f.write(f"{ts_str}\t{mid}\n")
+    except Exception as e:
+        print(f"[DEDUP] Failed to rewrite cache: {type(e).__name__}: {e}")
+
+    return {mid for _, mid in valid}
+
+
+def _persist_seen_id(msg_id: str) -> None:
+    """Append a freshly-processed message id to the cache file. Best effort."""
+    try:
+        with open(DEDUP_CACHE_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.time()}\t{msg_id}\n")
+    except Exception as e:
+        print(f"[DEDUP] Failed to persist {msg_id}: {type(e).__name__}: {e}")
+
+
+_seen_ids: set[str] = _load_seen_ids()
+print(f"[DEDUP] Loaded {len(_seen_ids)} recent message ids from {DEDUP_CACHE_FILE}")
 
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
@@ -542,19 +602,6 @@ def webhook():
             f"sender={sender_name!r} msg_id={msg_id!r}"
         )
 
-        # PRIMARY LOOP FIX — skip outbound/echo events.
-        # WATI fires webhook events for OUR replies too, not just inbound
-        # customer messages. owner / isOwner / fromMe are the various flags
-        # WATI uses across plans / endpoints to mark "we sent this".
-        if data.get("owner") or data.get("isOwner") or data.get("fromMe"):
-            print(
-                f"[WEBHOOK] Skipped: outbound/echo event "
-                f"(owner={data.get('owner')!r}, "
-                f"isOwner={data.get('isOwner')!r}, "
-                f"fromMe={data.get('fromMe')!r})"
-            )
-            return jsonify({"status": "ok"}), 200
-
         # Skip non-text events (images, audio, video, documents, stickers, status updates).
         if message_type != "text":
             print(f"[WEBHOOK] Skipped: non-text message type {message_type!r}")
@@ -576,14 +623,18 @@ def webhook():
             print(f"[WEBHOOK] Skipped: message from protected number {wa_id}")
             return jsonify({"status": "ok"}), 200
 
-        # Best-effort dedup: skip if we've recently processed this same
-        # message id in this worker (handles WATI retries and any echo
-        # paths the owner/eventType filters above don't catch).
+        # PRIMARY LOOP DEFENSE — dedup by message id.
+        # WATI fires webhook events for our outbound replies too, but those
+        # echo events do NOT carry an owner/isOwner/fromMe flag in the
+        # payload (confirmed empirically). What they DO have is the same
+        # message id, repeated. Persisting the seen set across worker
+        # restarts is what stops the loop after a redeploy / worker recycle.
         if msg_id and msg_id in _seen_ids:
             print(f"[WEBHOOK] Skipped: duplicate message id {msg_id}")
             return jsonify({"status": "ok"}), 200
         if msg_id:
-            _seen_ids.append(msg_id)
+            _seen_ids.add(msg_id)
+            _persist_seen_id(msg_id)
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
 
