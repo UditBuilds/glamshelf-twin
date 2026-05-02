@@ -867,6 +867,10 @@ def dashboard_data():
         cur = conn.cursor()
 
         # ---- KPIs (today) ----
+        # `pending` = rows whose status isn't one of the known terminal
+        # outcomes. Always 0 today (every code path writes one of the listed
+        # statuses), but it's a placeholder for a future approval/queue state.
+        # `closed` is hardcoded 0 — same — until a CLOSED status is introduced.
         cur.execute(
             """
             SELECT
@@ -876,6 +880,10 @@ def dashboard_data():
                 COALESCE(SUM(CASE WHEN status='DEDUP' THEN 1 END), 0) AS dedup_skips,
                 COALESCE(SUM(CASE WHEN status='PROTECTED' THEN 1 END), 0) AS protected_blocks,
                 COALESCE(SUM(CASE WHEN status='ERROR' THEN 1 END), 0) AS errors,
+                COALESCE(SUM(CASE
+                    WHEN status NOT IN ('AUTO','ESCALATE','DEDUP','PROTECTED','ERROR','DRAFT')
+                    THEN 1 END), 0) AS pending,
+                0 AS closed,
                 AVG(latency_ms) AS avg_latency_ms,
                 MAX(latency_ms) AS max_latency_ms
             FROM message_logs WHERE ts >= ?
@@ -890,8 +898,10 @@ def dashboard_data():
             "dedup_skips": r[3] or 0,
             "protected_blocks": r[4] or 0,
             "errors": r[5] or 0,
-            "avg_latency_ms": int(r[6]) if r[6] is not None else None,
-            "max_latency_ms": int(r[7]) if r[7] is not None else None,
+            "pending": r[6] or 0,
+            "closed": r[7] or 0,
+            "avg_latency_ms": int(r[8]) if r[8] is not None else None,
+            "max_latency_ms": int(r[9]) if r[9] is not None else None,
         }
 
         # ---- Conversations: last 50, exclude DEDUP/PROTECTED ----
@@ -993,7 +1003,9 @@ def dashboard_data():
         )
         distinct_count = cur.fetchone()[0] or 0
         bulk_spike = {
-            "distinct_senders_last_30min": distinct_count,
+            # Renamed from distinct_senders_last_30min so the frontend's
+            # data.bulk_spike.unique_senders_30min reference resolves.
+            "unique_senders_30min": distinct_count,
             "is_spike": distinct_count >= 5,
         }
 

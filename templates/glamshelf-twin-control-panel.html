@@ -477,9 +477,12 @@ a, button, [role="button"] { transition: color var(--transition), background var
   <main class="main">
 
     <!-- ===== BULK ALERT ===== -->
-    <div class="alert-banner" id="bulk-alert">
+    <!-- Hidden by default — checkBulkSpike() removes the hidden class only when
+         data.bulk_spike.is_spike is true. The placeholder count below is
+         overwritten with the live unique_senders_30min figure on every fetch. -->
+    <div class="alert-banner hidden" id="bulk-alert">
       <i data-lucide="zap" class="alert-icon" width="16" height="16"></i>
-      <div class="alert-msg"><strong>Bulk inquiry spike:</strong> 7 new messages in last 30 min from new numbers. Possible viral moment or ad traffic.</div>
+      <div class="alert-msg"></div>
       <button class="alert-dismiss" onclick="document.getElementById('bulk-alert').classList.add('hidden')" aria-label="Dismiss">
         <i data-lucide="x" width="14" height="14"></i>
       </button>
@@ -877,21 +880,34 @@ function selectConvo(waId) {
   const statusText  = latest.status === "ESCALATE" ? "Escalated" : latest.status === "AUTO" ? "Auto-replied" : latest.status;
   document.getElementById("chat-status-badge").innerHTML = `<span class="badge badge-${statusClass}">${statusText}</span>`;
 
+  // Per-status emoji+label for the bot bubble. AUTO / ESCALATE / DRAFT
+  // are the three statuses that ever produce a reply_text in the DB; any
+  // unknown status falls through to its raw label.
+  const tagFor = (status) => (
+    status === 'AUTO'     ? '🤖 auto' :
+    status === 'ESCALATE' ? '⚡ escalated' :
+    status === 'DRAFT'    ? '📝 draft' :
+    status
+  );
+
   const msgContainer = document.getElementById("chat-messages");
-  msgContainer.innerHTML = msgs.map(m => `
-    <div class="msg customer">
-      <div class="msg-bubble">${escHtml(m.msg_text || "")}</div>
-      <div class="msg-meta">${formatTime(m.ts)}</div>
-    </div>
-    ${m.reply_text ? `
-    <div class="msg ai">
-      <div class="msg-bubble">${escHtml(m.reply_text)}</div>
-      <div class="msg-meta">
-        <span class="msg-tag">${m.status === 'ESCALATE' ? '⚡ escalated' : '🤖 ai twin'}</span>
-        ${formatTime(m.ts)} · ${m.latency_ms ? (m.latency_ms/1000).toFixed(1)+'s' : ''}
+  msgContainer.innerHTML = msgs.map(m => {
+    const latency = m.latency_ms ? ` · ${(m.latency_ms / 1000).toFixed(1)}s` : '';
+    const botBubble = m.reply_text ? `
+      <div class="msg ai">
+        <div class="msg-bubble">${escHtml(m.reply_text)}</div>
+        <div class="msg-meta">
+          <span class="msg-tag">${tagFor(m.status)}</span>
+          ${formatTime(m.ts)}${latency}
+        </div>
+      </div>` : '';
+    return `
+      <div class="msg customer">
+        <div class="msg-bubble">${escHtml(m.msg_text || "")}</div>
+        <div class="msg-meta">${formatTime(m.ts)}</div>
       </div>
-    </div>` : ''}
-  `).join("");
+      ${botBubble}`;
+  }).join("");
   msgContainer.scrollTop = msgContainer.scrollHeight;
 }
 
@@ -1037,9 +1053,16 @@ function renderLogs(errorLog) {
 // ===== BULK SPIKE ALERT =====
 function checkBulkSpike(spike) {
   const banner = document.getElementById("bulk-alert");
-  if (spike && spike.is_spike) {
+  if (!banner) return;
+  if (spike && spike.is_spike === true) {
     banner.classList.remove("hidden");
-    banner.querySelector(".alert-msg").innerHTML = `<strong>Bulk inquiry spike:</strong> ${spike.unique_senders_30min} new contacts in last 30 min. Check inbox.`;
+    banner.querySelector(".alert-msg").innerHTML =
+      `<strong>${spike.unique_senders_30min}</strong> new contacts in the last 30 min`;
+  } else {
+    // Auto-hide on every refresh where the spike has subsided. User dismiss
+    // is honoured for the current page-load only — the next fetch resets
+    // visibility based purely on is_spike.
+    banner.classList.add("hidden");
   }
 }
 
