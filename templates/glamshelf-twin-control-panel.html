@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GlamShelf Twin Control Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<style>
+/* ===== DESIGN TOKENS ===== */
+:root, [data-theme="light"] {
+  --color-bg: #f7f6f2; --color-surface: #f9f8f5; --color-surface-2: #fbfbf9;
+  --color-surface-offset: #f3f0ec; --color-surface-offset-2: #edeae5;
+  --color-surface-dynamic: #e6e4df; --color-divider: #dcd9d5; --color-border: #d4d1ca;
+  --color-text: #28251d; --color-text-muted: #7a7974; --color-text-faint: #bab9b4;
+  --color-text-inverse: #f9f8f4;
+  --color-primary: #01696f; --color-primary-hover: #0c4e54; --color-primary-active: #0f3638;
+  --color-primary-highlight: #cedcd8;
+  --color-success: #437a22; --color-success-hover: #2e5c10; --color-success-highlight: #d4dfcc;
+  --color-warning: #964219; --color-warning-hover: #713417; --color-warning-highlight: #ddcfc6;
+  --color-error: #a12c7b; --color-error-hover: #7d1e5e; --color-error-highlight: #e0ced7;
+  --color-notification: #a13544; --color-notification-highlight: #dececb;
+  --color-orange: #da7101; --color-orange-highlight: #e7d7c4;
+  --color-blue: #006494; --color-blue-highlight: #c6d8e4;
+  --color-gold: #d19900; --color-gold-highlight: #e9e0c6;
+  --shadow-sm: 0 1px 2px oklch(0.2 0.01 80 / 0.06);
+  --shadow-md: 0 4px 12px oklch(0.2 0.01 80 / 0.08);
+  --radius-sm: 0.375rem; --radius-md: 0.5rem; --radius-lg: 0.75rem; --radius-xl: 1rem; --radius-full: 9999px;
+  --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem; --space-4: 1rem; --space-5: 1.25rem;
+  --space-6: 1.5rem; --space-8: 2rem; --space-10: 2.5rem; --space-12: 3rem;
+  --text-xs: clamp(0.75rem, 0.7rem + 0.25vw, 0.875rem);
+  --text-sm: clamp(0.875rem, 0.8rem + 0.35vw, 1rem);
+  --text-base: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
+  --text-lg: clamp(1.125rem, 1rem + 0.75vw, 1.5rem);
+  --text-xl: clamp(1.5rem, 1.2rem + 1.25vw, 2.25rem);
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme="dark"] {
+  --color-bg: #171614; --color-surface: #1c1b19; --color-surface-2: #201f1d;
+  --color-surface-offset: #1d1c1a; --color-surface-offset-2: #22211f;
+  --color-surface-dynamic: #2d2c2a; --color-divider: #262523; --color-border: #393836;
+  --color-text: #cdccca; --color-text-muted: #797876; --color-text-faint: #5a5957;
+  --color-text-inverse: #2b2a28;
+  --color-primary: #4f98a3; --color-primary-hover: #227f8b; --color-primary-active: #1a626b;
+  --color-primary-highlight: #313b3b;
+  --color-success: #6daa45; --color-success-hover: #4d8f25; --color-success-highlight: #3a4435;
+  --color-warning: #bb653b; --color-warning-hover: #b95525; --color-warning-highlight: #564942;
+  --color-error: #d163a7; --color-error-hover: #b9478f; --color-error-highlight: #4c3d46;
+  --color-notification: #dd6974; --color-notification-highlight: #574848;
+  --color-orange: #fdab43; --color-orange-highlight: #564b3e;
+  --color-blue: #5591c7; --color-blue-highlight: #3a4550;
+  --color-gold: #e8af34; --color-gold-highlight: #4d4332;
+  --shadow-sm: 0 1px 2px oklch(0 0 0 / 0.2);
+  --shadow-md: 0 4px 12px oklch(0 0 0 / 0.3);
+}
+
+/* ===== BASE ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+html { -webkit-font-smoothing: antialiased; font-size: 14px; }
+body { font-family: var(--font-body); color: var(--color-text); background: var(--color-bg); font-size: var(--text-sm); line-height: 1.5; }
+button { cursor: pointer; background: none; border: none; font: inherit; color: inherit; }
+input, select, textarea { font: inherit; color: inherit; }
+a, button, [role="button"] { transition: color var(--transition), background var(--transition), border-color var(--transition); }
+:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 3px; border-radius: var(--radius-sm); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-faint); }
+
+/* ===== LAYOUT ===== */
+.dashboard {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 48px 1fr;
+  height: 100dvh;
+}
+
+/* ===== SIDEBAR ===== */
+.sidebar {
+  grid-row: 1 / -1;
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-border);
+  display: flex; flex-direction: column;
+  overflow-y: auto; overscroll-behavior: contain;
+}
+.sidebar-logo {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  min-height: 48px;
+}
+.logo-mark {
+  width: 28px; height: 28px; flex-shrink: 0;
+}
+.logo-text { font-weight: 700; font-size: 0.875rem; letter-spacing: -0.01em; line-height: 1.1; }
+.logo-sub { font-size: 0.65rem; color: var(--color-text-muted); font-weight: 400; display: block; }
+
+.sidebar-section { padding: var(--space-3) var(--space-2); }
+.sidebar-section-label {
+  font-size: 0.65rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--color-text-faint);
+  padding: var(--space-2) var(--space-2) var(--space-1);
+}
+.nav-item {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-2);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted); font-size: 0.8125rem; font-weight: 500;
+  cursor: pointer; width: 100%; text-align: left;
+  transition: background var(--transition), color var(--transition);
+  position: relative;
+}
+.nav-item:hover { background: var(--color-surface-dynamic); color: var(--color-text); }
+.nav-item.active { background: var(--color-primary-highlight); color: var(--color-primary); }
+.nav-item .icon { flex-shrink: 0; opacity: 0.7; }
+.nav-item.active .icon { opacity: 1; }
+.nav-badge {
+  margin-left: auto; background: var(--color-notification);
+  color: #fff; font-size: 0.6rem; font-weight: 700;
+  padding: 1px 5px; border-radius: 99px; min-width: 16px; text-align: center;
+}
+.nav-badge.warn { background: var(--color-warning); }
+.nav-badge.info { background: var(--color-blue); }
+
+.sidebar-footer {
+  margin-top: auto; padding: var(--space-3); border-top: 1px solid var(--color-border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--color-success); display: inline-block;
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; } 50% { opacity: 0.4; }
+}
+.status-text { font-size: 0.7rem; color: var(--color-text-muted); display: flex; align-items: center; gap: 5px; }
+
+/* ===== HEADER ===== */
+.header {
+  grid-column: 2;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 var(--space-5);
+  position: sticky; top: 0; z-index: 10;
+}
+.header-left { display: flex; align-items: center; gap: var(--space-3); }
+.page-title { font-size: 0.875rem; font-weight: 600; }
+.breadcrumb { font-size: 0.75rem; color: var(--color-text-muted); }
+.header-right { display: flex; align-items: center; gap: var(--space-2); }
+.icon-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  transition: background var(--transition), color var(--transition);
+}
+.icon-btn:hover { background: var(--color-surface-dynamic); color: var(--color-text); }
+.refresh-btn {
+  display: flex; align-items: center; gap: var(--space-1);
+  padding: 4px var(--space-3); border-radius: var(--radius-md);
+  background: var(--color-primary); color: white; font-size: 0.75rem; font-weight: 600;
+  transition: background var(--transition);
+}
+.refresh-btn:hover { background: var(--color-primary-hover); }
+.last-update { font-size: 0.7rem; color: var(--color-text-faint); }
+
+/* ===== MAIN ===== */
+.main {
+  grid-column: 2;
+  overflow-y: auto; overscroll-behavior: contain;
+  padding: var(--space-5);
+  display: flex; flex-direction: column; gap: var(--space-5);
+}
+
+/* ===== PAGE SECTIONS ===== */
+.page-section { display: none; flex-direction: column; gap: var(--space-5); }
+.page-section.active { display: flex; }
+
+/* ===== KPI ROW ===== */
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: var(--space-3); }
+.kpi-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  display: flex; flex-direction: column; gap: var(--space-1);
+}
+.kpi-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); }
+.kpi-value {
+  font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums lining-nums;
+  line-height: 1; color: var(--color-text);
+}
+.kpi-delta { font-size: 0.7rem; color: var(--color-text-muted); display: flex; align-items: center; gap: 3px; margin-top: 2px; }
+.kpi-delta.up { color: var(--color-success); }
+.kpi-delta.down { color: var(--color-error); }
+.kpi-accent-bar { height: 3px; border-radius: 99px; margin-top: var(--space-2); }
+
+/* ===== CARDS ===== */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.card-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+}
+.card-title { font-size: 0.8125rem; font-weight: 600; }
+.card-actions { display: flex; align-items: center; gap: var(--space-2); }
+.card-body { padding: var(--space-4); }
+
+/* ===== BADGE ===== */
+.badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: var(--radius-full);
+  font-size: 0.65rem; font-weight: 600; white-space: nowrap;
+}
+.badge-auto { background: var(--color-success-highlight); color: var(--color-success); }
+.badge-escalated { background: var(--color-notification-highlight); color: var(--color-notification); }
+.badge-pending { background: var(--color-gold-highlight); color: var(--color-gold); }
+.badge-closed { background: var(--color-surface-dynamic); color: var(--color-text-muted); }
+.badge-error { background: var(--color-error-highlight); color: var(--color-error); }
+.badge-warn { background: var(--color-warning-highlight); color: var(--color-warning); }
+.badge-info { background: var(--color-blue-highlight); color: var(--color-blue); }
+
+/* ===== INBOX FEED ===== */
+.inbox-layout { display: grid; grid-template-columns: 300px 1fr; min-height: 500px; }
+.inbox-list { border-right: 1px solid var(--color-border); overflow-y: auto; max-height: 600px; }
+.inbox-item {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-divider);
+  cursor: pointer; transition: background var(--transition);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.inbox-item:hover { background: var(--color-surface-dynamic); }
+.inbox-item.selected { background: var(--color-primary-highlight); }
+.inbox-item.unread { border-left: 3px solid var(--color-primary); }
+.inbox-item-top { display: flex; align-items: center; justify-content: space-between; }
+.inbox-name { font-size: 0.8125rem; font-weight: 600; }
+.inbox-time { font-size: 0.65rem; color: var(--color-text-faint); font-variant-numeric: tabular-nums; }
+.inbox-preview { font-size: 0.75rem; color: var(--color-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
+
+/* ===== CHAT PANE ===== */
+.chat-pane { display: flex; flex-direction: column; }
+.chat-pane-header {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.chat-meta { display: flex; flex-direction: column; gap: 2px; }
+.chat-name { font-size: 0.875rem; font-weight: 600; }
+.chat-phone { font-size: 0.7rem; color: var(--color-text-muted); font-family: var(--font-mono); }
+.chat-messages { flex: 1; overflow-y: auto; padding: var(--space-4); display: flex; flex-direction: column; gap: var(--space-3); max-height: 420px; }
+.msg { max-width: 75%; display: flex; flex-direction: column; gap: 2px; }
+.msg.customer { align-self: flex-start; }
+.msg.ai { align-self: flex-end; }
+.msg-bubble {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  font-size: 0.8125rem; line-height: 1.5;
+}
+.msg.customer .msg-bubble { background: var(--color-surface-dynamic); border-bottom-left-radius: 4px; }
+.msg.ai .msg-bubble { background: var(--color-primary); color: white; border-bottom-right-radius: 4px; }
+.msg-meta { font-size: 0.6rem; color: var(--color-text-faint); display: flex; align-items: center; gap: 4px; }
+.msg.ai .msg-meta { justify-content: flex-end; }
+.msg-tag { font-size: 0.55rem; background: var(--color-surface-dynamic); padding: 1px 5px; border-radius: 3px; color: var(--color-text-faint); }
+.chat-empty {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: var(--space-3); color: var(--color-text-faint); padding: var(--space-8);
+}
+
+/* ===== FILTER BAR ===== */
+.filter-bar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.filter-btn {
+  padding: 4px var(--space-3); border-radius: var(--radius-full);
+  font-size: 0.75rem; font-weight: 500; border: 1px solid var(--color-border);
+  color: var(--color-text-muted); transition: all var(--transition);
+}
+.filter-btn:hover { border-color: var(--color-primary); color: var(--color-primary); }
+.filter-btn.active { background: var(--color-primary); border-color: var(--color-primary); color: white; }
+.search-input {
+  padding: 5px var(--space-3); border-radius: var(--radius-md);
+  border: 1px solid var(--color-border); background: var(--color-surface-offset);
+  font-size: 0.75rem; color: var(--color-text); outline: none;
+  transition: border-color var(--transition);
+}
+.search-input:focus { border-color: var(--color-primary); }
+
+/* ===== TABLE ===== */
+.data-table { width: 100%; border-collapse: collapse; }
+.data-table th {
+  text-align: left; font-size: 0.65rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--color-text-faint);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.data-table td {
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.8125rem; border-bottom: 1px solid var(--color-divider);
+  vertical-align: middle;
+}
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:hover td { background: var(--color-surface-dynamic); cursor: pointer; }
+.data-table .mono { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text-muted); }
+.data-table .num { font-variant-numeric: tabular-nums lining-nums; }
+
+/* ===== CONVERSION CHART ===== */
+.chart-container { position: relative; height: 160px; }
+.bar-chart { display: flex; align-items: flex-end; gap: var(--space-2); height: 140px; padding: 0 var(--space-2); }
+.bar-group { flex: 1; display: flex; flex-direction: column; align-items: center; gap: var(--space-1); }
+.bar-wrap { display: flex; gap: 3px; align-items: flex-end; width: 100%; justify-content: center; }
+.bar {
+  width: 12px; border-radius: 3px 3px 0 0;
+  transition: opacity var(--transition);
+  cursor: pointer;
+}
+.bar:hover { opacity: 0.7; }
+.bar.inquiries { background: var(--color-blue); }
+.bar.orders { background: var(--color-success); }
+.bar-label { font-size: 0.6rem; color: var(--color-text-faint); white-space: nowrap; }
+.chart-legend { display: flex; gap: var(--space-4); padding: var(--space-3) var(--space-4); border-top: 1px solid var(--color-divider); }
+.legend-item { display: flex; align-items: center; gap: var(--space-1); font-size: 0.7rem; color: var(--color-text-muted); }
+.legend-dot { width: 8px; height: 8px; border-radius: 2px; }
+
+/* ===== HEALTH PANEL ===== */
+.health-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-3); }
+.health-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+}
+.health-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
+.health-title { font-size: 0.75rem; font-weight: 600; color: var(--color-text-muted); }
+.health-status { display: flex; align-items: center; gap: 5px; font-size: 0.7rem; }
+.dot { width: 6px; height: 6px; border-radius: 50%; }
+.dot-green { background: var(--color-success); animation: pulse 2s ease-in-out infinite; }
+.dot-yellow { background: var(--color-gold); }
+.dot-red { background: var(--color-error); animation: pulse 1s ease-in-out infinite; }
+.health-val { font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.health-sub { font-size: 0.7rem; color: var(--color-text-muted); margin-top: 2px; }
+
+.latency-bar-wrap { margin-top: var(--space-2); }
+.latency-track { height: 6px; background: var(--color-surface-dynamic); border-radius: 99px; overflow: hidden; margin-top: 3px; }
+.latency-fill { height: 100%; border-radius: 99px; transition: width 0.5s ease; }
+
+.log-feed { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.log-entry {
+  display: flex; align-items: flex-start; gap: var(--space-2);
+  font-size: 0.7rem; font-family: var(--font-mono);
+  padding: 5px var(--space-2); border-radius: var(--radius-sm);
+  background: var(--color-surface-offset);
+}
+.log-time { color: var(--color-text-faint); white-space: nowrap; flex-shrink: 0; }
+.log-msg { color: var(--color-text-muted); word-break: break-all; }
+.log-entry.err .log-msg { color: var(--color-error); }
+.log-entry.warn .log-msg { color: var(--color-warning); }
+.log-entry.ok .log-msg { color: var(--color-success); }
+
+/* ===== ESCALATION TABLE ===== */
+.escalation-row td:first-child { font-weight: 600; }
+
+/* ===== CONVERSION TRACKING ===== */
+.funnel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-4); }
+.funnel-step { display: flex; align-items: center; gap: var(--space-3); }
+.funnel-label { font-size: 0.75rem; color: var(--color-text-muted); width: 110px; flex-shrink: 0; }
+.funnel-bar-outer { flex: 1; height: 22px; background: var(--color-surface-dynamic); border-radius: var(--radius-sm); overflow: hidden; position: relative; }
+.funnel-bar-inner { height: 100%; border-radius: var(--radius-sm); display: flex; align-items: center; padding: 0 var(--space-2); font-size: 0.7rem; font-weight: 600; color: white; transition: width 0.8s ease; }
+.funnel-count { font-size: 0.75rem; font-weight: 600; width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
+.funnel-pct { font-size: 0.65rem; color: var(--color-text-faint); width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ===== BULK ALERT ===== */
+.alert-banner {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-warning-highlight);
+  border: 1px solid color-mix(in oklch, var(--color-warning) 30%, transparent);
+  border-radius: var(--radius-lg);
+  font-size: 0.8125rem;
+}
+.alert-banner.hidden { display: none; }
+.alert-icon { color: var(--color-warning); flex-shrink: 0; }
+.alert-msg { flex: 1; }
+.alert-msg strong { color: var(--color-warning); }
+.alert-dismiss { color: var(--color-text-muted); padding: 2px; }
+.alert-dismiss:hover { color: var(--color-text); }
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 900px) {
+  .dashboard { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .header { grid-column: 1; }
+  .main { grid-column: 1; }
+  .inbox-layout { grid-template-columns: 1fr; }
+  .inbox-list { max-height: 200px; }
+}
+</style>
+</head>
+<body>
+<div class="dashboard" id="app">
+
+  <!-- ===== SIDEBAR ===== -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <svg class="logo-mark" viewBox="0 0 28 28" fill="none" aria-label="GlamShelf logo">
+        <rect width="28" height="28" rx="7" fill="var(--color-primary)"/>
+        <path d="M7 14.5 C7 11 9 8.5 13 8.5 L13 11.5 C11 11.5 10 12.5 10 14.5 C10 16.5 11 17.5 13 17.5 L13 20.5 C9 20.5 7 18 7 14.5Z" fill="white"/>
+        <path d="M14.5 14.5 L14.5 17.5 L19 17.5 L19 14.5 L16.5 14.5 L16.5 11.5 L19 11.5 L19 8.5 L14.5 8.5 L14.5 11.5 L16.5 11.5 L16.5 14.5Z" fill="white" opacity="0.85"/>
+      </svg>
+      <div class="logo-text">GlamShelf <span class="logo-sub">Twin Control Panel</span></div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">Overview</div>
+      <button class="nav-item active" data-section="inbox" onclick="navigate(this)">
+        <i data-lucide="message-square" class="icon" width="14" height="14"></i> Live Inbox
+        <span class="nav-badge" id="unread-badge">3</span>
+      </button>
+      <button class="nav-item" data-section="conversations" onclick="navigate(this)">
+        <i data-lucide="layers" class="icon" width="14" height="14"></i> Conversations
+      </button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">Analytics</div>
+      <button class="nav-item" data-section="conversion" onclick="navigate(this)">
+        <i data-lucide="trending-up" class="icon" width="14" height="14"></i> Conversion
+        <span class="nav-badge info" id="bulk-badge">!</span>
+      </button>
+      <button class="nav-item" data-section="health" onclick="navigate(this)">
+        <i data-lucide="activity" class="icon" width="14" height="14"></i> System Health
+        <span class="nav-badge warn" id="err-badge">2</span>
+      </button>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="status-text">
+        <span class="status-dot"></span> AI Twin live
+      </div>
+      <button class="icon-btn" onclick="toggleTheme()" data-theme-toggle aria-label="Toggle theme">
+        <i data-lucide="moon" width="14" height="14"></i>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ===== HEADER ===== -->
+  <header class="header">
+    <div class="header-left">
+      <span class="page-title" id="page-title">Live Inbox</span>
+      <span class="last-update" id="last-update">Updated just now</span>
+    </div>
+    <div class="header-right">
+      <button class="icon-btn" title="Export" aria-label="Export data">
+        <i data-lucide="download" width="14" height="14"></i>
+      </button>
+      <button class="refresh-btn" onclick="simulateRefresh()">
+        <i data-lucide="refresh-cw" width="12" height="12"></i> Refresh
+      </button>
+    </div>
+  </header>
+
+  <!-- ===== MAIN ===== -->
+  <main class="main">
+
+    <!-- ===== BULK ALERT ===== -->
+    <div class="alert-banner" id="bulk-alert">
+      <i data-lucide="zap" class="alert-icon" width="16" height="16"></i>
+      <div class="alert-msg"><strong>Bulk inquiry spike:</strong> 7 new messages in last 30 min from new numbers. Possible viral moment or ad traffic.</div>
+      <button class="alert-dismiss" onclick="document.getElementById('bulk-alert').classList.add('hidden')" aria-label="Dismiss">
+        <i data-lucide="x" width="14" height="14"></i>
+      </button>
+    </div>
+
+    <!-- ===== INBOX SECTION ===== -->
+    <section class="page-section active" id="section-inbox">
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Total Today</div>
+          <div class="kpi-value" id="kpi-total">34</div>
+          <div class="kpi-delta up"><i data-lucide="arrow-up" width="10" height="10"></i> +8 vs yesterday</div>
+          <div class="kpi-accent-bar" style="background:var(--color-primary);width:80%"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Auto-replied</div>
+          <div class="kpi-value" style="color:var(--color-success)" id="kpi-auto">26</div>
+          <div class="kpi-delta up">76% auto rate</div>
+          <div class="kpi-accent-bar" style="background:var(--color-success);width:76%"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Escalated</div>
+          <div class="kpi-value" style="color:var(--color-notification)" id="kpi-esc">4</div>
+          <div class="kpi-delta">Telegram alerts sent</div>
+          <div class="kpi-accent-bar" style="background:var(--color-notification);width:20%"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Pending</div>
+          <div class="kpi-value" style="color:var(--color-gold)" id="kpi-pend">3</div>
+          <div class="kpi-delta down">Needs attention</div>
+          <div class="kpi-accent-bar" style="background:var(--color-gold);width:15%"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Closed</div>
+          <div class="kpi-value" style="color:var(--color-text-muted)" id="kpi-closed">1</div>
+          <div class="kpi-delta">Resolved</div>
+          <div class="kpi-accent-bar" style="background:var(--color-border);width:5%"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Avg Latency</div>
+          <div class="kpi-value" style="color:var(--color-blue)" id="kpi-latency">1.2s</div>
+          <div class="kpi-delta up">p99: 3.1s</div>
+          <div class="kpi-accent-bar" style="background:var(--color-blue);width:30%"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Conversations</span>
+          <div class="card-actions">
+            <div class="filter-bar">
+              <button class="filter-btn active" onclick="filterInbox(this,'all')">All</button>
+              <button class="filter-btn" onclick="filterInbox(this,'auto')">Auto-replied</button>
+              <button class="filter-btn" onclick="filterInbox(this,'escalated')">Escalated</button>
+              <button class="filter-btn" onclick="filterInbox(this,'pending')">Pending</button>
+              <input class="search-input" placeholder="Search number or keyword…" oninput="searchInbox(this.value)">
+            </div>
+          </div>
+        </div>
+        <div class="inbox-layout">
+          <div class="inbox-list" id="inbox-list"></div>
+          <div class="chat-pane" id="chat-pane">
+            <div class="chat-empty" id="chat-empty">
+              <i data-lucide="message-circle" width="32" height="32" style="opacity:0.3"></i>
+              <span style="font-size:0.8rem">Select a conversation</span>
+            </div>
+            <div id="chat-detail" style="display:none;flex-direction:column;height:100%">
+              <div class="chat-pane-header">
+                <div class="chat-meta">
+                  <span class="chat-name" id="chat-name">—</span>
+                  <span class="chat-phone" id="chat-phone">—</span>
+                </div>
+                <span id="chat-status-badge"></span>
+              </div>
+              <div class="chat-messages" id="chat-messages"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== CONVERSATIONS SECTION ===== -->
+    <section class="page-section" id="section-conversations">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">All Conversations — Today</span>
+          <div class="card-actions">
+            <input class="search-input" placeholder="Search…" oninput="filterTable(this.value)">
+          </div>
+        </div>
+        <table class="data-table" id="conv-table">
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th>Number</th>
+              <th>Last Message</th>
+              <th>Status</th>
+              <th>Msgs</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="conv-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== CONVERSION SECTION ===== -->
+    <section class="page-section" id="section-conversion">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4)">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Inquiry → Order Funnel</span></div>
+          <div class="funnel" id="funnel-chart"></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">7-Day Volume</span></div>
+          <div class="bar-chart" id="bar-chart"></div>
+          <div class="chart-legend">
+            <div class="legend-item"><div class="legend-dot" style="background:var(--color-blue)"></div>Inquiries</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--color-success)"></div>Orders</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Bulk Inquiry Alerts</span>
+          <span class="badge badge-warn">Spike detected</span>
+        </div>
+        <table class="data-table">
+          <thead><tr><th>Time</th><th>Trigger</th><th>Count</th><th>Action Taken</th><th>Status</th></tr></thead>
+          <tbody id="bulk-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== HEALTH SECTION ===== -->
+    <section class="page-section" id="section-health">
+      <div class="health-grid">
+        <div class="health-card">
+          <div class="health-header">
+            <span class="health-title">Webhook</span>
+            <div class="health-status"><div class="dot dot-green"></div> Operational</div>
+          </div>
+          <div class="health-val">100%</div>
+          <div class="health-sub">Uptime today (48/48 hits)</div>
+          <div class="latency-bar-wrap">
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Success rate</span><span>48/48</span></div>
+            <div class="latency-track"><div class="latency-fill" style="width:100%;background:var(--color-success)"></div></div>
+          </div>
+        </div>
+        <div class="health-card">
+          <div class="health-header">
+            <span class="health-title">Dedup Engine</span>
+            <div class="health-status"><div class="dot dot-green"></div> Active</div>
+          </div>
+          <div class="health-val" id="dedup-count">0</div>
+          <div class="health-sub">Dupes blocked today</div>
+          <div class="latency-bar-wrap">
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Block rate</span><span>26%</span></div>
+            <div class="latency-track"><div class="latency-fill" style="width:26%;background:var(--color-gold)"></div></div>
+          </div>
+        </div>
+        <div class="health-card">
+          <div class="health-header">
+            <span class="health-title">Response Latency</span>
+            <div class="health-status"><div class="dot dot-green"></div> Normal</div>
+          </div>
+          <div class="health-val">1.2s</div>
+          <div class="health-sub" id="latency-p99">Avg · p99: —</div>
+          <div class="latency-bar-wrap">
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>vs 3s target</span><span>✓</span></div>
+            <div class="latency-track"><div class="latency-fill" id="latency-bar" style="width:0%;background:var(--color-primary)"></div></div>
+          </div>
+        </div>
+        <div class="health-card">
+          <div class="health-header">
+            <span class="health-title">Protected Numbers</span>
+            <div class="health-status"><div class="dot dot-green"></div> Enforced</div>
+          </div>
+          <div class="health-val">3</div>
+          <div class="health-sub">In blocklist · 0 bypasses</div>
+          <div class="latency-bar-wrap">
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Blocked msgs</span><span>0</span></div>
+            <div class="latency-track"><div class="latency-fill" style="width:0%;background:var(--color-error)"></div></div>
+          </div>
+        </div>
+        <div class="health-card">
+          <div class="health-header">
+            <span class="health-title">Claude API</span>
+            <div class="health-status"><div class="dot dot-yellow"></div> Degraded</div>
+          </div>
+          <div class="health-val" id="claude-rate" style="color:var(--color-gold)">—</div>
+          <div class="health-sub" id="claude-errors">Loading…</div>
+          <div class="latency-bar-wrap">
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Success</span><span>46/48</span></div>
+            <div class="latency-track"><div class="latency-fill" id="claude-bar" style="width:100%;background:var(--color-gold)"></div></div>
+          </div>
+        </div>
+        <div class="health-card">
+          <div class="health-header">
+            <span class="health-title">Render Server</span>
+            <div class="health-status"><div class="dot dot-green"></div> Online</div>
+          </div>
+          <div class="health-val">✓</div>
+          <div class="health-sub">All endpoints healthy</div>
+          <div class="latency-bar-wrap">
+            <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--color-text-faint)"><span>Memory</span><span>312MB / 512MB</span></div>
+            <div class="latency-track"><div class="latency-fill" style="width:61%;background:var(--color-primary)"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Error Log</span>
+          <span class="badge badge-warn">2 errors</span>
+        </div>
+        <div class="card-body">
+          <div class="log-feed" id="log-feed"></div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+// ===== CONFIG =====
+const API_BASE = "https://glamshelf-twin.onrender.com";
+// Set your dashboard key here (same as DASHBOARD_KEY env var on Render)
+// In production, pass via URL: ?key=xxxx — read from URL param below
+const urlParams = new URLSearchParams(window.location.search);
+const DASH_KEY = urlParams.get("key") || "";
+
+let allData = null;
+let currentFilter = "all";
+let selectedId = null;
+let refreshTimer = null;
+let lastRefreshTime = null;
+
+// ===== FETCH REAL DATA =====
+async function fetchData() {
+  if (!DASH_KEY) {
+    showKeyPrompt();
+    return;
+  }
+  try {
+    document.getElementById("last-update").textContent = "Fetching…";
+    const res = await fetch(`${API_BASE}/dashboard-data?key=${DASH_KEY}`);
+    if (res.status === 401) { showKeyPrompt(); return; }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    allData = await res.json();
+    lastRefreshTime = new Date();
+    renderAll(allData);
+    document.getElementById("last-update").textContent = "Updated just now";
+  } catch (err) {
+    document.getElementById("last-update").textContent = "⚠ Fetch failed — retrying";
+    console.error("[dashboard] fetch error:", err);
+    renderOfflineState();
+  }
+}
+
+function showKeyPrompt() {
+  document.getElementById("last-update").textContent = "⚠ No key — add ?key=xxxx to URL";
+}
+
+// ===== RENDER ALL =====
+function renderAll(data) {
+  renderKPIs(data.kpis);
+  renderInbox(data.conversations, currentFilter);
+  renderConvTable(data.conversations);
+  renderFunnel(data.kpis);
+  renderBarChart(data.daily_volume || []);
+  renderBulkTable(data.bulk_spike, data.conversations);
+  renderHealthPanel(data.kpis, data.error_log || []);
+  renderLogs(data.error_log || []);
+  updateUnreadBadge(data.conversations);
+  checkBulkSpike(data.bulk_spike);
+}
+
+// ===== KPIs =====
+function renderKPIs(k) {
+  if (!k) return;
+  const total    = k.total || 0;
+  const auto     = k.auto_replied || 0;
+  const esc      = k.escalated || 0;
+  const dedup    = k.dedup_skips || 0;
+  const errors   = k.errors || 0;
+  const pending  = total - auto - esc;
+  const latency  = k.avg_latency_ms ? (k.avg_latency_ms / 1000).toFixed(1) + "s" : "—";
+  const autoRate = total > 0 ? Math.round((auto / total) * 100) : 0;
+
+  animateNum("kpi-total",   total);
+  animateNum("kpi-auto",    auto);
+  animateNum("kpi-esc",     esc);
+  animateNum("kpi-pend",    Math.max(0, pending));
+  animateNum("kpi-closed",  0);
+  document.getElementById("kpi-latency").textContent = latency;
+
+  document.querySelector("#kpi-auto").closest(".kpi-card").querySelector(".kpi-delta").textContent = autoRate + "% auto rate";
+  document.querySelector("#kpi-auto").closest(".kpi-card").querySelector(".kpi-accent-bar").style.width = autoRate + "%";
+
+  // Update sidebar error badge
+  const errBadge = document.getElementById("err-badge");
+  errBadge.textContent = errors;
+  errBadge.style.display = errors > 0 ? "" : "none";
+
+  // Update dedup in health
+  document.getElementById("dedup-count") && (document.getElementById("dedup-count").textContent = dedup);
+}
+
+function animateNum(id, target) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const current = parseInt(el.textContent) || 0;
+  if (current === target) return;
+  const step = target > current ? 1 : -1;
+  let val = current;
+  const timer = setInterval(() => {
+    val += step;
+    el.textContent = val;
+    if (val === target) clearInterval(timer);
+  }, 30);
+}
+
+// ===== INBOX =====
+function renderInbox(convos, filter = "all", query = "") {
+  if (!convos) return;
+  const list = document.getElementById("inbox-list");
+
+  // Group by wa_id — show latest message per customer
+  const byCustomer = {};
+  convos.forEach(c => {
+    if (!byCustomer[c.wa_id] || c.ts > byCustomer[c.wa_id].ts) {
+      byCustomer[c.wa_id] = c;
+    }
+  });
+
+  let items = Object.values(byCustomer);
+
+  if (filter !== "all") {
+    items = items.filter(c => c.status.toLowerCase() === filter.toLowerCase());
+  }
+  if (query) {
+    const q = query.toLowerCase();
+    items = items.filter(c =>
+      (c.sender_name || "").toLowerCase().includes(q) ||
+      c.wa_id.includes(q) ||
+      (c.msg_text || "").toLowerCase().includes(q)
+    );
+  }
+
+  items.sort((a, b) => b.ts - a.ts);
+
+  if (items.length === 0) {
+    list.innerHTML = `<div style="padding:var(--space-8);text-align:center;color:var(--color-text-faint);font-size:0.8rem">No conversations</div>`;
+    return;
+  }
+
+  list.innerHTML = items.map(c => {
+    const name = c.sender_name || formatPhone(c.wa_id);
+    const time = formatTime(c.ts);
+    const statusClass = c.status.toLowerCase() === "escalate" ? "escalated" : c.status.toLowerCase() === "auto" ? "auto" : "pending";
+    const statusText  = c.status === "ESCALATE" ? "Escalated" : c.status === "AUTO" ? "Auto-replied" : c.status;
+    return `
+    <div class="inbox-item ${selectedId === c.wa_id ? 'selected' : ''}"
+         onclick="selectConvo('${c.wa_id}')" data-id="${c.wa_id}">
+      <div class="inbox-item-top">
+        <span class="inbox-name">${escHtml(name)}</span>
+        <span class="inbox-time">${time}</span>
+      </div>
+      <span class="badge badge-${statusClass}" style="font-size:0.6rem;margin-bottom:2px">${statusText}</span>
+      <span class="inbox-preview">${escHtml(c.msg_text || "")}</span>
+    </div>`;
+  }).join("");
+}
+
+// ===== CHAT PANE =====
+function selectConvo(waId) {
+  if (!allData) return;
+  selectedId = waId;
+  renderInbox(allData.conversations, currentFilter);
+
+  const msgs = allData.conversations.filter(c => c.wa_id === waId).sort((a, b) => a.ts - b.ts);
+  if (!msgs.length) return;
+
+  const latest = msgs[msgs.length - 1];
+  const name = latest.sender_name || formatPhone(waId);
+
+  document.getElementById("chat-empty").style.display = "none";
+  const detail = document.getElementById("chat-detail");
+  detail.style.display = "flex";
+  document.getElementById("chat-name").textContent = name;
+  document.getElementById("chat-phone").textContent = formatPhone(waId);
+
+  const statusClass = latest.status === "ESCALATE" ? "escalated" : latest.status === "AUTO" ? "auto" : "pending";
+  const statusText  = latest.status === "ESCALATE" ? "Escalated" : latest.status === "AUTO" ? "Auto-replied" : latest.status;
+  document.getElementById("chat-status-badge").innerHTML = `<span class="badge badge-${statusClass}">${statusText}</span>`;
+
+  const msgContainer = document.getElementById("chat-messages");
+  msgContainer.innerHTML = msgs.map(m => `
+    <div class="msg customer">
+      <div class="msg-bubble">${escHtml(m.msg_text || "")}</div>
+      <div class="msg-meta">${formatTime(m.ts)}</div>
+    </div>
+    ${m.reply_text ? `
+    <div class="msg ai">
+      <div class="msg-bubble">${escHtml(m.reply_text)}</div>
+      <div class="msg-meta">
+        <span class="msg-tag">${m.status === 'ESCALATE' ? '⚡ escalated' : '🤖 ai twin'}</span>
+        ${formatTime(m.ts)} · ${m.latency_ms ? (m.latency_ms/1000).toFixed(1)+'s' : ''}
+      </div>
+    </div>` : ''}
+  `).join("");
+  msgContainer.scrollTop = msgContainer.scrollHeight;
+}
+
+// ===== CONVERSATIONS TABLE =====
+function renderConvTable(convos, query = "") {
+  if (!convos) return;
+  const byCustomer = {};
+  convos.forEach(c => {
+    if (!byCustomer[c.wa_id] || c.ts > byCustomer[c.wa_id].ts) byCustomer[c.wa_id] = c;
+  });
+  let items = Object.values(byCustomer).sort((a, b) => b.ts - a.ts);
+  if (query) {
+    const q = query.toLowerCase();
+    items = items.filter(c => (c.sender_name||"").toLowerCase().includes(q) || c.wa_id.includes(q) || (c.msg_text||"").toLowerCase().includes(q));
+  }
+  const tbody = document.getElementById("conv-tbody");
+  if (!items.length) { tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--color-text-faint);padding:var(--space-8)">No data yet</td></tr>`; return; }
+  tbody.innerHTML = items.map(c => {
+    const name = c.sender_name || formatPhone(c.wa_id);
+    const statusClass = c.status === "ESCALATE" ? "escalated" : c.status === "AUTO" ? "auto" : "pending";
+    const statusText  = c.status === "ESCALATE" ? "Escalated" : c.status === "AUTO" ? "Auto-replied" : c.status;
+    const msgCount = convos.filter(x => x.wa_id === c.wa_id).length;
+    return `<tr onclick="navigate(document.querySelector('[data-section=inbox]'));selectConvo('${c.wa_id}')">
+      <td><strong>${escHtml(name)}</strong></td>
+      <td class="mono">${formatPhone(c.wa_id)}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(c.msg_text||"")}</td>
+      <td><span class="badge badge-${statusClass}">${statusText}</span></td>
+      <td class="num">${msgCount}</td>
+      <td class="mono">${formatTime(c.ts)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function filterTable(q) { renderConvTable(allData?.conversations || [], q); }
+
+// ===== FUNNEL =====
+function renderFunnel(k) {
+  if (!k) return;
+  const total = k.total || 0;
+  const auto  = k.auto_replied || 0;
+  const esc   = k.escalated || 0;
+  if (total === 0) {
+    document.getElementById("funnel-chart").innerHTML = `<div style="padding:var(--space-8);text-align:center;color:var(--color-text-faint);font-size:0.8rem">No data yet today</div>`;
+    return;
+  }
+  const steps = [
+    { label: "Msgs received",  count: total, pct: 100, color: "var(--color-primary)" },
+    { label: "Auto-replied",   count: auto,  pct: total > 0 ? Math.round(auto/total*100) : 0, color: "var(--color-blue)" },
+    { label: "Escalated",      count: esc,   pct: total > 0 ? Math.round(esc/total*100) : 0,  color: "var(--color-notification)" },
+  ];
+  document.getElementById("funnel-chart").innerHTML = steps.map(s => `
+    <div class="funnel-step">
+      <span class="funnel-label">${s.label}</span>
+      <div class="funnel-bar-outer">
+        <div class="funnel-bar-inner" style="width:${s.pct}%;background:${s.color}">${s.pct}%</div>
+      </div>
+      <span class="funnel-count">${s.count}</span>
+    </div>`).join("");
+}
+
+// ===== BAR CHART =====
+function renderBarChart(daily) {
+  if (!daily || !daily.length) {
+    document.getElementById("bar-chart").innerHTML = `<div style="width:100%;display:flex;align-items:center;justify-content:center;color:var(--color-text-faint);font-size:0.8rem">No 7-day data yet</div>`;
+    return;
+  }
+  const max = Math.max(...daily.map(d => d.total), 1);
+  document.getElementById("bar-chart").innerHTML = daily.map(d => {
+    const dayLabel = new Date(d.day).toLocaleDateString("en-IN", { weekday: "short" });
+    return `
+    <div class="bar-group">
+      <div class="bar-wrap">
+        <div class="bar inquiries" style="height:${Math.round((d.total/max)*110)+10}px" title="${d.total} messages"></div>
+        <div class="bar orders"    style="height:${Math.round((d.escalated/max)*110)+4}px" title="${d.escalated} escalated"></div>
+      </div>
+      <span class="bar-label">${dayLabel}</span>
+    </div>`;
+  }).join("");
+}
+
+// ===== BULK TABLE =====
+function renderBulkTable(spike, convos) {
+  const tbody = document.getElementById("bulk-tbody");
+  const rows = [];
+  if (spike && spike.is_spike) {
+    rows.push({ time: "Now", trigger: `${spike.unique_senders_30min} unique senders in 30min`, count: spike.unique_senders_30min, action: "Check inbox", status: "escalated" });
+  }
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--color-text-faint);padding:var(--space-6)">No spikes detected today 🤍</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td class="mono">${r.time}</td>
+      <td>${r.trigger}</td>
+      <td class="num">${r.count}</td>
+      <td>${r.action}</td>
+      <td><span class="badge badge-${r.status}">${r.status === 'escalated' ? 'Escalated' : 'Auto-handled'}</span></td>
+    </tr>`).join("");
+}
+
+// ===== HEALTH PANEL =====
+function renderHealthPanel(k, errorLog) {
+  if (!k) return;
+  const errs = k.errors || 0;
+  const dedup = k.dedup_skips || 0;
+  const latencyMs = k.avg_latency_ms || 0;
+  const p99Ms = k.max_latency_ms || 0;
+
+  // Claude API status
+  const total = (k.total || 0) + errs;
+  const successRate = total > 0 ? Math.round(((total - errs) / total) * 100) : 100;
+  const claudeStatus = errs === 0 ? "Operational" : errs <= 2 ? "Degraded" : "Issues";
+  const claudeDot = errs === 0 ? "dot-green" : errs <= 2 ? "dot-yellow" : "dot-red";
+
+  document.getElementById("claude-rate") && (document.getElementById("claude-rate").textContent = successRate + "%");
+  document.getElementById("claude-errors") && (document.getElementById("claude-errors").textContent = errs + " error" + (errs !== 1 ? "s" : "") + " today");
+  document.getElementById("claude-bar") && (document.getElementById("claude-bar").style.width = successRate + "%");
+
+  // Latency
+  document.getElementById("latency-avg") && (document.getElementById("latency-avg").textContent = latencyMs > 0 ? (latencyMs/1000).toFixed(1)+"s" : "—");
+  document.getElementById("latency-p99") && (document.getElementById("latency-p99").textContent = p99Ms > 0 ? "p99: "+(p99Ms/1000).toFixed(1)+"s" : "");
+  document.getElementById("latency-bar") && (document.getElementById("latency-bar").style.width = Math.min(100, Math.round((latencyMs/3000)*100)) + "%");
+
+  // Dedup
+  document.getElementById("dedup-count") && (document.getElementById("dedup-count").textContent = dedup);
+}
+
+// ===== LOG FEED =====
+function renderLogs(errorLog) {
+  const feed = document.getElementById("log-feed");
+  if (!errorLog || !errorLog.length) {
+    feed.innerHTML = `<div class="log-entry ok"><span class="log-time">now</span><span class="log-msg">No errors today — twin running clean ✓</span></div>`;
+    return;
+  }
+  feed.innerHTML = errorLog.slice(0, 15).map(l => {
+    const type = l.status === "ERROR" ? "err" : l.status === "ESCALATE" ? "warn" : "ok";
+    const msg = l.error || `${l.status} — ${l.wa_id} — ${l.msg_text || ""}`.slice(0, 80);
+    return `<div class="log-entry ${type}"><span class="log-time">${formatTime(l.ts)}</span><span class="log-msg">${escHtml(msg)}</span></div>`;
+  }).join("");
+}
+
+// ===== BULK SPIKE ALERT =====
+function checkBulkSpike(spike) {
+  const banner = document.getElementById("bulk-alert");
+  if (spike && spike.is_spike) {
+    banner.classList.remove("hidden");
+    banner.querySelector(".alert-msg").innerHTML = `<strong>Bulk inquiry spike:</strong> ${spike.unique_senders_30min} new contacts in last 30 min. Check inbox.`;
+  }
+}
+
+// ===== OFFLINE STATE =====
+function renderOfflineState() {
+  document.getElementById("log-feed").innerHTML = `<div class="log-entry err"><span class="log-time">now</span><span class="log-msg">Could not reach glamshelf-twin.onrender.com — server may be sleeping (Render cold start ~30s)</span></div>`;
+}
+
+// ===== UTILS =====
+function formatTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
+}
+function formatPhone(wa_id) {
+  return wa_id ? "+" + wa_id.replace(/^91/, "91 ").replace(/(\d{5})(\d{5})$/, "$1 $2") : "—";
+}
+function escHtml(s) {
+  return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+function updateUnreadBadge(convos) {
+  const badge = document.getElementById("unread-badge");
+  const esc = (convos||[]).filter(c => c.status === "ESCALATE").length;
+  badge.textContent = esc;
+  badge.style.display = esc > 0 ? "" : "none";
+}
+
+// ===== FILTER / SEARCH =====
+function filterInbox(btn, filter) {
+  currentFilter = filter;
+  document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  if (allData) renderInbox(allData.conversations, filter);
+}
+function searchInbox(q) {
+  if (allData) renderInbox(allData.conversations, currentFilter, q);
+}
+
+// ===== NAVIGATION =====
+const sectionTitles = {
+  inbox: "Live Inbox", conversations: "All Conversations",
+  conversion: "Conversion Tracking", health: "System Health"
+};
+function navigate(btn) {
+  const section = btn.getAttribute("data-section");
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
+  btn.classList.add("active");
+  document.querySelectorAll(".page-section").forEach(s => s.classList.remove("active"));
+  document.getElementById("section-"+section).classList.add("active");
+  document.getElementById("page-title").textContent = sectionTitles[section];
+}
+
+// ===== THEME =====
+function toggleTheme() {
+  const html = document.documentElement;
+  html.setAttribute("data-theme", html.getAttribute("data-theme") === "dark" ? "light" : "dark");
+}
+
+// ===== REFRESH =====
+function simulateRefresh() {
+  fetchData();
+}
+
+// ===== AUTO-REFRESH (30s) =====
+function startAutoRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    fetchData();
+    // Update "X min ago" display between fetches
+  }, 30000);
+}
+
+setInterval(() => {
+  if (lastRefreshTime) {
+    const secs = Math.round((Date.now() - lastRefreshTime) / 1000);
+    if (secs < 10) document.getElementById("last-update").textContent = "Updated just now";
+    else if (secs < 60) document.getElementById("last-update").textContent = `Updated ${secs}s ago`;
+    else document.getElementById("last-update").textContent = `Updated ${Math.round(secs/60)}m ago`;
+  }
+}, 5000);
+
+// ===== INIT =====
+fetchData();
+startAutoRefresh();
+lucide.createIcons();
+</script>
+</body>
+</html>

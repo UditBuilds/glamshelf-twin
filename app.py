@@ -617,6 +617,17 @@ def healthz():
     })
 
 
+@app.route("/dashboard")
+def dashboard():
+    """Serve the static control-panel HTML, gated by the same DASHBOARD_KEY
+    query parameter as /dashboard-data. Pure HTML — the page itself fetches
+    /dashboard-data?key=... from JS and renders the JSON client-side."""
+    key = request.args.get("key", "")
+    if key != DASHBOARD_KEY:
+        return "Unauthorized", 401
+    return render_template("glamshelf-twin-control-panel.html")
+
+
 @app.route("/api/draft", methods=["POST"])
 @login_required
 def draft():
