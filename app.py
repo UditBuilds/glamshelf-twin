@@ -275,6 +275,52 @@ def _log_message(
         print(f"[DB] _log_message failed: {type(e).__name__}: {e}")
 
 
+def _load_conversation_history(wa_id: str) -> list[dict]:
+    """Pull up to 10 recent (customer msg, bot reply) exchanges with this
+    wa_id from the last 24 hours, oldest first.
+
+    Only AUTO and ESCALATE rows are eligible — those are the only statuses
+    that reflect a real reply the customer actually saw. DRAFT replies were
+    sent over Telegram to the founder, not delivered to WhatsApp, so
+    including them would mislead Claude into thinking the customer saw
+    text they never did.
+
+    Failures are logged-and-swallowed → returns []. Caller falls back to a
+    plain single-turn call.
+    """
+    if not wa_id:
+        return []
+    try:
+        cutoff = time.time() - 24 * 3600
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts, msg_text, reply_text
+            FROM message_logs
+            WHERE wa_id = ?
+              AND status IN ('AUTO', 'ESCALATE')
+              AND ts >= ?
+              AND msg_text IS NOT NULL
+              AND reply_text IS NOT NULL
+            ORDER BY ts DESC
+            LIMIT 10
+            """,
+            (wa_id, cutoff),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        rows.reverse()  # oldest -> newest
+        history = [
+            {"ts": r[0], "msg_text": r[1], "reply_text": r[2]} for r in rows
+        ]
+        print(f"[MEMORY] Loaded {len(history)} messages for {wa_id}")
+        return history
+    except Exception as e:
+        print(f"[MEMORY] Failed to load history for {wa_id}: {type(e).__name__}: {e}")
+        return []
+
+
 _init_db()
 
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
@@ -450,7 +496,11 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         print(f"[WATI] Unexpected error: {type(e).__name__}: {e}")
 
 
-def draft_reply_logic(message: str, order_context: str = "") -> tuple[str, str, str]:
+def draft_reply_logic(
+    message: str,
+    order_context: str = "",
+    history: list[dict] | None = None,
+) -> tuple[str, str, str]:
     """Core twin pipeline — load brain, call Claude, parse classification.
 
     Returns (classification, reply, raw_response).
@@ -461,6 +511,10 @@ def draft_reply_logic(message: str, order_context: str = "") -> tuple[str, str, 
     Used by both /api/draft (which returns raw_response to the browser)
     and /webhook (which dispatches based on classification).
 
+    Optional `history` (oldest → newest) gives Claude per-customer context;
+    only the webhook caller passes it — /api/draft has no wa_id and never
+    will, so it stays single-turn.
+
     Raises if brain.md is missing or the Claude API call fails — callers
     must catch and decide how to surface the error.
     """
@@ -468,7 +522,7 @@ def draft_reply_logic(message: str, order_context: str = "") -> tuple[str, str, 
         raise FileNotFoundError(f"brain file not found at {BRAIN_FILE}")
 
     brain = load_brain()
-    raw = ask_claude(brain, message, order_context)
+    raw = ask_claude(brain, message, order_context, history=history)
 
     classification = ""
     reply = ""
@@ -547,7 +601,12 @@ def strip_markdown_fences(text: str) -> tuple[str, bool]:
     return cleaned.strip(), was_fenced
 
 
-def ask_claude(brain: str, customer_message: str, order_context: str) -> str:
+def ask_claude(
+    brain: str,
+    customer_message: str,
+    order_context: str,
+    history: list[dict] | None = None,
+) -> str:
     """Call the Anthropic Messages API.
 
     The brain content is sent as the `system` prompt with `cache_control`
@@ -555,12 +614,29 @@ def ask_claude(brain: str, customer_message: str, order_context: str) -> str:
     requests in a busy session, cache hits make follow-up requests
     significantly cheaper and lower-latency. The customer message and
     order context go in the user prompt and are *not* cached.
+
+    `history`, when provided, is a list of {ts, msg_text, reply_text} dicts
+    representing prior exchanges with the same customer (oldest first).
+    Each entry becomes a user/assistant pair preceding the current
+    user message, so Claude treats the request as a real multi-turn
+    conversation rather than a one-shot question.
     """
     user_text = build_user_message(customer_message, order_context)
     print(
         f"[CLAUDE] Calling {MODEL} "
-        f"(brain: {len(brain)} chars, user: {len(user_text)} chars)"
+        f"(brain: {len(brain)} chars, user: {len(user_text)} chars, "
+        f"history: {len(history) if history else 0} turns)"
     )
+
+    # Build the messages list. When history is non-empty, prior exchanges
+    # are interleaved as alternating user/assistant turns BEFORE the current
+    # task-shaped user message. Empty / None history → single-turn (unchanged).
+    messages: list[dict] = []
+    if history:
+        for turn in history:
+            messages.append({"role": "user", "content": turn["msg_text"]})
+            messages.append({"role": "assistant", "content": turn["reply_text"]})
+    messages.append({"role": "user", "content": user_text})
 
     message = client.messages.create(
         model=MODEL,
@@ -572,7 +648,7 @@ def ask_claude(brain: str, customer_message: str, order_context: str) -> str:
                 "cache_control": {"type": "ephemeral"},
             }
         ],
-        messages=[{"role": "user", "content": user_text}],
+        messages=messages,
     )
 
     # Combine any top-level text blocks (usually just one).
@@ -802,8 +878,14 @@ def webhook():
             print(f"[WEBHOOK] ERROR: brain file missing at {BRAIN_FILE}")
             return jsonify({"status": "ok"}), 200
 
+        # Pull recent context for this customer so Claude sees the
+        # ongoing conversation, not just the latest message in isolation.
+        # Best-effort — failures inside _load_conversation_history return []
+        # and we fall through to a single-turn call.
+        history = _load_conversation_history(wa_id)
+
         # Run the twin. order_context is empty here — webhook doesn't have Shopify info.
-        classification, reply, _raw = draft_reply_logic(text_body, "")
+        classification, reply, _raw = draft_reply_logic(text_body, "", history=history)
 
         if not classification or not reply:
             print(
