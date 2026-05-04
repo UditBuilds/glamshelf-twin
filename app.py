@@ -12,6 +12,8 @@ Auth: ANTHROPIC_API_KEY environment variable.
 """
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -121,6 +123,12 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-
 GITHUB_REPO = GITHUB_REPO.replace("https://github.com/", "").rstrip("/")
 GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", "glamshelf_logs.db")
 BACKUP_INTERVAL_SECONDS = 60 * 60
+
+# Shopify webhook secret — used to HMAC-verify inbound order webhooks at
+# /shopify-webhook. Get this from Shopify Admin → Notifications → Webhooks.
+# Missing/empty value causes every shopify-webhook POST to 401, which is
+# the safe default until the secret is set.
+SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
 # temp dir so the dedup set survives worker restarts within a single
@@ -257,6 +265,27 @@ def _init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON message_logs(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_status ON message_logs(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_wa_id ON message_logs(wa_id)")
+
+        # Shopify orders — populated by /shopify-webhook, queried at webhook
+        # time to inject "Recent order" context into Claude's prompt.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT,
+                customer_phone TEXT,
+                customer_name TEXT,
+                product_names TEXT,
+                total_price TEXT,
+                order_status TEXT,
+                created_at TEXT,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(customer_phone)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_logged ON orders(logged_at)")
+
         conn.commit()
         conn.close()
         print(f"[DB] Initialized {DB_PATH}")
@@ -345,6 +374,131 @@ def _load_conversation_history(wa_id: str) -> list[dict]:
     except Exception as e:
         print(f"[MEMORY] Failed to load history for {wa_id}: {type(e).__name__}: {e}")
         return []
+
+
+def _verify_shopify_hmac(raw_body: bytes, hmac_header: str | None) -> bool:
+    """Constant-time HMAC-SHA256 verification of a Shopify webhook body.
+
+    Shopify computes HMAC-SHA256 of the raw request body using the
+    webhook secret, base64-encodes it, and sends the result in
+    X-Shopify-Hmac-Sha256. We must verify against the RAW body, not a
+    re-serialized JSON — so the route reads request.get_data() before
+    any parsing.
+
+    Returns False (never raises) if the secret isn't configured, the
+    header is missing, or the digests don't match.
+    """
+    if not SHOPIFY_WEBHOOK_SECRET or not hmac_header:
+        return False
+    try:
+        computed = base64.b64encode(
+            hmac.new(
+                SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
+                raw_body,
+                hashlib.sha256,
+            ).digest()
+        ).decode("ascii")
+        return hmac.compare_digest(computed, hmac_header)
+    except Exception as e:
+        print(f"[SHOPIFY] HMAC verify error: {type(e).__name__}: {e}")
+        return False
+
+
+def _phone_to_10digit(raw: str) -> str:
+    """Reduce any phone string to the 10-digit Indian mobile form.
+
+    Strips non-digits, then drops the leading "91" country code if the
+    result is 12 digits, or a leading "0" if it's 11 digits. Used both
+    when storing Shopify orders and when matching a WhatsApp wa_id
+    against the orders table.
+
+    "+91 98765 43210" -> "9876543210"
+    "919876543210"     -> "9876543210"
+    "9876543210"        -> "9876543210"
+    """
+    digits = "".join(c for c in (raw or "") if c.isdigit())
+    if len(digits) >= 12 and digits.startswith("91"):
+        digits = digits[-10:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits
+
+
+def _log_shopify_order(
+    order_id: str,
+    customer_phone: str,
+    customer_name: str,
+    product_names: str,
+    total_price: str,
+    order_status: str,
+    created_at: str,
+) -> None:
+    """Insert one row into orders. Failures swallowed — same pattern as
+    _log_message; we never break the webhook response on a DB hiccup."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO orders "
+            "(order_id, customer_phone, customer_name, product_names, "
+            " total_price, order_status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                order_id,
+                customer_phone,
+                customer_name,
+                product_names,
+                total_price,
+                order_status,
+                created_at,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] _log_shopify_order failed: {type(e).__name__}: {e}")
+
+
+def _lookup_recent_order(wa_id: str) -> str:
+    """If this customer placed an order in the last 30 days, return a
+    one-line summary suitable to inject into Claude's prompt. Empty
+    string otherwise (or on any failure — treated as "no context").
+
+    Format matches what Claude expects to see under "Order context":
+        Recent order: #<id> — <product names> — ₹<total> — <status>
+    """
+    if not wa_id:
+        return ""
+    phone10 = _phone_to_10digit(wa_id)
+    if not phone10:
+        return ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT order_id, product_names, total_price, order_status
+            FROM orders
+            WHERE customer_phone = ?
+              AND logged_at >= datetime('now', '-30 days')
+            ORDER BY logged_at DESC
+            LIMIT 1
+            """,
+            (phone10,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return ""
+        order_id, product_names, total_price, order_status = row
+        line = (
+            f"Recent order: #{order_id} — {product_names} — "
+            f"₹{total_price} — {order_status}"
+        )
+        print(f"[ORDER] Found recent order #{order_id} for {wa_id}")
+        return line
+    except Exception as e:
+        print(f"[ORDER] Lookup failed for {wa_id}: {type(e).__name__}: {e}")
+        return ""
 
 
 def _github_backup_configured() -> bool:
@@ -910,9 +1064,11 @@ def healthz():
     Intentionally NOT behind login_required — Render needs to hit it without auth."""
     db_status = "ok"
     total_logged = 0
+    total_orders = 0
     try:
         conn = sqlite3.connect(DB_PATH)
         total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
+        total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
         conn.close()
     except Exception as e:
         db_status = f"error: {type(e).__name__}: {e}"
@@ -925,6 +1081,7 @@ def healthz():
         "anthropic_api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "db": db_status,
         "total_logged": total_logged,
+        "total_orders": total_orders,
         "seen_ids_cached": len(_seen_ids),
         # Normalized protected numbers — diagnostic so misconfigured env vars
         # are obvious from the public health probe. Phone numbers, not secrets.
@@ -1086,8 +1243,14 @@ def webhook():
         # and we fall through to a single-turn call.
         history = _load_conversation_history(wa_id)
 
-        # Run the twin. order_context is empty here — webhook doesn't have Shopify info.
-        classification, reply, _raw = draft_reply_logic(text_body, "", history=history)
+        # If the same customer has a Shopify order in the last 30 days,
+        # surface it to Claude as order_context. Empty string when no
+        # match → falls through to "(none provided)" placeholder, same
+        # behaviour as before.
+        order_line = _lookup_recent_order(wa_id)
+
+        # Run the twin.
+        classification, reply, _raw = draft_reply_logic(text_body, order_line, history=history)
 
         if not classification or not reply:
             print(
@@ -1152,6 +1315,71 @@ def webhook():
         except Exception:
             pass
         print("=" * 60 + "\n")
+        return jsonify({"status": "ok"}), 200
+
+
+@app.route("/shopify-webhook", methods=["POST"])
+def shopify_webhook():
+    """Receive Shopify order webhooks, verify HMAC, log to the orders table.
+
+    Shopify expects 200 on success. We return:
+      - 401 with [WEBHOOK] Invalid signature when HMAC verification fails
+      - 200 in every other case (parse errors, DB hiccups), so Shopify
+        doesn't retry forever and create duplicate rows
+    """
+    # Use raw bytes — JSON re-serialization would break HMAC verification.
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+
+    if not _verify_shopify_hmac(raw_body, hmac_header):
+        print("[WEBHOOK] Invalid signature")
+        return jsonify({"error": "invalid signature"}), 401
+
+    try:
+        data = json.loads(raw_body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        print(f"[SHOPIFY] Invalid JSON: {e}")
+        return jsonify({"status": "ok"}), 200
+
+    try:
+        order_id = str(data.get("id") or "")
+        customer = data.get("customer") or {}
+        shipping = data.get("shipping_address") or {}
+
+        # Phone: prefer shipping_address.phone, fall back to customer.phone.
+        raw_phone = shipping.get("phone") or customer.get("phone") or ""
+        customer_phone = _phone_to_10digit(raw_phone)
+
+        customer_name = customer.get("first_name") or ""
+
+        line_items = data.get("line_items") or []
+        product_names = ", ".join(
+            (item.get("title") or "") for item in line_items if item
+        )
+
+        total_price = str(data.get("total_price") or "")
+        order_status = data.get("financial_status") or ""
+        created_at = data.get("created_at") or ""
+
+        _log_shopify_order(
+            order_id=order_id,
+            customer_phone=customer_phone,
+            customer_name=customer_name,
+            product_names=product_names,
+            total_price=total_price,
+            order_status=order_status,
+            created_at=created_at,
+        )
+
+        print(
+            f"[SHOPIFY] Logged order #{order_id} "
+            f"phone={customer_phone or '(none)'} name={customer_name or '(none)'} "
+            f"status={order_status}"
+        )
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print(f"[SHOPIFY] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return jsonify({"status": "ok"}), 200
 
 
@@ -1350,6 +1578,9 @@ def dashboard_data():
         cur.execute("SELECT COUNT(*) FROM message_logs")
         total_logged_all_time = cur.fetchone()[0] or 0
 
+        cur.execute("SELECT COUNT(*) FROM orders")
+        total_orders_all_time = cur.fetchone()[0] or 0
+
         # Webhook uptime — fraction of today's events that didn't ERROR.
         total_today = kpis["total"]
         errors_today = kpis["errors"]
@@ -1379,6 +1610,7 @@ def dashboard_data():
             "render_status": "online",
             "db_path": DB_PATH,
             "total_logged": total_logged_all_time,
+            "total_orders": total_orders_all_time,
             "webhook_uptime_pct": webhook_uptime_pct,
             "webhook_total_today": total_today,
             "webhook_success_today": total_today - errors_today,
