@@ -138,7 +138,29 @@ SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 # Both missing → GET handshake always 403; POST processes locally but
 # can't send replies.
 INSTAGRAM_VERIFY_TOKEN = os.environ.get("INSTAGRAM_VERIFY_TOKEN", "")
-INSTAGRAM_PAGE_ACCESS_TOKEN = os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
+
+
+def _clean_meta_token(raw: str) -> str:
+    """Defensive cleanup for Meta access tokens pasted into env vars.
+
+    Strips trailing/leading whitespace (newlines included), surrounding
+    single or double quotes, and a leading "Bearer " if the founder pasted
+    an entire header value. Without this, a stray newline or quote in the
+    Render env var produces Meta's HTTP 400 'Cannot parse access token'
+    even though the token itself is valid — the most common production
+    paste mistake.
+    """
+    s = (raw or "").strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    if s.lower().startswith("bearer "):
+        s = s[7:].strip()
+    return s
+
+
+INSTAGRAM_PAGE_ACCESS_TOKEN = _clean_meta_token(
+    os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
+)
 INSTAGRAM_TIMEOUT_SECONDS = 10
 
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
@@ -560,9 +582,16 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
         if resp.ok:
             print(f"[INSTAGRAM] Sent reply to {sender_id} ({len(text)} chars)")
         else:
+            # On failure, surface diagnostic info about the token so
+            # config issues are obvious from Render logs without leaking
+            # the secret itself. Length + 4-char prefix is enough to tell
+            # whether the env var loaded, was truncated, or carried garbage.
+            tok_len = len(INSTAGRAM_PAGE_ACCESS_TOKEN)
+            tok_prefix = INSTAGRAM_PAGE_ACCESS_TOKEN[:4] if tok_len else "(empty)"
             print(
                 f"[INSTAGRAM] Failed: HTTP {resp.status_code} "
-                f"{resp.text[:300]}"
+                f"{resp.text[:300]} "
+                f"(token len={tok_len}, prefix={tok_prefix!r})"
             )
     except requests.RequestException as e:
         print(f"[INSTAGRAM] Network error: {type(e).__name__}: {e}")
