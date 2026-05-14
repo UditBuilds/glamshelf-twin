@@ -270,6 +270,63 @@ BRAIN_CACHE_TTL_SECONDS = 300
 _brain_cache_text: str | None = None
 _brain_cache_loaded_at: float = 0.0
 
+# Human-takeover pause register. When Udit sends an outbound WATI message
+# containing "#pause" (typically appended to a real reply to the customer),
+# that customer's wa_id is added here with a 4-hour expiry. While present,
+# the WATI webhook handler short-circuits before any Claude call so the
+# twin stops auto-replying — the human is on it. "#resume" removes the
+# entry immediately. The register is in-memory only (resets on Render
+# restart, which is acceptable; the brain's Section 7 protocol covers
+# this anyway).
+PAUSED_TTL_SECONDS = 4 * 60 * 60  # 4 hours
+paused_numbers: dict[str, float] = {}  # wa_id -> expiry unix timestamp
+
+
+def _is_paused(wa_id: str) -> bool:
+    """Return True if this number is currently in a human-takeover window.
+    Also opportunistically prunes any expired entries so the dict stays
+    bounded — no separate cleanup job needed."""
+    now = time.time()
+    expired = [num for num, exp in paused_numbers.items() if exp < now]
+    for num in expired:
+        del paused_numbers[num]
+        print(f"[PAUSE] Auto-expired for {num} (4h elapsed)")
+    return wa_id in paused_numbers
+
+
+def _handle_pause_directive(wa_id: str, text_body: str) -> str | None:
+    """Detect #pause / #resume directives embedded in a webhook event.
+
+    Returns:
+      "pause"   if "#pause" appeared in text_body (caller should stop
+                processing — directive has been recorded)
+      "resume"  if "#resume" appeared (entry removed if present)
+      None      no directive — caller continues normal flow
+
+    Designed to ride along inside a real outbound message Udit sent
+    through WATI to the customer (e.g. "Sure, looking into it. #pause").
+    WATI fires a webhook event for those outbound messages with the
+    customer's wa_id as the subject — that wa_id is what we register.
+    Customers accidentally typing "#pause" would pause themselves;
+    acceptable since these strings are unusual enough that it's rare.
+    """
+    lower = text_body.lower()
+    if "#pause" in lower:
+        paused_numbers[wa_id] = time.time() + PAUSED_TTL_SECONDS
+        print(
+            f"[PAUSE] Human takeover activated for {wa_id} "
+            f"(expires in {PAUSED_TTL_SECONDS}s = 4h)"
+        )
+        return "pause"
+    if "#resume" in lower:
+        if wa_id in paused_numbers:
+            del paused_numbers[wa_id]
+            print(f"[PAUSE] Human takeover released for {wa_id}")
+        else:
+            print(f"[PAUSE] #resume seen for {wa_id} but no active pause to clear")
+        return "resume"
+    return None
+
 
 def _init_db() -> None:
     """Create the message_logs table and supporting indexes if missing.
@@ -1458,6 +1515,21 @@ def webhook():
             print("[WEBHOOK] Skipped: missing waId")
             return jsonify({"status": "ok"}), 200
 
+        # #pause / #resume directive scan. Done EARLY so a directive
+        # embedded in Udit's manual outbound (which arrives at /webhook
+        # via WATI's outbound echo) is honoured before any other gate
+        # could discard the event. The directive itself doesn't get
+        # replied to; we mark seen-id so re-fires don't reprocess.
+        directive = _handle_pause_directive(wa_id, text_body)
+        if directive is not None:
+            if msg_id:
+                _seen_ids.add(msg_id)
+                _persist_seen_id(msg_id)
+            _log_message(
+                wa_id, sender_name, text_body, status=f"PAUSE_CMD_{directive.upper()}"
+            )
+            return jsonify({"status": "ok"}), 200
+
         # Don't process messages from our own business or owner number.
         # Compared on normalized digits so format quirks (+91, 0091, spaces,
         # etc.) can't slip past the equality check.
@@ -1480,6 +1552,14 @@ def webhook():
         if msg_id:
             _seen_ids.add(msg_id)
             _persist_seen_id(msg_id)
+
+        # Human-takeover gate. If Udit previously sent "#pause" for this
+        # number (within the last 4h), short-circuit before any Claude
+        # call — log only, no reply. Mirrors brain.md Section 7.
+        if _is_paused(wa_id):
+            print(f"[PAUSED] Skipping reply — human takeover active for {wa_id}")
+            _log_message(wa_id, sender_name, text_body, status="PAUSED")
+            return jsonify({"status": "ok"}), 200
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
 
