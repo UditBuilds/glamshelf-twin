@@ -130,28 +130,20 @@ BACKUP_INTERVAL_SECONDS = 60 * 60
 # the safe default until the secret is set.
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 
-# Shopify Admin API config — for live inventory queries injected into the
-# system prompt on every Claude call. Separate from the webhook secret
-# above: the webhook secret verifies inbound order pushes, while these
-# credentials authenticate OUTBOUND read calls to the products.json
-# endpoint.
+# Live inventory source — Shopify's public storefront /products.json.
 #
-# To generate the token:
-#   Shopify Admin → Settings → Apps and sales channels → Develop apps →
-#   Create an app ("glamshelf-twin-inventory") → Configure Admin API
-#   scopes → enable read_products and read_inventory → Install app →
-#   reveal "Admin API access token". Starts with shpat_.
+# No auth needed: every Shopify store exposes a public read-only feed at
+# <store-domain>/products.json that returns up to 250 products per page
+# with their variants. This is the same JSON Shopify themes consume on
+# the storefront, so it's safe to hit from anywhere with no API token.
 #
-# SHOPIFY_STORE_DOMAIN should be the *.myshopify.com domain (not the
-# custom domain). Default keeps the production value so the env var is
-# optional in practice; override only if the store domain ever changes.
-# Missing token → get_live_inventory() silently returns "" and the
-# webhook continues normally without live stock data.
-SHOPIFY_ADMIN_API_TOKEN = os.environ.get("SHOPIFY_ADMIN_API_TOKEN", "")
-SHOPIFY_STORE_DOMAIN = os.environ.get(
-    "SHOPIFY_STORE_DOMAIN", "glamshelf.myshopify.com"
-).strip().rstrip("/")
-SHOPIFY_API_VERSION = "2024-01"
+# Trade-off vs the Admin API: this endpoint does NOT expose
+# inventory_quantity (numeric units). Each variant only carries an
+# `available` boolean. We use that boolean to mark IN STOCK / SOLD OUT
+# — sufficient for Claude to decide when to use the out-of-stock script
+# without us having to manage a Shopify Admin App token.
+SHOPIFY_PRODUCTS_URL = "https://glamshelf.in/products.json"
+SHOPIFY_PRODUCTS_LIMIT = 250  # the endpoint's max page size
 SHOPIFY_TIMEOUT_SECONDS = 8
 
 # 5-minute in-memory cache for live inventory. Single-entry dict — the
@@ -1336,18 +1328,20 @@ def get_live_inventory() -> str:
     plaintext block suitable for prepending to the brain on every Claude
     call.
 
-    Format (matches the contract Claude is told to expect in brain.md
-    Section 2 note):
+    Source: Shopify's public storefront /products.json endpoint — no
+    auth required. Each variant exposes an `available` boolean (NOT a
+    numeric quantity), so the block marks every product as either IN
+    STOCK or SOLD OUT with no unit counts:
 
         [LIVE INVENTORY - checked now]
-        GS1 Luxe Light Lash Tray: IN STOCK (40 units)
+        GS1 Luxe Light Lash Tray: IN STOCK
         GS3 Luxe Light Half Lash Tray: SOLD OUT
         ...
 
-    Returns "" on any failure — missing credentials, network error, HTTP
-    error, malformed JSON, anything. The caller treats "" as "no live
-    data, continue with the brain as-is" so a Shopify outage never breaks
-    the webhook. NEVER raises.
+    Returns "" on any failure — network error, HTTP error, malformed
+    JSON, anything. The caller treats "" as "no live data, continue with
+    the brain as-is" so a Shopify outage never breaks the webhook.
+    NEVER raises.
 
     Cached in-memory for 5 minutes per worker (INVENTORY_CACHE_TTL_SECONDS).
     Important: only SUCCESSFUL fetches are cached. If the call fails we
@@ -1364,26 +1358,15 @@ def get_live_inventory() -> str:
         print(f"[INVENTORY] Cache hit (age {age:.0f}s, TTL {INVENTORY_CACHE_TTL_SECONDS}s)")
         return _inventory_cache["text"]
 
-    if not SHOPIFY_ADMIN_API_TOKEN or not SHOPIFY_STORE_DOMAIN:
-        print("[INVENTORY] Skipped: SHOPIFY_ADMIN_API_TOKEN or SHOPIFY_STORE_DOMAIN not set")
-        return ""
-
-    url = (
-        f"https://{SHOPIFY_STORE_DOMAIN}"
-        f"/admin/api/{SHOPIFY_API_VERSION}/products.json"
-    )
-    headers = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_API_TOKEN}
-    params = {"limit": 50}
+    params = {"limit": SHOPIFY_PRODUCTS_LIMIT}
 
     try:
         resp = requests.get(
-            url, headers=headers, params=params, timeout=SHOPIFY_TIMEOUT_SECONDS
+            SHOPIFY_PRODUCTS_URL, params=params, timeout=SHOPIFY_TIMEOUT_SECONDS
         )
         if not resp.ok:
-            # Don't leak the full response body in case it echoes back
-            # anything sensitive. Status + first 200 chars is enough to
-            # diagnose 401 (bad token) vs 404 (wrong domain) vs 429 (rate
-            # limited) vs anything else from Render logs.
+            # Status + first 200 chars is enough to diagnose 404 (wrong
+            # path), 429 (rate limited), or 5xx from Render logs.
             print(
                 f"[INVENTORY] Shopify HTTP {resp.status_code}: "
                 f"{resp.text[:200]}"
@@ -1404,26 +1387,24 @@ def get_live_inventory() -> str:
         variants = p.get("variants") or []
         if not title or not variants:
             continue
-        qty = variants[0].get("inventory_quantity")
-        if qty is None:
-            # Variant exists but inventory tracking is off — skip rather
-            # than guess. Better to omit a row than mislabel it.
+        # The public storefront endpoint exposes `available` (bool) per
+        # variant — true means at least one unit is in stock, false means
+        # sold out. Variants where the field is absent (very old themes)
+        # get skipped rather than guessed.
+        available = variants[0].get("available")
+        if available is None:
             continue
-        try:
-            qty_int = int(qty)
-        except (TypeError, ValueError):
-            continue
-        if qty_int > 0:
-            lines.append(f"{title}: IN STOCK ({qty_int} units)")
+        if available:
+            lines.append(f"{title}: IN STOCK")
         else:
             lines.append(f"{title}: SOLD OUT")
 
-    # If Shopify returned products but none had usable inventory, we
-    # still produced a one-line block (just the header). That's not
+    # If Shopify returned products but none had usable availability data,
+    # we'd still produce a one-line block (just the header). That's not
     # useful for Claude and would consume system-prompt tokens for
     # nothing — return "" so the brain prompt is unchanged.
     if len(lines) == 1:
-        print(f"[INVENTORY] Shopify returned {len(products)} products but none had inventory data")
+        print(f"[INVENTORY] Shopify returned {len(products)} products but none had availability data")
         return ""
 
     block = "\n".join(lines) + "\n"
@@ -1431,7 +1412,7 @@ def get_live_inventory() -> str:
     _inventory_cache["fetched_at"] = now
     print(
         f"[INVENTORY] Fetched {len(products)} products from Shopify "
-        f"({len(lines) - 1} with inventory)"
+        f"({len(lines) - 1} with availability)"
     )
     return block
 
@@ -1755,16 +1736,14 @@ def inventory_debug():
 
     Gated by the same DASHBOARD_KEY as /dashboard-data. Returns whatever
     get_live_inventory() currently has — empty string means the call
-    failed silently (check Render logs for [INVENTORY] lines) or the
-    Shopify env vars are unset. Cache TTL is 5 minutes; refresh by
-    waiting it out or restarting the worker.
+    failed silently (check Render logs for [INVENTORY] lines). Cache
+    TTL is 5 minutes; refresh by waiting it out or restarting the worker.
 
     Response shape:
         {
             "inventory": "<the formatted block, possibly empty>",
             "cached_age_seconds": <float, 0 on first call after restart>,
-            "shopify_token_set": <bool>,
-            "shopify_store_domain": "<string>"
+            "shopify_products_url": "<string>"
         }
     """
     if request.args.get("key") != DASHBOARD_KEY:
@@ -1777,8 +1756,7 @@ def inventory_debug():
             if _inventory_cache["fetched_at"]
             else None
         ),
-        "shopify_token_set": bool(SHOPIFY_ADMIN_API_TOKEN),
-        "shopify_store_domain": SHOPIFY_STORE_DOMAIN,
+        "shopify_products_url": SHOPIFY_PRODUCTS_URL,
     })
 
 
