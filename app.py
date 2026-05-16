@@ -130,6 +130,38 @@ BACKUP_INTERVAL_SECONDS = 60 * 60
 # the safe default until the secret is set.
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 
+# Shopify Admin API config — for live inventory queries injected into the
+# system prompt on every Claude call. Separate from the webhook secret
+# above: the webhook secret verifies inbound order pushes, while these
+# credentials authenticate OUTBOUND read calls to the products.json
+# endpoint.
+#
+# To generate the token:
+#   Shopify Admin → Settings → Apps and sales channels → Develop apps →
+#   Create an app ("glamshelf-twin-inventory") → Configure Admin API
+#   scopes → enable read_products and read_inventory → Install app →
+#   reveal "Admin API access token". Starts with shpat_.
+#
+# SHOPIFY_STORE_DOMAIN should be the *.myshopify.com domain (not the
+# custom domain). Default keeps the production value so the env var is
+# optional in practice; override only if the store domain ever changes.
+# Missing token → get_live_inventory() silently returns "" and the
+# webhook continues normally without live stock data.
+SHOPIFY_ADMIN_API_TOKEN = os.environ.get("SHOPIFY_ADMIN_API_TOKEN", "")
+SHOPIFY_STORE_DOMAIN = os.environ.get(
+    "SHOPIFY_STORE_DOMAIN", "glamshelf.myshopify.com"
+).strip().rstrip("/")
+SHOPIFY_API_VERSION = "2024-01"
+SHOPIFY_TIMEOUT_SECONDS = 8
+
+# 5-minute in-memory cache for live inventory. Single-entry dict — the
+# formatted block (string) and the unix timestamp it was fetched at.
+# Empty-string entries are NOT cached: a transient Shopify outage
+# shouldn't pin a no-data result for the full TTL. Only successful
+# fetches set fetched_at.
+INVENTORY_CACHE_TTL_SECONDS = 300
+_inventory_cache: dict = {"text": "", "fetched_at": 0.0}
+
 # Instagram DM webhook config.
 #
 # IMPORTANT — there are TWO Instagram messaging APIs and they need
@@ -1299,6 +1331,111 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         print(f"[WATI] Unexpected error: {type(e).__name__}: {e}")
 
 
+def get_live_inventory() -> str:
+    """Fetch current stock for every product in Shopify and return a
+    plaintext block suitable for prepending to the brain on every Claude
+    call.
+
+    Format (matches the contract Claude is told to expect in brain.md
+    Section 2 note):
+
+        [LIVE INVENTORY - checked now]
+        GS1 Luxe Light Lash Tray: IN STOCK (40 units)
+        GS3 Luxe Light Half Lash Tray: SOLD OUT
+        ...
+
+    Returns "" on any failure — missing credentials, network error, HTTP
+    error, malformed JSON, anything. The caller treats "" as "no live
+    data, continue with the brain as-is" so a Shopify outage never breaks
+    the webhook. NEVER raises.
+
+    Cached in-memory for 5 minutes per worker (INVENTORY_CACHE_TTL_SECONDS).
+    Important: only SUCCESSFUL fetches are cached. If the call fails we
+    return "" without caching, so the next customer message will re-try
+    rather than wait out the full TTL behind a transient error.
+
+    Product titles are echoed verbatim from Shopify — no mapping table
+    here, so a product rename in Shopify takes effect on the next 5-min
+    cache rollover with no brain.md change.
+    """
+    now = time.time()
+    age = now - _inventory_cache["fetched_at"]
+    if _inventory_cache["text"] and age < INVENTORY_CACHE_TTL_SECONDS:
+        print(f"[INVENTORY] Cache hit (age {age:.0f}s, TTL {INVENTORY_CACHE_TTL_SECONDS}s)")
+        return _inventory_cache["text"]
+
+    if not SHOPIFY_ADMIN_API_TOKEN or not SHOPIFY_STORE_DOMAIN:
+        print("[INVENTORY] Skipped: SHOPIFY_ADMIN_API_TOKEN or SHOPIFY_STORE_DOMAIN not set")
+        return ""
+
+    url = (
+        f"https://{SHOPIFY_STORE_DOMAIN}"
+        f"/admin/api/{SHOPIFY_API_VERSION}/products.json"
+    )
+    headers = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_API_TOKEN}
+    params = {"limit": 50}
+
+    try:
+        resp = requests.get(
+            url, headers=headers, params=params, timeout=SHOPIFY_TIMEOUT_SECONDS
+        )
+        if not resp.ok:
+            # Don't leak the full response body in case it echoes back
+            # anything sensitive. Status + first 200 chars is enough to
+            # diagnose 401 (bad token) vs 404 (wrong domain) vs 429 (rate
+            # limited) vs anything else from Render logs.
+            print(
+                f"[INVENTORY] Shopify HTTP {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+            return ""
+        products = (resp.json() or {}).get("products") or []
+    except requests.RequestException as e:
+        print(f"[INVENTORY] Network error: {type(e).__name__}: {e}")
+        return ""
+    except Exception as e:
+        # Defensive — JSON decode error, unexpected payload shape, anything.
+        print(f"[INVENTORY] Unexpected error: {type(e).__name__}: {e}")
+        return ""
+
+    lines = ["[LIVE INVENTORY - checked now]"]
+    for p in products:
+        title = (p.get("title") or "").strip()
+        variants = p.get("variants") or []
+        if not title or not variants:
+            continue
+        qty = variants[0].get("inventory_quantity")
+        if qty is None:
+            # Variant exists but inventory tracking is off — skip rather
+            # than guess. Better to omit a row than mislabel it.
+            continue
+        try:
+            qty_int = int(qty)
+        except (TypeError, ValueError):
+            continue
+        if qty_int > 0:
+            lines.append(f"{title}: IN STOCK ({qty_int} units)")
+        else:
+            lines.append(f"{title}: SOLD OUT")
+
+    # If Shopify returned products but none had usable inventory, we
+    # still produced a one-line block (just the header). That's not
+    # useful for Claude and would consume system-prompt tokens for
+    # nothing — return "" so the brain prompt is unchanged.
+    if len(lines) == 1:
+        print(f"[INVENTORY] Shopify returned {len(products)} products but none had inventory data")
+        return ""
+
+    block = "\n".join(lines) + "\n"
+    _inventory_cache["text"] = block
+    _inventory_cache["fetched_at"] = now
+    print(
+        f"[INVENTORY] Fetched {len(products)} products from Shopify "
+        f"({len(lines) - 1} with inventory)"
+    )
+    return block
+
+
 def draft_reply_logic(
     message: str,
     order_context: str = "",
@@ -1328,6 +1465,19 @@ def draft_reply_logic(
         raise FileNotFoundError(f"brain file not found at {BRAIN_FILE}")
 
     brain = _load_brain_cached()
+
+    # Prepend live Shopify inventory to the brain so Claude always sees
+    # current stock at the very top of the system prompt. Empty string on
+    # any failure (silent fallback) — brain alone is still a complete
+    # working prompt; the inventory block is additive context. See
+    # get_live_inventory() doc for details. The 5-minute cache there
+    # plus Anthropic's 5-minute ephemeral system-prompt cache mean the
+    # system prompt's content changes at most ~once per 5 minutes; the
+    # cache churn cost is acceptable for the freshness gain.
+    live_stock = get_live_inventory()
+    if live_stock:
+        brain = live_stock + "\n\n" + brain
+
     raw = ask_claude(brain, message, order_context, history=history, source=source)
 
     classification = ""
@@ -1596,6 +1746,39 @@ def healthz():
             normalize_wa(BUSINESS_NUMBER),
             normalize_wa(OWNER_NUMBER),
         ],
+    })
+
+
+@app.route("/inventory-debug")
+def inventory_debug():
+    """Diagnostic endpoint for live Shopify inventory.
+
+    Gated by the same DASHBOARD_KEY as /dashboard-data. Returns whatever
+    get_live_inventory() currently has — empty string means the call
+    failed silently (check Render logs for [INVENTORY] lines) or the
+    Shopify env vars are unset. Cache TTL is 5 minutes; refresh by
+    waiting it out or restarting the worker.
+
+    Response shape:
+        {
+            "inventory": "<the formatted block, possibly empty>",
+            "cached_age_seconds": <float, 0 on first call after restart>,
+            "shopify_token_set": <bool>,
+            "shopify_store_domain": "<string>"
+        }
+    """
+    if request.args.get("key") != DASHBOARD_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    block = get_live_inventory()
+    return jsonify({
+        "inventory": block,
+        "cached_age_seconds": (
+            round(time.time() - _inventory_cache["fetched_at"], 1)
+            if _inventory_cache["fetched_at"]
+            else None
+        ),
+        "shopify_token_set": bool(SHOPIFY_ADMIN_API_TOKEN),
+        "shopify_store_domain": SHOPIFY_STORE_DOMAIN,
     })
 
 
