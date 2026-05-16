@@ -126,6 +126,12 @@ If the message is a recognised greeting ("hi", "hey", "hello", "hola", "namaste"
 
 ## SECTION 2 — PRODUCTS & PRICING
 
+> **Note: Live inventory is injected at runtime.** Always refer to the
+> `[LIVE INVENTORY]` block above for current stock status. Never assume
+> a product is in or out of stock from this section. If the live block
+> is missing, fall back to asking the customer to check on the website
+> rather than guessing stock status.
+
 ### Single Pairs
 | Product | Price | Description |
 |---------|-------|-------------|
@@ -140,11 +146,11 @@ If the message is a recognised greeting ("hi", "hey", "hello", "hola", "namaste"
 | MINK TRIO | ₹549 | 3× KAWAII faux mink lashes, value set for frequent wearers |
 
 ### Luxe Light Trays (10 pairs each, ₹849)
-| Product | Price | Description | Status |
-|---------|-------|-------------|--------|
-| GS1 Luxe Light Lash Tray | ₹849 | Soft natural finish, everyday + light bridal | ✅ In Stock |
-| GS2 Luxe Light Lash Tray | ₹849 | Bolder bridal/event finish, preferred by MUAs | ✅ In Stock |
-| GS3 Luxe Light Half Lash Tray | ₹849 | Half/corner lashes for subtle lifted look | 🚨 SOLD OUT |
+| Product | Price | Description |
+|---------|-------|-------------|
+| GS1 Luxe Light Lash Tray | ₹849 | Soft natural finish, everyday + light bridal |
+| GS2 Luxe Light Lash Tray | ₹849 | Bolder bridal/event finish, preferred by MUAs |
+| GS3 Luxe Light Half Lash Tray | ₹849 | Half/corner lashes for subtle lifted look |
 
 ### Generic Price Inquiry Handling
 
