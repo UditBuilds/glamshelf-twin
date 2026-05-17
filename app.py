@@ -379,6 +379,36 @@ HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
 # better than missing the notification entirely.
 _sent_shipping_updates: set[tuple[str, str]] = set()
 
+# Post-delivery review-request scheduler.
+#
+# When _process_shipping_event handles a "delivered" event we schedule a
+# threading.Timer to fire REVIEW_DELAY_SECONDS later and send a single
+# WhatsApp message asking the customer for a review. Dedup is keyed by
+# order_id so an order can only ever schedule one review (even if Shopify
+# fires the delivered webhook multiple times for retries / edits).
+#
+# WARNING — in-memory state. The Timer thread + the _scheduled_reviews
+# dict do not survive a Render worker restart. If Render redeploys
+# during the 10-day window the review just doesn't send for the orders
+# in flight. This is documented and accepted per spec — durable
+# scheduling would require Postgres + a separate worker, out of scope.
+#
+# REVIEW_DELAY_SECONDS is a module-level constant so tests can monkey-
+# patch it (e.g. set to 60 for a 1-minute verification end-to-end)
+# without touching the scheduling logic.
+REVIEW_DELAY_SECONDS = 60   # TESTING — 1 minute. REVERT to 10 * 24 * 60 * 60 before merging to master.
+_scheduled_reviews: dict[str, dict] = {}
+
+REVIEW_REQUEST_TEMPLATE = (
+    "Hi {first_name}! Hope you're loving your lashes from The Glam Shelf 🤍\n\n"
+    "If you have a minute, a quick review on our website would mean so much "
+    "to us — it helps other girls find us too!\n\n"
+    "→ glamshelf.in/pages/reviews\n\n"
+    "And if you've worn them, we'd love to see! Tag us @glamshelfstore on "
+    "Instagram 🤍\n\n"
+    "— Team The Glam Shelf"
+)
+
 # ----- Telegram DRAFT inline-button approval flow -----
 #
 # When the WATI webhook classifies a message as DRAFT+APPROVE, instead of
@@ -2350,6 +2380,58 @@ def inventory_debug():
     })
 
 
+@app.route("/review-debug")
+def review_debug():
+    """Diagnostic endpoint showing currently scheduled review requests.
+
+    Gated by the same DASHBOARD_KEY as /dashboard-data. Reads the
+    in-memory _scheduled_reviews dict — empty after every worker
+    restart even if reviews were scheduled before. Useful for confirming
+    a 'delivered' shipping event actually scheduled the follow-up.
+
+    Response shape:
+        {
+            "scheduled_reviews": [
+                {
+                    "order_id": "...",
+                    "order_number": "#1042",
+                    "customer_number": "919...",
+                    "customer_name": "Priya",
+                    "scheduled_at": <unix ts>,
+                    "fires_in_hours": 239.5
+                },
+                ...
+            ],
+            "total": <int>,
+            "review_delay_seconds": REVIEW_DELAY_SECONDS
+        }
+    """
+    if request.args.get("key") != DASHBOARD_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    now = time.time()
+    items = []
+    for order_id, entry in _scheduled_reviews.items():
+        scheduled_at = entry.get("scheduled_at") or 0
+        fires_at = scheduled_at + REVIEW_DELAY_SECONDS
+        remaining_seconds = max(0.0, fires_at - now)
+        items.append({
+            "order_id": order_id,
+            "order_number": entry.get("order_number") or "",
+            "customer_number": entry.get("customer_number") or "",
+            "customer_name": entry.get("customer_name") or "",
+            "scheduled_at": scheduled_at,
+            "fires_in_hours": round(remaining_seconds / 3600, 2),
+        })
+    items.sort(key=lambda x: x["fires_in_hours"])
+
+    return jsonify({
+        "scheduled_reviews": items,
+        "total": len(items),
+        "review_delay_seconds": REVIEW_DELAY_SECONDS,
+    })
+
+
 @app.route("/dashboard")
 def dashboard():
     """Serve the static control-panel HTML, gated by the same DASHBOARD_KEY
@@ -2804,6 +2886,97 @@ def shopify_webhook():
         return jsonify({"status": "ok"}), 200
 
 
+def _send_review_request(order_id: str) -> None:
+    """Timer callback — fires REVIEW_DELAY_SECONDS after a 'delivered'
+    shipping event. Sends the review-request WhatsApp template via WATI
+    and clears the entry from _scheduled_reviews.
+
+    Wrapped in try/except so a transient failure (WATI down, customer
+    number gone bad, anything) never crashes the daemon thread. No retry
+    on failure — review nudges are nice-to-have, not critical.
+    """
+    try:
+        entry = _scheduled_reviews.get(order_id)
+        if not entry:
+            print(f"[REVIEW] Timer fired for order_id={order_id} but no entry — likely already sent or cancelled")
+            return
+
+        customer_number = entry.get("customer_number") or ""
+        customer_name = entry.get("customer_name") or ""
+        order_number = entry.get("order_number") or order_id
+
+        if not customer_number:
+            # Shouldn't happen because _schedule_review_request gates on
+            # this, but defensive — if state was corrupted somehow, skip
+            # rather than send to nobody.
+            print(f"[REVIEW] No phone for order {order_number} at fire time — skipping")
+            _scheduled_reviews.pop(order_id, None)
+            return
+
+        # First-name fallback so the greeting reads naturally if Shopify
+        # didn't include the recipient's first name on the fulfillment.
+        first_name = customer_name or "there"
+
+        print(
+            f"[REVIEW] Sending review request for order {order_number} "
+            f"to {customer_number} (name={customer_name or '(none)'})"
+        )
+        message = REVIEW_REQUEST_TEMPLATE.format(first_name=first_name)
+        send_whatsapp_reply(customer_number, message)
+        _scheduled_reviews.pop(order_id, None)
+        print(f"[REVIEW] Sent review request for order {order_number} to {customer_number}")
+    except Exception as e:
+        print(f"[REVIEW] Send error for order_id={order_id}: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        _scheduled_reviews.pop(order_id, None)
+
+
+def _schedule_review_request(
+    order_id: str,
+    order_number: str,
+    customer_number: str,
+    customer_name: str,
+) -> None:
+    """Schedule a single review-request WhatsApp message for REVIEW_DELAY_SECONDS
+    from now. Idempotent: if a review is already scheduled for this
+    order_id, do nothing (dedup gate).
+
+    Called from _process_shipping_event after a 'delivered' message ships
+    successfully. Failure modes:
+      - missing customer_number → log + skip (no recipient to send to)
+      - missing order_id → log + skip (can't dedup without a key)
+      - already-scheduled → log + skip (dedup)
+    """
+    if not order_id:
+        print("[REVIEW] No order_id — skipping review schedule")
+        return
+    if not customer_number:
+        print(f"[REVIEW] No phone for order {order_number or order_id} — skipping review schedule")
+        return
+    if order_id in _scheduled_reviews:
+        print(f"[REVIEW] Already scheduled for order {order_number or order_id} — dedup skip")
+        return
+
+    now = time.time()
+    _scheduled_reviews[order_id] = {
+        "customer_number": customer_number,
+        "customer_name": customer_name,
+        "order_number": order_number,
+        "scheduled_at": now,
+        "delivered_at": now,
+    }
+    timer = threading.Timer(REVIEW_DELAY_SECONDS, _send_review_request, args=(order_id,))
+    timer.daemon = True
+    timer.start()
+
+    hours = REVIEW_DELAY_SECONDS / 3600
+    print(
+        f"[REVIEW] Scheduled review request for order {order_number or order_id} "
+        f"({customer_number}) — fires in {hours:g}h"
+    )
+    print("[REVIEW] Note: timer is in-memory — will reset on Render restart")
+
+
 def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     """Decide whether a Shopify fulfillment webhook should trigger a
     customer-facing WhatsApp update, build the message per the configured
@@ -2926,6 +3099,22 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         f"[SHIPPING] Sent {event!r} update for order #{order_number} "
         f"to {wa_id} (name={first_name or '(none)'})"
     )
+
+    # Post-delivery hook: when an order is marked delivered, schedule a
+    # review-request WhatsApp for REVIEW_DELAY_SECONDS later. The
+    # scheduler dedupes by order_id so retried "delivered" webhooks only
+    # schedule once. Failure here never blocks the shipping confirmation
+    # already sent above — _schedule_review_request swallows everything.
+    if event == "delivered":
+        try:
+            _schedule_review_request(
+                order_id=order_id,
+                order_number=f"#{order_number}" if order_number else "",
+                customer_number=wa_id,
+                customer_name=first_name,
+            )
+        except Exception as e:
+            print(f"[REVIEW] Schedule call failed for order #{order_number}: {type(e).__name__}: {e}")
 
 
 @app.route("/shopify-fulfillment", methods=["POST"])
