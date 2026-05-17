@@ -396,7 +396,7 @@ _sent_shipping_updates: set[tuple[str, str]] = set()
 # REVIEW_DELAY_SECONDS is a module-level constant so tests can monkey-
 # patch it (e.g. set to 60 for a 1-minute verification end-to-end)
 # without touching the scheduling logic.
-REVIEW_DELAY_SECONDS = 60   # TESTING — 1 minute. REVERT to 10 * 24 * 60 * 60 before merging to master.
+REVIEW_DELAY_SECONDS = 10 * 24 * 60 * 60   # 864000s = 10 days
 _scheduled_reviews: dict[str, dict] = {}
 
 REVIEW_REQUEST_TEMPLATE = (
@@ -2377,71 +2377,6 @@ def inventory_debug():
             else None
         ),
         "shopify_products_url": SHOPIFY_PRODUCTS_URL,
-    })
-
-
-@app.route("/trigger-test-review")
-def trigger_test_review():
-    """Test-only endpoint — schedule a fake review request without needing
-    a real Shopify 'delivered' webhook. Gated by DASHBOARD_KEY.
-
-    Query params (all optional):
-      number  — recipient wa_id in "91XXXXXXXXXX" form
-                (default: OWNER_NUMBER env var). IMPORTANT: send_whatsapp_reply
-                BLOCKS outbound sends to BUSINESS_NUMBER / OWNER_NUMBER as
-                defense-in-depth, so if the default matches one of those
-                you'll see [REVIEW] schedule + fire logs but the WATI send
-                will be blocked. Pass &number=<other_wa_id> (your personal
-                phone) to actually receive the message.
-      name    — first name for the greeting (default: "Udit")
-      order   — order number label for logs / dedup key (default: "#TEST01")
-
-    Schedules a review for REVIEW_DELAY_SECONDS from now. If the same
-    order is triggered twice, the dedup gate in _schedule_review_request
-    short-circuits the second call (response will still show "scheduled"
-    but [REVIEW] Already scheduled... will appear in logs).
-    """
-    if request.args.get("key") != DASHBOARD_KEY:
-        return jsonify({"error": "unauthorized"}), 401
-
-    number = (request.args.get("number") or OWNER_NUMBER or "").strip()
-    name = (request.args.get("name") or "Udit").strip()
-    order_number = (request.args.get("order") or "#TEST01").strip()
-    # Internal order_id key — strip leading "#" so it matches how real
-    # Shopify events would populate _scheduled_reviews (order_id is the
-    # numeric id, order_number is the customer-facing "#1042" label).
-    order_id = order_number.lstrip("#") or "TEST01"
-
-    # Surface the outbound-block warning so the caller isn't surprised
-    # when no WhatsApp arrives on a protected number.
-    blocked = False
-    try:
-        protected = {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}
-        if normalize_wa(number) in protected:
-            blocked = True
-    except Exception:
-        pass
-
-    _schedule_review_request(
-        order_id=order_id,
-        order_number=order_number,
-        customer_number=number,
-        customer_name=name,
-    )
-
-    return jsonify({
-        "status": "scheduled",
-        "order_id": order_id,
-        "order_number": order_number,
-        "customer_number": number,
-        "customer_name": name,
-        "fires_in_seconds": REVIEW_DELAY_SECONDS,
-        "wati_outbound_blocked": blocked,
-        "warning": (
-            "Recipient matches BUSINESS_NUMBER / OWNER_NUMBER — send_whatsapp_reply "
-            "will BLOCK the actual outbound. Schedule + timer logs will still fire. "
-            "Pass &number=<other_wa_id> to actually receive the WhatsApp."
-        ) if blocked else None,
     })
 
 
