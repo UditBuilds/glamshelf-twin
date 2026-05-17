@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import shutil
 import sqlite3
 import sys
@@ -334,6 +335,26 @@ HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
 # is one duplicate message per customer per event type, which is far
 # better than missing the notification entirely.
 _sent_shipping_updates: set[tuple[str, str]] = set()
+
+# ----- Telegram DRAFT inline-button approval flow -----
+#
+# When the WATI webhook classifies a message as DRAFT+APPROVE, instead of
+# sending a plain Telegram notification we send a message with three
+# inline buttons (✅ Send as-is / ✏️ Edit / ⛔ Skip) and register the
+# pending draft in _pending_drafts. The /telegram-callback endpoint
+# receives the button tap (or Udit's edited text) and actions it.
+#
+# State is in-memory only — a worker restart loses any pending drafts.
+# Acceptable: orphaned Telegram buttons just return an "Already handled"
+# toast via the dedup check (draft_id not in _pending_drafts), and Udit
+# gets a fresh draft on the next inbound from the same customer.
+#
+# Key is the short draft_id (8 hex chars from secrets.token_hex(4)) so
+# callback_data fits in Telegram's 64-byte hard limit alongside action
+# and customer phone.
+PENDING_DRAFT_TTL_SECONDS = 24 * 60 * 60     # opportunistic prune cutoff
+EDIT_TIMEOUT_SECONDS = 10 * 60                # 10 min per spec
+_pending_drafts: dict[str, dict] = {}
 
 
 def _is_paused(wa_id: str) -> bool:
@@ -1259,6 +1280,346 @@ def send_telegram_notification(
         print(f"[TG] Unexpected error: {type(e).__name__}: {e}")
 
 
+# ===== Telegram inline-button DRAFT approval flow =====
+
+def _telegram_api(method: str, payload: dict) -> dict | None:
+    """POST to Telegram Bot API. Returns parsed JSON on success, None on
+    any failure. Never raises — Telegram side effects are non-critical.
+
+    Used by the DRAFT-button flow (send_draft_for_approval and the
+    /telegram-callback handlers). The legacy send_telegram_notification
+    above predates this helper and still has its own inline requests
+    call; intentionally left alone to keep that codepath byte-identical.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        print(f"[TELEGRAM DRAFT] {method} skipped: TELEGRAM_BOT_TOKEN not set")
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        resp = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
+        if not resp.ok:
+            print(f"[TELEGRAM DRAFT] {method} HTTP {resp.status_code}: {resp.text[:300]}")
+            return None
+        return resp.json()
+    except requests.RequestException as e:
+        print(f"[TELEGRAM DRAFT] {method} network error: {type(e).__name__}: {e}")
+        return None
+    except Exception as e:
+        print(f"[TELEGRAM DRAFT] {method} unexpected error: {type(e).__name__}: {e}")
+        return None
+
+
+def _is_authorized_telegram_chat(chat_id) -> bool:
+    """Only honor callback/message events from the configured owner chat.
+
+    Without this gate, anyone who discovers /telegram-callback could
+    trigger WhatsApp sends on your behalf. We check the chat id from the
+    incoming Telegram update against TELEGRAM_CHAT_ID — if mismatched,
+    the handler silently drops the event.
+    """
+    if not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        return str(chat_id) == str(TELEGRAM_CHAT_ID)
+    except Exception:
+        return False
+
+
+def send_draft_for_approval(
+    customer_number: str,
+    customer_name: str,
+    customer_message: str,
+    reply_text: str,
+) -> bool:
+    """Send a Telegram message with [✅ Send as-is | ✏️ Edit | ⛔ Skip]
+    inline buttons and register the draft in _pending_drafts so the
+    /telegram-callback handler can action it.
+
+    Returns True if the buttoned message was sent and state was registered;
+    False on any failure (caller may fall back to plain-text notification).
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM DRAFT] Skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+        return False
+
+    draft_id = secrets.token_hex(4)  # 8 hex chars → safe for 64-byte callback_data limit
+    sender_block = (
+        f"{customer_name} ({customer_number})" if customer_name else customer_number
+    )
+    text = (
+        "🟡 DRAFT + APPROVE\n\n"
+        f"From: {sender_block}\n\n"
+        "Customer said:\n"
+        f'"{customer_message}"\n\n'
+        "Drafted reply:\n"
+        f'"{reply_text}"'
+    )
+
+    # callback_data must be ≤ 64 bytes (Telegram hard limit). Our format:
+    #   "action:<verb>|num:<wa_id>|id:<8-hex>"
+    # Worst case: action:send (11) + |num: (5) + 12 wa_id + |id: (4) + 8 = 40 bytes.
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Send as-is", "callback_data": f"action:send|num:{customer_number}|id:{draft_id}"},
+            {"text": "✏️ Edit",       "callback_data": f"action:edit|num:{customer_number}|id:{draft_id}"},
+            {"text": "⛔ Skip",        "callback_data": f"action:skip|num:{customer_number}|id:{draft_id}"},
+        ]]
+    }
+
+    resp = _telegram_api("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "reply_markup": keyboard,
+    })
+    if not resp or not resp.get("ok"):
+        return False
+
+    result = resp.get("result") or {}
+    _pending_drafts[draft_id] = {
+        "reply_text": reply_text,
+        "customer_number": customer_number,
+        "customer_name": customer_name,
+        "customer_message": customer_message,
+        "original_text": text,
+        "telegram_chat_id": (result.get("chat") or {}).get("id"),
+        "telegram_message_id": result.get("message_id"),
+        "awaiting_edit": False,
+        "created_at": time.time(),
+    }
+
+    # Opportunistic prune — clean entries older than TTL so the dict
+    # stays bounded even if some drafts are never actioned.
+    cutoff = time.time() - PENDING_DRAFT_TTL_SECONDS
+    for stale_id in [k for k, v in _pending_drafts.items() if v["created_at"] < cutoff]:
+        del _pending_drafts[stale_id]
+
+    print(f"[TELEGRAM DRAFT] Sent buttoned draft id={draft_id} for {customer_number}")
+    return True
+
+
+def _parse_callback_data(data: str) -> dict:
+    """Parse 'action:send|num:919...|id:abc12345' into a dict.
+
+    Robust to missing fields; returns whatever keys were present. Caller
+    validates required fields.
+    """
+    out: dict = {}
+    for part in (data or "").split("|"):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            out[k] = v
+    return out
+
+
+def _finalize_draft_message(
+    chat_id, message_id, original_text: str, suffix: str
+) -> None:
+    """Strip the inline keyboard from a draft message and append a status
+    line so Udit can see what happened without scrolling. Best effort —
+    failures here just mean the buttons stick around looking active, but
+    the dedup check (draft_id not in _pending_drafts) still prevents
+    duplicate actions on subsequent taps.
+    """
+    _telegram_api("editMessageReplyMarkup", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": {"inline_keyboard": []},
+    })
+    _telegram_api("editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": (original_text + "\n\n" + suffix)[:4096],  # Telegram message length limit
+    })
+
+
+def _handle_telegram_callback(cb: dict) -> None:
+    """Process a single inline-button tap (callback_query).
+
+    Answers the callback first (Telegram requires it within ~30s or the
+    button shows a loading spinner forever), then does the action.
+    """
+    callback_id = cb.get("id")
+    data_str = cb.get("data") or ""
+    msg = cb.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+
+    if not _is_authorized_telegram_chat(chat_id):
+        print(f"[TELEGRAM DRAFT] Ignored callback from unauthorized chat {chat_id}")
+        # Still answer so the user's button doesn't spin forever.
+        if callback_id:
+            _telegram_api("answerCallbackQuery", {
+                "callback_query_id": callback_id, "text": "Not authorized"
+            })
+        return
+
+    parsed = _parse_callback_data(data_str)
+    action = parsed.get("action")
+    draft_id = parsed.get("id")
+    customer_number = parsed.get("num")
+
+    draft = _pending_drafts.get(draft_id) if draft_id else None
+
+    # Dedup — second tap on same button (or post-restart orphan).
+    if not draft:
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id, "text": "Already handled"
+        })
+        print(f"[TELEGRAM DRAFT] Tap on stale draft id={draft_id} — already handled")
+        return
+
+    customer_name = draft.get("customer_name") or ""
+    name_for_display = customer_name or customer_number
+    original_text = draft.get("original_text") or (msg.get("text") or "")
+
+    if action == "send":
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id, "text": "Sending…"
+        })
+        send_whatsapp_reply(customer_number, draft["reply_text"])
+        _finalize_draft_message(
+            chat_id, message_id, original_text,
+            f"✅ Sent to {name_for_display}",
+        )
+        del _pending_drafts[draft_id]
+        print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
+
+    elif action == "edit":
+        # Flip the awaiting flag; the next message from this chat becomes
+        # the edited reply (see _handle_telegram_message).
+        draft["awaiting_edit"] = True
+        draft["edit_started_at"] = time.time()
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id, "text": "Send your edit"
+        })
+        # Remove buttons immediately so a second tap doesn't re-trigger.
+        _telegram_api("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+        _telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"✏️ Please send your edited message for {name_for_display}:",
+        })
+        # Schedule a 10-min auto-skip timer in case Udit walks away.
+        timer = threading.Timer(EDIT_TIMEOUT_SECONDS, _edit_timeout_check, args=(draft_id,))
+        timer.daemon = True
+        timer.start()
+        print(f"[TELEGRAM DRAFT] Awaiting edit for {customer_number} (draft {draft_id})")
+
+    elif action == "skip":
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id, "text": "Skipped"
+        })
+        _finalize_draft_message(
+            chat_id, message_id, original_text,
+            "⛔ Skipped — handle manually in WATI",
+        )
+        del _pending_drafts[draft_id]
+        print(f"[TELEGRAM DRAFT] Skipped for {customer_number} (draft {draft_id})")
+
+    else:
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id, "text": "Unknown action"
+        })
+        print(f"[TELEGRAM DRAFT] Unknown action {action!r} on draft {draft_id}")
+
+
+def _handle_telegram_message(msg: dict) -> None:
+    """Process a regular text message from Telegram.
+
+    Today's only purpose: complete an in-flight Edit flow. If any pending
+    draft is marked awaiting_edit for this chat, the next text message
+    from Udit becomes the edited reply (sent to WATI verbatim).
+
+    Anything else (chat messages from Udit not tied to a pending edit) is
+    logged and ignored.
+    """
+    chat_id = (msg.get("chat") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+    if not _is_authorized_telegram_chat(chat_id):
+        return  # silently drop anything from unauthorized chats
+
+    # Find oldest awaiting-edit draft from this chat. If somehow there are
+    # multiple, the oldest is the most likely one Udit meant — but in
+    # practice there's at most one because hitting Edit removes buttons
+    # from that message immediately.
+    target_id: str | None = None
+    target_started: float = float("inf")
+    for did, d in _pending_drafts.items():
+        if (
+            d.get("awaiting_edit")
+            and d.get("telegram_chat_id") == chat_id
+            and d.get("edit_started_at", float("inf")) < target_started
+        ):
+            target_id = did
+            target_started = d.get("edit_started_at", float("inf"))
+
+    if not target_id:
+        # Not part of an edit flow — could be Udit typing anything in the
+        # bot chat. Ignore (no command system yet).
+        return
+
+    draft = _pending_drafts[target_id]
+    customer_number = draft["customer_number"]
+    customer_name = draft.get("customer_name") or ""
+    name_for_display = customer_name or customer_number
+
+    send_whatsapp_reply(customer_number, text)
+    _telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": f"✅ Sent your edit to {name_for_display}",
+    })
+
+    # Annotate the original draft message so the chat history reads cleanly.
+    orig_chat = draft.get("telegram_chat_id")
+    orig_msg = draft.get("telegram_message_id")
+    original_text = draft.get("original_text") or ""
+    if orig_chat and orig_msg:
+        _finalize_draft_message(
+            orig_chat, orig_msg, original_text,
+            f"✏️ Edited and sent to {name_for_display}",
+        )
+
+    del _pending_drafts[target_id]
+    print(f"[TELEGRAM DRAFT] Edit completed for {customer_number} (draft {target_id})")
+
+
+def _edit_timeout_check(draft_id: str) -> None:
+    """Fires EDIT_TIMEOUT_SECONDS after Edit was tapped. If the draft is
+    still awaiting an edit at that point, auto-skip and notify Telegram.
+
+    No-op if the user already sent the edit, hit Skip, or the worker
+    restarted (draft would no longer be in _pending_drafts).
+    """
+    draft = _pending_drafts.get(draft_id)
+    if not draft or not draft.get("awaiting_edit"):
+        return  # already actioned
+    customer_number = draft.get("customer_number") or "(unknown)"
+    customer_name = draft.get("customer_name") or ""
+    name_for_display = customer_name or customer_number
+    print(f"[DRAFT] Edit timed out for {customer_number}")
+
+    chat_id = draft.get("telegram_chat_id")
+    if chat_id:
+        _telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"⏱️ Edit timed out for {name_for_display} — auto-skipped",
+        })
+    # Also strip buttons / annotate the original message if we still have its id.
+    orig_msg = draft.get("telegram_message_id")
+    original_text = draft.get("original_text") or ""
+    if chat_id and orig_msg:
+        _finalize_draft_message(
+            chat_id, orig_msg, original_text,
+            "⏱️ Edit timed out — auto-skipped",
+        )
+    _pending_drafts.pop(draft_id, None)
+
+
 def normalize_wa(number: str) -> str:
     """Reduce a phone number to comparable digits.
 
@@ -2019,10 +2380,25 @@ def webhook():
                 status="AUTO", reply_text=reply, latency_ms=elapsed_ms,
             )
         elif classification == "DRAFT+APPROVE":
-            send_telegram_notification(
-                classification, text_body, reply, sender_info=sender_info
+            # New buttoned approval flow: Telegram message with
+            # ✅ Send as-is / ✏️ Edit / ⛔ Skip inline buttons. State is
+            # registered in _pending_drafts; the actual customer reply
+            # ships from the /telegram-callback handler when Udit taps
+            # Send or completes an Edit. Falls back to the legacy plain-
+            # text notification if the buttoned send fails (missing
+            # Telegram config, network error, etc.) so Udit always gets
+            # *some* heads-up about the pending draft.
+            sent_with_buttons = send_draft_for_approval(
+                customer_number=wa_id,
+                customer_name=sender_name,
+                customer_message=text_body,
+                reply_text=reply,
             )
-            print(f"[DRAFT] Notified founder for {wa_id}")
+            if not sent_with_buttons:
+                send_telegram_notification(
+                    classification, text_body, reply, sender_info=sender_info
+                )
+            print(f"[DRAFT] Notified founder for {wa_id} (buttons={sent_with_buttons})")
             elapsed_ms = int((time.time() - t_start) * 1000)
             _log_message(
                 wa_id, sender_name, text_body,
@@ -2329,6 +2705,48 @@ def shopify_fulfillment():
         traceback.print_exc()
 
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/telegram-callback", methods=["POST"])
+def telegram_callback():
+    """Telegram webhook endpoint — handles both inline-button taps
+    (callback_query updates, used by the DRAFT approval flow) and regular
+    text messages (used by the Edit completion sub-flow).
+
+    Register with Telegram via:
+      POST https://api.telegram.org/bot<TOKEN>/setWebhook
+        ?url=https://glamshelf-twin.onrender.com/telegram-callback
+        &allowed_updates=["callback_query","message"]
+
+    Auth: only events whose chat.id matches TELEGRAM_CHAT_ID are honored
+    (see _is_authorized_telegram_chat). Unauthorized events get silently
+    dropped (callback queries are answered with "Not authorized" so the
+    button doesn't spin).
+
+    Always returns 200 so Telegram doesn't retry on internal hiccups.
+    """
+    try:
+        update = request.get_json(silent=True) or {}
+
+        # Inline-button tap.
+        cb = update.get("callback_query")
+        if cb:
+            _handle_telegram_callback(cb)
+            return jsonify({"status": "ok"}), 200
+
+        # Regular text message — only meaningful if Udit is in the middle
+        # of an Edit flow. Otherwise ignored.
+        msg = update.get("message")
+        if msg:
+            _handle_telegram_message(msg)
+            return jsonify({"status": "ok"}), 200
+
+        # Other update types (edited_message, channel_post, etc.) — ignore.
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print(f"[TELEGRAM DRAFT] Webhook handler error: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return jsonify({"status": "ok"}), 200
 
 
 @app.route("/instagram-webhook", methods=["GET"])
