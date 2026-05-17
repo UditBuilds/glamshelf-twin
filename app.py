@@ -321,6 +321,20 @@ _bot_recent_replies: dict[str, float] = {}  # reply text -> expiry unix timestam
 # Matches the brain's Section 7 "4+ hours of silence to resume" rule.
 HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
 
+# Shipping-update dedup. Shopify can deliver the same fulfillments/create
+# or fulfillments/update webhook multiple times (network retries, edits,
+# manual re-pushes from the admin). We never want to spam a customer with
+# duplicate "Your order has shipped" messages.
+#
+# Keyed by (order_id, event_type) where event_type is "shipped" /
+# "out_for_delivery" / "delivered". A given order can legitimately fire
+# all three events (one each), but only one of each type.
+#
+# In-memory only — resets on worker restart. Worst case after a redeploy
+# is one duplicate message per customer per event type, which is far
+# better than missing the notification entirely.
+_sent_shipping_updates: set[tuple[str, str]] = set()
+
 
 def _is_paused(wa_id: str) -> bool:
     """Return True if this number is currently in a human-takeover window.
@@ -781,6 +795,30 @@ def _phone_to_10digit(raw: str) -> str:
     elif len(digits) == 11 and digits.startswith("0"):
         digits = digits[1:]
     return digits
+
+
+def _phone_to_wa_id(raw: str) -> str:
+    """Convert any Indian phone string to WATI's "91XXXXXXXXXX" wa_id format.
+
+    Sibling of _phone_to_10digit but in the opposite direction — produces
+    the country-code-prefixed form WATI uses as the recipient ID when
+    sending session messages. Returns "" if there aren't enough digits
+    to be a plausible mobile number, so the caller can decide whether
+    to skip the send entirely.
+
+    Reuses _phone_to_10digit so the parsing rules stay consistent — any
+    string it accepts gets a "91" prefixed; anything it rejects (wrong
+    length, junk) returns "".
+
+    "+91 98765 43210" -> "919876543210"
+    "09876543210"      -> "919876543210"
+    "9876543210"        -> "919876543210"
+    "919876543210"      -> "919876543210"
+    """
+    ten = _phone_to_10digit(raw)
+    if len(ten) != 10:
+        return ""
+    return "91" + ten
 
 
 def _log_shopify_order(
@@ -2120,6 +2158,177 @@ def shopify_webhook():
         print(f"[SHOPIFY] EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
         return jsonify({"status": "ok"}), 200
+
+
+def _process_shipping_event(topic: str, fulfillment: dict) -> None:
+    """Decide whether a Shopify fulfillment webhook should trigger a
+    customer-facing WhatsApp update, build the message per the configured
+    templates, and dispatch via send_whatsapp_reply.
+
+    `topic` is the lower-cased X-Shopify-Topic header value:
+      - "fulfillments/create" → "Order shipped" template
+      - "fulfillments/update" → check shipment_status:
+            "out_for_delivery" → out-for-delivery template
+            "delivered"        → delivered template
+            anything else      → no message, silent acknowledge
+
+    Dedup: (order_id, event_type) pairs are tracked in _sent_shipping_updates
+    so retries / re-pushes don't spam the customer.
+
+    All errors bubble up to the route handler (which wraps in try/except
+    and always returns 200). Errors prefixed with [SHIPPING ERROR] in logs.
+    """
+    order_id = str(fulfillment.get("order_id") or fulfillment.get("id") or "")
+
+    # Shopify's `name` on a fulfillment is like "#1042.1" or "#1042-1"
+    # (order number + fulfillment sequence). Strip the suffix so the
+    # customer sees "#1042". Also strip a leading "#" because the
+    # message templates supply their own.
+    order_name_raw = (fulfillment.get("name") or "").strip()
+    order_number = order_name_raw
+    for sep in (".", "-"):
+        if sep in order_number:
+            order_number = order_number.split(sep, 1)[0]
+            break
+    order_number = order_number.lstrip("#")
+    if not order_number:
+        order_number = order_id  # fallback if name was missing
+
+    shipment_status = (fulfillment.get("shipment_status") or "").strip().lower()
+
+    # Decide which template (if any) applies.
+    event: str | None = None
+    if topic == "fulfillments/create":
+        event = "shipped"
+    elif topic == "fulfillments/update":
+        if shipment_status == "out_for_delivery":
+            event = "out_for_delivery"
+        elif shipment_status == "delivered":
+            event = "delivered"
+
+    if event is None:
+        print(
+            f"[SHIPPING] No template for topic={topic!r} "
+            f"shipment_status={shipment_status!r} (order #{order_number}) — "
+            f"silent acknowledge"
+        )
+        return
+
+    # Dedup BEFORE we look up the customer info — same key, same skip.
+    dedup_key = (order_id, event)
+    if dedup_key in _sent_shipping_updates:
+        print(
+            f"[SHIPPING] Already sent {event!r} for order #{order_number} "
+            f"(order_id={order_id}) — dedup skip"
+        )
+        return
+
+    # Extract customer info. The fulfillment payload's `destination` block
+    # is a copy of the shipping address — most reliable source of name +
+    # phone for the recipient.
+    destination = fulfillment.get("destination") or {}
+    first_name = (destination.get("first_name") or "").strip()
+    phone_raw = (destination.get("phone") or "").strip()
+
+    wa_id = _phone_to_wa_id(phone_raw)
+    if not wa_id:
+        print(f"[SHIPPING] No phone number for order #{order_number}, skipping")
+        return
+
+    # Build message per template.
+    greeting_name = first_name or "there"
+    if event == "shipped":
+        tracking_number = (fulfillment.get("tracking_number") or "").strip()
+        tracking_company = (fulfillment.get("tracking_company") or "").strip()
+        estimated_delivery = (fulfillment.get("estimated_delivery_at") or "").strip()
+
+        lines = [
+            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
+            f"has been shipped 🤍",
+            "",
+        ]
+        if tracking_number:
+            lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+        if tracking_company:
+            lines.append(f"Carrier: {tracking_company}")
+        if estimated_delivery:
+            lines.append(f"Estimated delivery: {estimated_delivery}")
+        lines.append("")
+        lines.append("Feel free to reach out if you need anything!")
+        message = "\n".join(lines)
+    elif event == "out_for_delivery":
+        message = (
+            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
+            f"is out for delivery today 🤍\n\n"
+            f"Keep an eye out — it'll be at your door soon!"
+        )
+    elif event == "delivered":
+        message = (
+            f"Hi {greeting_name}! Your order #{order_number} has been "
+            f"delivered 🤍\n\n"
+            f"Hope you love your lashes! If you have any questions about "
+            f"how to use them, just message us here."
+        )
+    else:
+        return  # Unreachable, but defensive.
+
+    # Ship it. send_whatsapp_reply handles WATI failures internally and
+    # never raises; it also pre-registers the outbound text in
+    # _bot_recent_replies so the subsequent WATI outbound webhook echo
+    # doesn't get mis-tagged as HUMAN_UDIT.
+    send_whatsapp_reply(wa_id, message)
+    _sent_shipping_updates.add(dedup_key)
+    print(
+        f"[SHIPPING] Sent {event!r} update for order #{order_number} "
+        f"to {wa_id} (name={first_name or '(none)'})"
+    )
+
+
+@app.route("/shopify-fulfillment", methods=["POST"])
+def shopify_fulfillment():
+    """Receive Shopify fulfillments/create and fulfillments/update webhooks,
+    verify HMAC, and dispatch a customer-facing WhatsApp shipping update
+    via WATI per _process_shipping_event.
+
+    Three triggers handled:
+      - fulfillments/create → "Order shipped" message with tracking link
+      - fulfillments/update + shipment_status=out_for_delivery → OFD message
+      - fulfillments/update + shipment_status=delivered → delivered message
+    All other update statuses (in_transit, attempted_delivery, etc.) are
+    silently acknowledged (200) with no customer message.
+
+    Auth: same SHOPIFY_WEBHOOK_SECRET that gates /shopify-webhook. Each
+    Shopify webhook subscription must be registered with the matching
+    secret for HMAC verification to pass.
+
+    Returns:
+      - 401 on HMAC mismatch (Shopify will retry; secret must be wrong)
+      - 200 in every other case (parse errors, internal exceptions, no
+        template match) — Shopify treats 200 as delivered and won't retry,
+        which is what we want for invalid/uninteresting events
+    """
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+    topic = (request.headers.get("X-Shopify-Topic") or "").strip().lower()
+
+    if not _verify_shopify_hmac(raw_body, hmac_header):
+        print("[SHIPPING] Invalid HMAC signature")
+        return jsonify({"error": "invalid signature"}), 401
+
+    try:
+        data = json.loads(raw_body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        print(f"[SHIPPING] Invalid JSON: {e}")
+        return jsonify({"status": "ok"}), 200
+
+    try:
+        _process_shipping_event(topic, data)
+    except Exception as e:
+        # [SHIPPING ERROR] prefix lets the founder grep for failures.
+        print(f"[SHIPPING ERROR] {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/instagram-webhook", methods=["GET"])
