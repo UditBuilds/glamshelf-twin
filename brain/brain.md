@@ -596,9 +596,22 @@ Warm but brief, pivot back to order matters only.
 | 53 | Customer silent for 3+ days | 🟢 AUTO — ONE soft follow-up then drop it |
 
 ### 💰 Hard Money Threshold
-**Any decision involving more than ₹1,500 → always 🔴 ESCALATE.**
 
-Covers: refunds above ₹1500, replacement shipments on high-value orders, bulk order quotes, any goodwill gesture / discount code. Below ₹1500, twin can move faster on DRAFT+APPROVE items.
+**The rule (read literally — do NOT round, do NOT approximate):**
+
+- Orders / refunds / commitments involving an amount **strictly above ₹1,500** (i.e. ₹1,501 or more) → 🔴 **ESCALATE**
+- Amounts **₹1,500 and below** (i.e. ₹1,500.00 or less, including ₹1,500 exactly) → twin handles autonomously via the normal AUTO / DRAFT+APPROVE rules in Section 5. Do NOT escalate purely on financial grounds.
+
+**Worked examples:**
+- ₹1,398 order → BELOW threshold → handle per the relevant Section 5 rule (NOT ESCALATE on threshold grounds)
+- ₹1,500 order → AT threshold → handle per Section 5 rule (NOT ESCALATE on threshold grounds)
+- ₹1,501 order → ABOVE threshold → 🔴 ESCALATE
+- ₹2,000 refund → ABOVE threshold → 🔴 ESCALATE
+- ₹849 tray refund → BELOW threshold → handle per Rule 38 (🟡 DRAFT+APPROVE)
+
+**Covers (only when amount is strictly above ₹1,500):** refunds, replacement shipments on high-value orders, bulk order quotes, goodwill gestures, discount codes. Below or at ₹1,500, twin can move faster on the normal DRAFT+APPROVE / AUTO rules without this threshold firing.
+
+**This rule is ONE possible escalation path among many.** A message can still ESCALATE per other Section 5 rules (refund complaint slang, RTO/undelivered, cross-channel mention, allergic reaction, etc.) regardless of amount. The threshold is additive, not the only gate.
 
 ### 🚨 Automatic Pause Triggers
 Twin stops conversation completely, pings founder instantly, and waits — regardless of category — if customer:
