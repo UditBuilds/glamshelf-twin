@@ -2977,6 +2977,36 @@ def _schedule_review_request(
     print("[REVIEW] Note: timer is in-memory — will reset on Render restart")
 
 
+def _extract_tracking_number(fulfillment: dict) -> str:
+    """Pull the tracking number from a Shopify fulfillment payload.
+
+    Shopify exposes tracking under several keys depending on plan version
+    and which fulfillment service populated it:
+      - fulfillment.tracking_number             (single, most common)
+      - fulfillment.tracking_numbers[0]         (array form)
+      - fulfillment.tracking_info.number        (newer nested object)
+
+    Returns the first non-empty string found, stripped, or "" if none.
+    """
+    direct = (fulfillment.get("tracking_number") or "").strip() if isinstance(fulfillment.get("tracking_number"), str) else ""
+    if direct:
+        return direct
+
+    arr = fulfillment.get("tracking_numbers")
+    if isinstance(arr, list) and arr:
+        first = arr[0]
+        if isinstance(first, str) and first.strip():
+            return first.strip()
+
+    info = fulfillment.get("tracking_info")
+    if isinstance(info, dict):
+        nested = info.get("number")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+
+    return ""
+
+
 def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     """Decide whether a Shopify fulfillment webhook should trigger a
     customer-facing WhatsApp update, build the message per the configured
@@ -3013,7 +3043,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
 
     shipment_status = (fulfillment.get("shipment_status") or "").strip().lower()
 
-    # Decide which template (if any) applies.
+    # Decide which status template (if any) applies.
     #
     # Shopify fires fulfillments/create when an order is fulfilled in
     # Shopify Admin (or when Shiprocket pushes the initial fulfillment),
@@ -3022,13 +3052,17 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     # fulfillments/update as the parcel moves through pickup → transit →
     # out for delivery → delivered. The status mapping below covers both
     # the create flow (no shipment_status) and the Shiprocket update
-    # flow (where the same SHIPPED notification needs to fire on
-    # shipment_status='in_transit' — that's the first event after
-    # Shiprocket picks the parcel up).
+    # flow.
     #
     # Dedup keys are (order_id, event), so "shipped" can only fire once
     # per order regardless of whether create or in_transit triggered it.
+    #
+    # pickup_scheduled / pickup_failed are known pre-shipment statuses —
+    # we don't send the customer a message for them, but we do NOT
+    # early-return here because the same webhook might also carry a
+    # tracking number that needs its own follow-up handling below.
     event: str | None = None
+    pre_shipment_silent = False
     if topic == "fulfillments/create":
         event = "shipped"
     elif topic == "fulfillments/update":
@@ -3040,15 +3074,56 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         elif shipment_status == "delivered":
             event = "delivered"
         elif shipment_status in ("pickup_scheduled", "pickup_failed"):
-            # Known Shiprocket pre-shipment statuses — explicitly silent.
-            # Acknowledging them by name (rather than letting them fall
-            # through to the generic "no template" log) makes it clear we
-            # know about these and chose not to message the customer.
-            print(
-                f"[SHIPPING] Silent ack for shipment_status={shipment_status!r} "
-                f"(order #{order_number}) — known pre-shipment status, no customer message"
+            pre_shipment_silent = True
+
+    # Extract customer info upfront. The fulfillment payload's `destination`
+    # block is a copy of the shipping address — most reliable source of
+    # name + phone for the recipient. We resolve it now because BOTH the
+    # tracking follow-up below and the status message below need it.
+    destination = fulfillment.get("destination") or {}
+    first_name = (destination.get("first_name") or "").strip()
+    phone_raw = (destination.get("phone") or "").strip()
+    wa_id = _phone_to_wa_id(phone_raw)
+    greeting_name = first_name or "there"
+
+    # Tracking number can appear under several field paths — extract once.
+    tracking_number = _extract_tracking_number(fulfillment)
+
+    # ----- TRACKING FOLLOW-UP -----
+    # Only on fulfillments/update. The fulfillments/create flow embeds
+    # tracking inline in the "shipped" message (and marks the tracking
+    # dedup key after sending, see below), so a subsequent update with
+    # the same tracking won't double-message the customer.
+    #
+    # This block runs INDEPENDENTLY of the status message — both can
+    # fire on the same webhook if it carries a status change AND a
+    # tracking number. Dedup key (order_id, "tracking") guarantees the
+    # follow-up only goes out once per order.
+    if topic == "fulfillments/update":
+        tracking_dedup_key = (order_id, "tracking")
+        if not tracking_number:
+            print(f"[SHIPPING] No tracking number in payload for order #{order_number}")
+        elif tracking_dedup_key in _sent_shipping_updates:
+            print(f"[SHIPPING] Already sent tracking for order #{order_number} — dedup skip")
+        elif not wa_id:
+            print(f"[SHIPPING] No phone for tracking follow-up on order #{order_number}, skipping")
+        else:
+            tracking_message = (
+                f"Hi {greeting_name}! Here's your tracking link for order #{order_number} 🤍\n\n"
+                f"Track your order: https://shiprocket.in/tracking/{tracking_number}\n\n"
+                f"Feel free to reach out if you need anything!"
             )
-            return
+            send_whatsapp_reply(wa_id, tracking_message)
+            _sent_shipping_updates.add(tracking_dedup_key)
+            print(f"[SHIPPING] Sent tracking link for order #{order_number} to {wa_id}")
+
+    # ----- STATUS MESSAGE -----
+    if pre_shipment_silent:
+        print(
+            f"[SHIPPING] Silent ack for shipment_status={shipment_status!r} "
+            f"(order #{order_number}) — known pre-shipment status, no customer message"
+        )
+        return
 
     if event is None:
         print(
@@ -3058,7 +3133,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         )
         return
 
-    # Dedup BEFORE we look up the customer info — same key, same skip.
+    # Dedup BEFORE building/sending the status message.
     dedup_key = (order_id, event)
     if dedup_key in _sent_shipping_updates:
         print(
@@ -3067,22 +3142,12 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         )
         return
 
-    # Extract customer info. The fulfillment payload's `destination` block
-    # is a copy of the shipping address — most reliable source of name +
-    # phone for the recipient.
-    destination = fulfillment.get("destination") or {}
-    first_name = (destination.get("first_name") or "").strip()
-    phone_raw = (destination.get("phone") or "").strip()
-
-    wa_id = _phone_to_wa_id(phone_raw)
     if not wa_id:
         print(f"[SHIPPING] No phone number for order #{order_number}, skipping")
         return
 
     # Build message per template.
-    greeting_name = first_name or "there"
     if event == "shipped":
-        tracking_number = (fulfillment.get("tracking_number") or "").strip()
         tracking_company = (fulfillment.get("tracking_company") or "").strip()
         estimated_delivery = (fulfillment.get("estimated_delivery_at") or "").strip()
 
@@ -3122,6 +3187,15 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     # doesn't get mis-tagged as HUMAN_UDIT.
     send_whatsapp_reply(wa_id, message)
     _sent_shipping_updates.add(dedup_key)
+
+    # If the shipped message embedded the tracking line, also mark the
+    # tracking dedup so a later fulfillments/update with the same
+    # tracking number doesn't fire a redundant "Here's your tracking
+    # link" follow-up. Only relevant for the "shipped" event — the
+    # out_for_delivery / delivered templates don't embed tracking.
+    if event == "shipped" and tracking_number:
+        _sent_shipping_updates.add((order_id, "tracking"))
+
     print(
         f"[SHIPPING] Sent {event!r} update for order #{order_number} "
         f"to {wa_id} (name={first_name or '(none)'})"
