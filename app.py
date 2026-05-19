@@ -3014,14 +3014,41 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     shipment_status = (fulfillment.get("shipment_status") or "").strip().lower()
 
     # Decide which template (if any) applies.
+    #
+    # Shopify fires fulfillments/create when an order is fulfilled in
+    # Shopify Admin (or when Shiprocket pushes the initial fulfillment),
+    # but the shipment_status on that create event is often empty — the
+    # carrier hasn't reported a status yet. Shiprocket then fires
+    # fulfillments/update as the parcel moves through pickup → transit →
+    # out for delivery → delivered. The status mapping below covers both
+    # the create flow (no shipment_status) and the Shiprocket update
+    # flow (where the same SHIPPED notification needs to fire on
+    # shipment_status='in_transit' — that's the first event after
+    # Shiprocket picks the parcel up).
+    #
+    # Dedup keys are (order_id, event), so "shipped" can only fire once
+    # per order regardless of whether create or in_transit triggered it.
     event: str | None = None
     if topic == "fulfillments/create":
         event = "shipped"
     elif topic == "fulfillments/update":
-        if shipment_status == "out_for_delivery":
+        if shipment_status == "in_transit":
+            # First Shiprocket status after pickup — treat as "we shipped".
+            event = "shipped"
+        elif shipment_status == "out_for_delivery":
             event = "out_for_delivery"
         elif shipment_status == "delivered":
             event = "delivered"
+        elif shipment_status in ("pickup_scheduled", "pickup_failed"):
+            # Known Shiprocket pre-shipment statuses — explicitly silent.
+            # Acknowledging them by name (rather than letting them fall
+            # through to the generic "no template" log) makes it clear we
+            # know about these and chose not to message the customer.
+            print(
+                f"[SHIPPING] Silent ack for shipment_status={shipment_status!r} "
+                f"(order #{order_number}) — known pre-shipment status, no customer message"
+            )
+            return
 
     if event is None:
         print(
