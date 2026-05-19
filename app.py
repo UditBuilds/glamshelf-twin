@@ -1795,6 +1795,114 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         print(f"[WATI] Unexpected error: {type(e).__name__}: {e}")
 
 
+def send_whatsapp_template(
+    wa_id: str,
+    template_name: str,
+    parameters: list[dict],
+    broadcast_name: str | None = None,
+) -> bool:
+    """Send a WhatsApp template (HSM) message via WATI's sendTemplateMessage API.
+
+    Template messages work OUTSIDE WATI's 24-hour session window — the
+    failure mode that sessionMessage hits with "Ticket has been expired"
+    when the customer hasn't messaged us in the last 24h. Used for
+    transactional notifications (order shipped, etc.) where the customer
+    may not have messaged us before.
+
+    Args:
+      wa_id: recipient phone in "91XXXXXXXXXX" format
+      template_name: WATI template name as configured in the WATI dashboard
+        (e.g. "shipping_notification_template")
+      parameters: list of {"name": "...", "value": "..."} dicts matching
+        the variable names configured in the WATI template. WATI expects
+        named parameters (not positional {{1}}/{{2}} placeholders) in the
+        request body — the names map to the placeholders server-side.
+      broadcast_name: optional broadcast label for WATI's analytics
+        (defaults to template_name)
+
+    Returns:
+      True if WATI accepted the message (HTTP 2xx and result=true),
+      False on any failure — network error, HTTP error, WATI rejection
+      (e.g. template not approved, parameters mismatched), missing config.
+      NEVER raises — caller can fall back to send_whatsapp_reply.
+
+    Same auth + base URL as send_whatsapp_reply — only the path differs
+    (sendTemplateMessage vs sendSessionMessage). Per the WATI_ENDPOINT
+    comment at the top of this module, the existing prod value already
+    points at live-mt-server.wati.io which serves both endpoints.
+    """
+    if not WATI_API_KEY or not WATI_ENDPOINT:
+        print("[WATI-TEMPLATE] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
+        return False
+    if not wa_id or not template_name:
+        print("[WATI-TEMPLATE] Skipped: missing wa_id or template_name")
+        return False
+
+    # Defense in depth: never auto-send to business/owner numbers.
+    target = normalize_wa(wa_id)
+    if target and target in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
+        print(f"[WATI-TEMPLATE] BLOCKED outbound to protected number {wa_id}")
+        return False
+
+    endpoint = WATI_ENDPOINT.rstrip("/")
+    url = f"{endpoint}/api/v1/sendTemplateMessage/{wa_id}"
+    headers = {
+        "Authorization": f"Bearer {WATI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "template_name": template_name,
+        "broadcast_name": broadcast_name or template_name,
+        "parameters": parameters,
+    }
+
+    print(
+        f"[WATI-TEMPLATE] POST {url} template={template_name!r} "
+        f"params_count={len(parameters)}"
+    )
+
+    try:
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=WATI_TIMEOUT_SECONDS
+        )
+
+        # Same logging pattern as send_whatsapp_reply — WATI returns
+        # logical failures inside the JSON body even on HTTP 200, so we
+        # log the body verbatim (truncated) and parse for result=false.
+        body_preview = (response.text or "(empty body)")[:1000]
+        print(f"[WATI-TEMPLATE] HTTP {response.status_code}")
+        print(f"[WATI-TEMPLATE] Response body: {body_preview}")
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+
+        if isinstance(data, dict) and data.get("result") is False:
+            info = data.get("info") or data.get("message") or "(no detail)"
+            print(f"[WATI-TEMPLATE] API rejected: {info}")
+            return False
+        if not response.ok:
+            print(f"[WATI-TEMPLATE] HTTP failure {response.status_code}")
+            return False
+
+        print(f"[WATI-TEMPLATE] Sent template {template_name!r} to {wa_id}")
+
+        # Pre-register the outbound for HUMAN_UDIT echo detection. We
+        # can't pre-register the rendered text (WATI renders the template
+        # server-side), but the msg_id from the response is enough — the
+        # subsequent WATI outbound webhook will carry the same id and
+        # _seen_ids will catch it. Empty text param is a no-op.
+        _record_bot_outbound("", data if isinstance(data, dict) else None)
+        return True
+    except requests.RequestException as e:
+        print(f"[WATI-TEMPLATE] Network error: {type(e).__name__}: {e}")
+        return False
+    except Exception as e:
+        print(f"[WATI-TEMPLATE] Unexpected error: {type(e).__name__}: {e}")
+        return False
+
+
 def get_live_inventory() -> str:
     """Fetch current stock for every product in Shopify and return a
     plaintext block suitable for prepending to the brain on every Claude
@@ -3146,25 +3254,71 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         print(f"[SHIPPING] No phone number for order #{order_number}, skipping")
         return
 
-    # Build message per template.
-    if event == "shipped":
-        tracking_company = (fulfillment.get("tracking_company") or "").strip()
-        estimated_delivery = (fulfillment.get("estimated_delivery_at") or "").strip()
+    # Build the message body (and optionally short-circuit to template send).
+    #
+    # SHIPPED uses WATI template (sendTemplateMessage) when a tracking
+    # number is available, because session messages fail with "Ticket has
+    # been expired" outside the 24h window and the shipped notification
+    # often fires when the customer hasn't messaged us at all yet.
+    # Template approval reference: shipping_notification_template with
+    # variables {{1}}=name, {{2}}=order_number, {{3}}=tracking_number,
+    # {{4}}=carrier, plus a dynamic URL button that appends the tracking
+    # number to https://shiprocket.in/tracking/.
+    #
+    # OUT_FOR_DELIVERY and DELIVERED continue using session messages —
+    # by the time they fire, the customer has typically been in an
+    # active session (asking about their order, etc.) so the 24h window
+    # is less of a problem.
+    message = None
+    template_sent = False
+    tracking_company = (fulfillment.get("tracking_company") or "").strip()
 
-        lines = [
-            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-            f"has been shipped 🤍",
-            "",
-        ]
+    if event == "shipped":
         if tracking_number:
-            lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
-        if tracking_company:
-            lines.append(f"Carrier: {tracking_company}")
-        if estimated_delivery:
-            lines.append(f"Estimated delivery: {estimated_delivery}")
-        lines.append("")
-        lines.append("Feel free to reach out if you need anything!")
-        message = "\n".join(lines)
+            print(
+                f"[SHIPPING] Sending template message for order #{order_number} to {wa_id}"
+            )
+            template_sent = send_whatsapp_template(
+                wa_id=wa_id,
+                template_name="shipping_notification_template",
+                parameters=[
+                    {"name": "name", "value": greeting_name},
+                    {"name": "order_number", "value": f"#{order_number}"},
+                    {"name": "tracking_number", "value": tracking_number},
+                    {"name": "carrier", "value": tracking_company or "Shiprocket"},
+                    # tracking_url variable is just the tracking number;
+                    # the template's button has the
+                    # https://shiprocket.in/tracking/ prefix baked in.
+                    {"name": "tracking_url", "value": tracking_number},
+                ],
+            )
+            if template_sent:
+                print(f"[SHIPPING] Template message sent for order #{order_number}")
+            else:
+                print(f"[SHIPPING] Template failed, falling back to session message")
+        else:
+            print(
+                f"[SHIPPING] No tracking number for order #{order_number} — "
+                f"template requires tracking, using session message"
+            )
+
+        # Session-message body (fallback OR no-tracking path).
+        if not template_sent:
+            estimated_delivery = (fulfillment.get("estimated_delivery_at") or "").strip()
+            lines = [
+                f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
+                f"has been shipped 🤍",
+                "",
+            ]
+            if tracking_number:
+                lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+            if tracking_company:
+                lines.append(f"Carrier: {tracking_company}")
+            if estimated_delivery:
+                lines.append(f"Estimated delivery: {estimated_delivery}")
+            lines.append("")
+            lines.append("Feel free to reach out if you need anything!")
+            message = "\n".join(lines)
     elif event == "out_for_delivery":
         message = (
             f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
@@ -3181,11 +3335,16 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     else:
         return  # Unreachable, but defensive.
 
-    # Ship it. send_whatsapp_reply handles WATI failures internally and
-    # never raises; it also pre-registers the outbound text in
-    # _bot_recent_replies so the subsequent WATI outbound webhook echo
-    # doesn't get mis-tagged as HUMAN_UDIT.
-    send_whatsapp_reply(wa_id, message)
+    # Send the session message UNLESS the template path already sent it.
+    # send_whatsapp_reply handles WATI failures internally and never raises;
+    # it also pre-registers the outbound text in _bot_recent_replies so the
+    # subsequent WATI outbound webhook echo doesn't get mis-tagged as
+    # HUMAN_UDIT.
+    if not template_sent:
+        if message is None:
+            return  # Defensive — should never happen given the branches above.
+        send_whatsapp_reply(wa_id, message)
+
     _sent_shipping_updates.add(dedup_key)
 
     # If the shipped message embedded the tracking line, also mark the
