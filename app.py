@@ -81,27 +81,33 @@ MAX_TOKENS = 2048
 VISION_MAX_TOKENS = 512                # extraction output is short JSON
 VISION_DOWNLOAD_TIMEOUT_SECONDS = 10   # per spec — give up fast on slow WATI media
 
-VISION_SYSTEM_PROMPT = """You are extracting order information from a customer screenshot for The Glam Shelf, an Indian eyelash brand.
+VISION_SYSTEM_PROMPT = """You are analyzing a customer image for The Glam Shelf, an Indian eyelash brand. Identify what kind of image it is and extract whatever's useful.
 
-Extract any of the following if visible:
-- Order ID / Order number (format: #XXXX or plain number)
-- Payment status
-- Amount paid
-- Product name
-- Customer name
-- Date of order
+FIRST, classify the image into ONE of:
+- "order_screenshot" → screenshot of an order confirmation, payment receipt, tracking page, invoice, or anything order-related
+- "eye_photo" → a close-up of a customer's eye(s) or face showing eyes — they're asking for a lash recommendation based on their eye shape
+- "product_photo" → a photo of lashes (ours or competitor's), a swatch, or makeup look reference
+- "other" → anything else (selfie without eyes visible, food, random scene, blurry, etc.)
 
-Respond ONLY in this JSON format:
+THEN extract the relevant fields based on image_type:
+
+For order_screenshot: order_id, payment_status, amount, product, customer_name, date.
+For eye_photo: eye_shape (one of: "hooded", "monolid", "almond", "round", "downturned", or null if unclear).
+For product_photo / other: leave extraction fields null.
+
+Respond ONLY in this JSON format (always include every key — use null when not applicable):
 {
+  "image_type": "order_screenshot" | "eye_photo" | "product_photo" | "other",
   "order_id": "1042" or null,
   "payment_status": "paid" or null,
   "amount": "849" or null,
   "product": "GS1 Luxe Light Lash Tray" or null,
   "customer_name": "Priya" or null,
+  "eye_shape": "hooded" or null,
   "confidence": "high" or "low"
 }
 
-If you cannot extract anything useful, return all nulls with confidence "low"."""
+Use confidence "high" only when you're genuinely sure about image_type AND have at least one useful extraction. If unsure or the image is too blurry/dark to read, return image_type as your best guess but set confidence to "low" and leave extraction fields null."""
 
 # Deterministic reply used when vision can't make sense of the image
 # (low confidence, download failure, or no image URL in payload).
@@ -2763,9 +2769,29 @@ def webhook():
 
             confidence = (extracted or {}).get("confidence", "").lower() if extracted else ""
             order_id = (extracted or {}).get("order_id") if extracted else None
+            image_type = ((extracted or {}).get("image_type") or "").lower() if extracted else ""
+            eye_shape = (extracted or {}).get("eye_shape") if extracted else None
 
-            if extracted and confidence == "high" and order_id:
-                # Path (a): synthesize text and fall through.
+            if extracted and confidence == "high" and image_type == "eye_photo":
+                # Path (a-eye): customer sent a close-up of their eye for a
+                # lash recommendation. Synthesize a query that triggers the
+                # brain's Section 4 eye-shape rules. If vision couldn't tell
+                # the exact shape, fall through to a generic "look at my eye
+                # and recommend" — brain will ask one short follow-up.
+                if eye_shape:
+                    text_body = (
+                        f"I just sent a close-up photo of my eye — my eye shape looks "
+                        f"{eye_shape}. Can you recommend a lash for me?"
+                    )
+                    print(f"[VISION] Eye photo confidence=high shape={eye_shape!r} — synthesized eye-shape recommendation query")
+                else:
+                    text_body = (
+                        "I just sent a close-up photo of my eye — my eye shape was unclear. "
+                        "Can you recommend a lash for me?"
+                    )
+                    print(f"[VISION] Eye photo confidence=high but shape unclear — synthesized generic recommendation query")
+            elif extracted and confidence == "high" and order_id:
+                # Path (a-order): synthesize text and fall through.
                 synth_parts = [f"My order ID is #{order_id}"]
                 amt = extracted.get("amount")
                 if amt:
@@ -2776,7 +2802,9 @@ def webhook():
                 text_body = " ".join(synth_parts)
                 print(f"[VISION] Extracted order_id={order_id} confidence=high — synthesized text: {text_body!r}")
             elif extracted and confidence == "high":
-                # Path (b): no order_id but extraction confident on other fields.
+                # Path (b): high confidence, no order_id, not an eye photo —
+                # likely an order screenshot without a visible ID, or a
+                # product photo. Synthesize whatever context we have.
                 parts = []
                 if extracted.get("customer_name"):
                     parts.append(f"name: {extracted['customer_name']}")
@@ -2788,10 +2816,10 @@ def webhook():
                     parts.append(f"payment: {extracted['payment_status']}")
                 detail = "; ".join(parts) if parts else "no specific details visible"
                 text_body = f"I just sent a screenshot of my order — {detail}. Can you help me with this?"
-                print(f"[VISION] Extracted info confidence=high but no order_id — synthesized context")
+                print(f"[VISION] Extracted info confidence=high but no order_id (image_type={image_type!r}) — synthesized context")
             else:
-                # Path (c): low confidence, no extraction, or no URL.
-                print(f"[VISION] Low confidence or no order_id (confidence={confidence!r}) — falling back to text flow")
+                # Path (c): low confidence, unrecognized image type, or no URL.
+                print(f"[VISION] Low confidence / unrecognized image (confidence={confidence!r} type={image_type!r}) — falling back to neutral reply")
                 send_whatsapp_reply(wa_id, FALLBACK_VISION_REPLY)
                 elapsed_ms = int((time.time() - t_start) * 1000)
                 _log_message(
