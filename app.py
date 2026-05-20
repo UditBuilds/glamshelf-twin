@@ -103,12 +103,15 @@ Respond ONLY in this JSON format:
 
 If you cannot extract anything useful, return all nulls with confidence "low"."""
 
-# Deterministic reply used when vision can't make sense of the screenshot
-# (low confidence, download failure, or no image URL in payload). Mirrors
-# the brain's pre-vision IMAGE RECEIVED template so the tone is consistent.
+# Deterministic reply used when vision can't make sense of the image
+# (low confidence, download failure, or no image URL in payload).
+# Intentionally NEUTRAL — the image might not be order-related at all
+# (product photo, Instagram screenshot, lash inspo, anything). Asking
+# "could you type out the order ID?" sounds wrong when the customer
+# sent a product photo. Mirrored verbatim in brain.md Section 1.5
+# IMAGE RECEIVED rule so the documented fallback matches what fires.
 FALLBACK_VISION_REPLY = (
-    "Thanks for sharing! I couldn't quite make out the screenshot — could you "
-    "type out the order ID from it? It usually starts with a # 🤍"
+    "Thanks for sharing! Could you tell me a little more about what you're looking for? 🤍"
 )
 
 # Telegram notification config. Set both on Render → Environment.
