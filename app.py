@@ -374,19 +374,13 @@ _bot_recent_replies: dict[str, float] = {}  # reply text -> expiry unix timestam
 # Matches the brain's Section 7 "4+ hours of silence to resume" rule.
 HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
 
-# Shipping-update dedup. Shopify can deliver the same fulfillments/create
-# or fulfillments/update webhook multiple times (network retries, edits,
-# manual re-pushes from the admin). We never want to spam a customer with
-# duplicate "Your order has shipped" messages.
-#
-# Keyed by (order_id, event_type) where event_type is "shipped" /
-# "out_for_delivery" / "delivered". A given order can legitimately fire
-# all three events (one each), but only one of each type.
-#
-# In-memory only — resets on worker restart. Worst case after a redeploy
-# is one duplicate message per customer per event type, which is far
-# better than missing the notification entirely.
-_sent_shipping_updates: set[tuple[str, str]] = set()
+# Shipping-update dedup is now persisted in the `shipping_notifications`
+# SQLite table (see _init_db). The DB is the single source of truth —
+# survives Render redeploys, which means we can never accidentally
+# double-send a "shipped" message after the worker restarts. The
+# in-memory `_sent_shipping_updates` set that previously lived here was
+# removed; use the _was_shipping_sent / _mark_shipping_sent helpers
+# (defined alongside the other DB helpers below) instead.
 
 # Post-delivery review-request scheduler.
 #
@@ -762,6 +756,30 @@ def _init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ig_sender ON instagram_logs(sender_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ig_logged ON instagram_logs(logged_at)")
 
+        # Shipping notification dedup. (order_id, message_type) primary
+        # key so INSERT OR IGNORE in _mark_shipping_sent is atomic — even
+        # if two webhook deliveries race, only one row lands and only one
+        # message ships. Survives Render redeploys, so the "fulfilled but
+        # never notified" recovery flow (/shopify-order-update) can trust
+        # this table as the source of truth across restarts.
+        #
+        # message_type is one of: "shipped" / "out_for_delivery" /
+        # "delivered" / "tracking" — matches the event keys
+        # _process_shipping_event uses today.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shipping_notifications (
+                order_id TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                phone TEXT,
+                order_number TEXT,
+                sent_at REAL NOT NULL,
+                PRIMARY KEY (order_id, message_type)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shipping_sent_at ON shipping_notifications(sent_at)")
+
         conn.commit()
         conn.close()
         print(f"[DB] Initialized {DB_PATH}")
@@ -999,6 +1017,78 @@ def _lookup_recent_order(wa_id: str) -> str:
     except Exception as e:
         print(f"[ORDER] Lookup failed for {wa_id}: {type(e).__name__}: {e}")
         return ""
+
+
+def _mark_shipping_sent(
+    order_id: str,
+    message_type: str,
+    phone: str | None = None,
+    order_number: str | None = None,
+) -> None:
+    """Persist that a shipping notification was sent for this
+    (order_id, message_type) so subsequent webhook deliveries OR a
+    Render redeploy can't double-send the same message.
+
+    `message_type` is one of: "shipped", "out_for_delivery", "delivered",
+    "tracking" — matches the keys _process_shipping_event uses.
+
+    Uses INSERT OR IGNORE so duplicate calls don't update timestamps —
+    the original send_at is preserved as the canonical "when we first
+    notified the customer" record.
+
+    Silent fail per [SHIPPING-DB] convention. By the time this is called
+    the message has already shipped to the customer; a DB hiccup must
+    NOT propagate or it'd 500 the webhook handler.
+    """
+    if not order_id or not message_type:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR IGNORE INTO shipping_notifications "
+            "(order_id, message_type, phone, order_number, sent_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(order_id), message_type, phone, order_number, time.time()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(
+            f"[SHIPPING-DB] _mark_shipping_sent failed for "
+            f"{order_id}/{message_type}: {type(e).__name__}: {e}"
+        )
+
+
+def _was_shipping_sent(order_id: str, message_type: str) -> bool:
+    """Check whether a notification of this type has already been sent
+    for this order. Used by _process_shipping_event and the new
+    /shopify-order-update handler for dedup across webhook retries +
+    Render restarts.
+
+    Returns False on any DB error — FAIL-OPEN, because the cost of one
+    duplicate message is far lower than the cost of silently swallowing
+    a legitimate shipping notification. A DB hiccup must never block a
+    real send.
+    """
+    if not order_id or not message_type:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM shipping_notifications "
+            "WHERE order_id = ? AND message_type = ? LIMIT 1",
+            (str(order_id), message_type),
+        )
+        hit = cur.fetchone() is not None
+        conn.close()
+        return hit
+    except Exception as e:
+        print(
+            f"[SHIPPING-DB] _was_shipping_sent check failed for "
+            f"{order_id}/{message_type}: {type(e).__name__}: {e}"
+        )
+        return False
 
 
 def _send_instagram_reply(sender_id: str, text: str) -> None:
@@ -3183,8 +3273,10 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             "delivered"        → delivered template
             anything else      → no message, silent acknowledge
 
-    Dedup: (order_id, event_type) pairs are tracked in _sent_shipping_updates
-    so retries / re-pushes don't spam the customer.
+    Dedup: (order_id, event_type) pairs are persisted to the
+    shipping_notifications SQLite table via _mark_shipping_sent /
+    _was_shipping_sent, so retries / re-pushes / Render restarts can't
+    re-trigger the same customer message.
 
     All errors bubble up to the route handler (which wraps in try/except
     and always returns 200). Errors prefixed with [SHIPPING ERROR] in logs.
@@ -3264,10 +3356,9 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     # tracking number. Dedup key (order_id, "tracking") guarantees the
     # follow-up only goes out once per order.
     if topic == "fulfillments/update":
-        tracking_dedup_key = (order_id, "tracking")
         if not tracking_number:
             print(f"[SHIPPING] No tracking number in payload for order #{order_number}")
-        elif tracking_dedup_key in _sent_shipping_updates:
+        elif _was_shipping_sent(order_id, "tracking"):
             print(f"[SHIPPING] Already sent tracking for order #{order_number} — dedup skip")
         elif not wa_id:
             print(f"[SHIPPING] No phone for tracking follow-up on order #{order_number}, skipping")
@@ -3278,7 +3369,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
                 f"Feel free to reach out if you need anything!"
             )
             send_whatsapp_reply(wa_id, tracking_message)
-            _sent_shipping_updates.add(tracking_dedup_key)
+            _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
             print(f"[SHIPPING] Sent tracking link for order #{order_number} to {wa_id}")
 
     # ----- STATUS MESSAGE -----
@@ -3298,8 +3389,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         return
 
     # Dedup BEFORE building/sending the status message.
-    dedup_key = (order_id, event)
-    if dedup_key in _sent_shipping_updates:
+    if _was_shipping_sent(order_id, event):
         print(
             f"[SHIPPING] Already sent {event!r} for order #{order_number} "
             f"(order_id={order_id}) — dedup skip"
@@ -3401,7 +3491,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             return  # Defensive — should never happen given the branches above.
         send_whatsapp_reply(wa_id, message)
 
-    _sent_shipping_updates.add(dedup_key)
+    _mark_shipping_sent(order_id, event, phone=wa_id, order_number=order_number)
 
     # If the shipped message embedded the tracking line, also mark the
     # tracking dedup so a later fulfillments/update with the same
@@ -3409,7 +3499,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     # link" follow-up. Only relevant for the "shipped" event — the
     # out_for_delivery / delivered templates don't embed tracking.
     if event == "shipped" and tracking_number:
-        _sent_shipping_updates.add((order_id, "tracking"))
+        _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
 
     print(
         f"[SHIPPING] Sent {event!r} update for order #{order_number} "
@@ -3475,6 +3565,154 @@ def shopify_fulfillment():
     except Exception as e:
         # [SHIPPING ERROR] prefix lets the founder grep for failures.
         print(f"[SHIPPING ERROR] {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+    return jsonify({"status": "ok"}), 200
+
+
+def _process_order_update(payload: dict) -> None:
+    """Decide whether an orders/updated event should fire a recovery
+    "shipped" notification. Called by shopify_order_update after HMAC
+    verification.
+
+    Why this exists: when an order is archived in Shopify Admin before
+    the fulfillments/* webhooks fire, the shipping notification never
+    gets sent. When the order is later unarchived, Shopify re-fires
+    orders/updated but NOT fulfillments/*, so the regular shipping flow
+    misses it. This handler catches that "fulfilled but never notified"
+    case by reading the order's current fulfillment_status and dedup
+    table.
+
+    Conditions for sending (all must be true):
+      - fulfillment_status == "fulfilled"
+      - financial_status == "paid"
+      - _was_shipping_sent(order_id, "shipped") is False
+      - phone is resolvable
+    """
+    order_id = str(payload.get("id") or "")
+    order_number_raw = (payload.get("name") or "").strip()
+    order_number = order_number_raw.lstrip("#") or order_id
+
+    fulfillment_status = (payload.get("fulfillment_status") or "").strip().lower()
+    financial_status = (payload.get("financial_status") or "").strip().lower()
+
+    if fulfillment_status != "fulfilled":
+        print(
+            f"[ORDER-UPDATE] Order #{order_number} not fulfilled "
+            f"(status={fulfillment_status or 'unfulfilled'!r}) — skipping"
+        )
+        return
+
+    if financial_status != "paid":
+        print(
+            f"[ORDER-UPDATE] Order #{order_number} not paid "
+            f"(status={financial_status or 'pending'!r}) — skipping"
+        )
+        return
+
+    if _was_shipping_sent(order_id, "shipped"):
+        print(f"[ORDER-UPDATE] Order #{order_number} already notified — skipping")
+        return
+
+    shipping = payload.get("shipping_address") or {}
+    customer = payload.get("customer") or {}
+    raw_phone = (shipping.get("phone") or customer.get("phone") or "").strip()
+    wa_id = _phone_to_wa_id(raw_phone)
+    if not wa_id:
+        print(f"[ORDER-UPDATE] Order #{order_number} has no phone — skipping")
+        return
+
+    first_name = (customer.get("first_name") or "").strip()
+    greeting_name = first_name or "there"
+
+    # Tracking info from the first fulfillment if any are attached to
+    # the order. Same multi-path extraction as _process_shipping_event.
+    fulfillments = payload.get("fulfillments") or []
+    fulfillment = fulfillments[0] if fulfillments and isinstance(fulfillments[0], dict) else {}
+    tracking_number = _extract_tracking_number(fulfillment)
+    tracking_company = (fulfillment.get("tracking_company") or "").strip()
+
+    print(
+        f"[ORDER-UPDATE] Order #{order_number} fulfilled + not yet notified — "
+        f"sending shipping message"
+    )
+
+    # Mirror _process_shipping_event's send strategy: template first
+    # (works outside 24h WATI session window), fall back to session
+    # message if template fails OR no tracking number available.
+    template_sent = False
+    if tracking_number:
+        template_sent = send_whatsapp_template(
+            wa_id=wa_id,
+            template_name="shipping_notification_template",
+            parameters=[
+                {"name": "name", "value": greeting_name},
+                {"name": "order_number", "value": f"#{order_number}"},
+                {"name": "tracking_number", "value": tracking_number},
+                {"name": "carrier", "value": tracking_company or "Shiprocket"},
+                {"name": "tracking_url", "value": tracking_number},
+            ],
+        )
+        if template_sent:
+            print(f"[ORDER-UPDATE] Template message sent for order #{order_number}")
+        else:
+            print(f"[ORDER-UPDATE] Template failed, falling back to session message")
+
+    if not template_sent:
+        lines = [
+            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
+            f"has been shipped 🤍",
+            "",
+        ]
+        if tracking_number:
+            lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+        if tracking_company:
+            lines.append(f"Carrier: {tracking_company}")
+        lines.append("")
+        lines.append("Feel free to reach out if you need anything!")
+        send_whatsapp_reply(wa_id, "\n".join(lines))
+
+    _mark_shipping_sent(order_id, "shipped", phone=wa_id, order_number=order_number)
+    # Same convention as _process_shipping_event: if we embedded tracking
+    # in this shipped message, mark tracking dedup so a later
+    # fulfillments/update doesn't fire a redundant follow-up.
+    if tracking_number:
+        _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
+
+
+@app.route("/shopify-order-update", methods=["POST"])
+def shopify_order_update():
+    """Receive Shopify orders/updated webhook. Catches the
+    "fulfilled but never notified" case — most commonly when an order
+    is archived in Shopify Admin before the fulfillments/* webhook
+    fires, then unarchived later (Shopify re-fires orders/updated on
+    unarchive but NOT fulfillments/*).
+
+    Auth: same SHOPIFY_WEBHOOK_SECRET that gates /shopify-webhook and
+    /shopify-fulfillment.
+
+    Returns:
+      - 401 on HMAC mismatch (Shopify will retry; secret must be wrong)
+      - 200 in every other case (parse errors, internal exceptions, no
+        action needed) — Shopify treats 200 as delivered and won't retry
+    """
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+
+    if not _verify_shopify_hmac(raw_body, hmac_header):
+        print("[ORDER-UPDATE] Invalid HMAC signature")
+        return jsonify({"error": "invalid signature"}), 401
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        print(f"[ORDER-UPDATE] Invalid JSON: {e}")
+        return jsonify({"status": "ok"}), 200
+
+    try:
+        _process_order_update(payload)
+    except Exception as e:
+        print(f"[ORDER-UPDATE] Handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
 
     return jsonify({"status": "ok"}), 200
