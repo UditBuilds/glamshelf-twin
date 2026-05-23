@@ -776,6 +776,20 @@ def _init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ig_sender ON instagram_logs(sender_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ig_logged ON instagram_logs(logged_at)")
 
+        # One-time migration: add `source` column to instagram_logs if it
+        # doesn't exist. Used to tag rows like HUMAN_UDIT_INSTAGRAM so
+        # the inbound handler can detect (via SQL, restart-safe) that
+        # Udit replied manually on Instagram and short-circuit Claude.
+        # Schema additions on existing prod DBs need ALTER TABLE since
+        # CREATE TABLE IF NOT EXISTS doesn't add new columns.
+        try:
+            existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(instagram_logs)").fetchall()]
+            if "source" not in existing_cols:
+                conn.execute("ALTER TABLE instagram_logs ADD COLUMN source TEXT")
+                print("[DB] Migrated instagram_logs: added `source` column")
+        except Exception as e:
+            print(f"[DB] instagram_logs source migration failed: {type(e).__name__}: {e}")
+
         # Shipping notification dedup. (order_id, message_type) primary
         # key so INSERT OR IGNORE in _mark_shipping_sent is atomic — even
         # if two webhook deliveries race, only one row lands and only one
@@ -1172,8 +1186,14 @@ def _log_instagram(
     message_text: str,
     reply_text: str,
     timestamp: str,
+    source: str | None = None,
 ) -> None:
     """Insert one Instagram exchange into instagram_logs.
+
+    `source` is an optional tag. Today's only special value is
+    "HUMAN_UDIT_INSTAGRAM" — used to record that Udit manually replied
+    on Instagram so the inbound handler can short-circuit (similar to
+    the WATI HUMAN_UDIT safety net).
 
     Failures swallowed — same pattern as _log_message and
     _log_shopify_order. Backup loop captures this table at the next
@@ -1183,14 +1203,51 @@ def _log_instagram(
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
             "INSERT INTO instagram_logs "
-            "(sender_id, message_text, reply_text, timestamp) "
-            "VALUES (?, ?, ?, ?)",
-            (sender_id, message_text, reply_text, timestamp),
+            "(sender_id, message_text, reply_text, timestamp, source) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (sender_id, message_text, reply_text, timestamp, source),
         )
         conn.commit()
         conn.close()
     except Exception as e:
         print(f"[DB] _log_instagram failed: {type(e).__name__}: {e}")
+
+
+def _udit_replied_recently_ig(sender_id: str, window_seconds: int = HUMAN_HANDLING_WINDOW_SECONDS) -> bool:
+    """Return True if Udit manually replied on Instagram to this sender
+    within `window_seconds`. Used by _process_instagram_event as a
+    restart-safe sibling of the WATI _udit_replied_recently safety net.
+
+    A HUMAN_UDIT_INSTAGRAM row is written by _process_instagram_event
+    when Meta delivers an event with sender_id == INSTAGRAM_PAGE_ID
+    (Udit's manual outbound from the IG app), with the recipient
+    customer's ID stored as instagram_logs.sender_id. So the query is:
+    "does a HUMAN_UDIT_INSTAGRAM row exist for this customer in the last
+    4h?"
+
+    Returns False on any failure (fail-open, same convention as the WATI
+    helper) — the in-memory paused_numbers register is the primary gate;
+    this DB check is the post-restart backup.
+    """
+    if not sender_id:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM instagram_logs "
+            "WHERE sender_id = ? "
+            "AND source = 'HUMAN_UDIT_INSTAGRAM' "
+            "AND logged_at >= datetime('now', ?) "
+            "LIMIT 1",
+            (sender_id, f"-{int(window_seconds)} seconds"),
+        )
+        hit = cur.fetchone() is not None
+        conn.close()
+        return hit
+    except Exception as e:
+        print(f"[HUMAN_HANDLING_IG] DB check failed for {sender_id}: {type(e).__name__}: {e}")
+        return False
 
 
 def _load_instagram_history(sender_id: str) -> list[dict]:
@@ -1384,6 +1441,7 @@ def send_telegram_notification(
     reply: str,
     sender_info: str | None = None,
     channel: str = "WhatsApp",
+    customer_id: str | None = None,
 ) -> None:
     """Fire a Telegram message to the founder for DRAFT+APPROVE and ESCALATE.
 
@@ -1401,6 +1459,14 @@ def send_telegram_notification(
     ESCALATE notes the holding reply was already sent (because the IG
     handler ships every classification's reply). Default preserves the
     existing WATI behavior byte-for-byte.
+
+    `customer_id` is the wa_id (WATI) or IG sender_id. When provided AND
+    classification is ESCALATE, a single inline button "🛑 Stop bot for
+    this customer" is attached to the Telegram message. Tapping it routes
+    to _handle_telegram_callback's pause_escalate handler, which calls
+    _pause_number(customer_id) for 4h. Without customer_id (e.g. the
+    /api/draft browser flow) the message goes out as plain text — same
+    as before.
 
     All failures (network, Telegram API errors, missing token, etc.) are
     logged and swallowed — Telegram is a side effect, never a blocker for
@@ -1455,6 +1521,20 @@ def send_telegram_notification(
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+
+    # ESCALATE-only: attach a single inline button so Udit can pause the
+    # twin for this customer with one tap, without leaving Telegram. The
+    # callback_data fits well under Telegram's 64-byte limit:
+    # "action:pause_escalate|id:<id>" ≈ 30-52 bytes.
+    if classification == "ESCALATE" and customer_id:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[
+                {
+                    "text": "🛑 Stop bot for this customer",
+                    "callback_data": f"action:pause_escalate|id:{customer_id}",
+                }
+            ]]
+        }
 
     try:
         response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
@@ -1649,6 +1729,40 @@ def _handle_telegram_callback(cb: dict) -> None:
     action = parsed.get("action")
     draft_id = parsed.get("id")
     customer_number = parsed.get("num")
+
+    # ESCALATE "🛑 Stop bot for this customer" button — handled first
+    # because it has no _pending_drafts state. The `id` in the callback
+    # is the customer's wa_id (WATI) or sender_id (IG), and we just need
+    # to pause that number for 4h.
+    if action == "pause_escalate":
+        customer_id = parsed.get("id") or ""
+        if not customer_id:
+            _telegram_api("answerCallbackQuery", {
+                "callback_query_id": callback_id, "text": "No customer id"
+            })
+            print("[ESCALATE-PAUSE] Tap missing id — ignored")
+            return
+        _pause_number(customer_id)
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "✅ Bot paused for this customer",
+        })
+        # Strip the button and append a status footer so the chat history
+        # reads cleanly. Best effort — same _finalize-style edit pattern
+        # as the DRAFT buttons use.
+        original_text = (msg.get("text") or "")
+        _telegram_api("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+        _telegram_api("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": (original_text + "\n\n🛑 Bot paused 4h — you're handling this")[:4096],
+        })
+        print(f"[ESCALATE-PAUSE] Udit tapped Stop bot — paused {customer_id} for 4h")
+        return
 
     # Atomic pop — dict.pop is thread-safe in CPython, so two rapid taps
     # racing into this function only one of them gets the draft; the other
@@ -3030,7 +3144,8 @@ def webhook():
             )
         elif classification == "ESCALATE":
             send_telegram_notification(
-                classification, text_body, reply, sender_info=sender_info
+                classification, text_body, reply,
+                sender_info=sender_info, customer_id=wa_id,
             )
             print(f"[ESCALATE] Notified founder for {wa_id}")
             # Auto-pause this number for 4h so subsequent messages from
@@ -3841,13 +3956,43 @@ def _process_instagram_event(event: dict) -> None:
     lines so one bad event can't take down the rest of the batch."""
     try:
         sender_id = ((event.get("sender") or {}).get("id") or "").strip()
+        recipient_id = ((event.get("recipient") or {}).get("id") or "").strip()
         message = event.get("message") or {}
 
-        # Echoes are messages WE sent (Meta loops them back). Skip silently.
+        # Echoes are messages WE sent via the Send API (Meta loops them back).
+        # Skip silently — our outbound dispatcher already logged them.
         if message.get("is_echo"):
             return
 
         text = (message.get("text") or "").strip()
+
+        # HUMAN_UDIT_INSTAGRAM detection — when Udit manually replies to
+        # a customer from the Instagram app, Meta fires a webhook with
+        # sender=PAGE_ID and recipient=customer. We need to:
+        #   1. Log it as HUMAN_UDIT_INSTAGRAM so subsequent inbounds
+        #      from that customer can short-circuit (restart-safe).
+        #   2. Auto-pause the customer's sender_id (= recipient_id of
+        #      this event) for 4h so the twin stops replying.
+        # Order matters: this check goes BEFORE the empty-text/no-sender
+        # gates because Udit's manual sends always have text and a
+        # well-formed sender, but we don't want any other downstream
+        # processing to fire on them.
+        if INSTAGRAM_PAGE_ID and sender_id == INSTAGRAM_PAGE_ID:
+            if not recipient_id:
+                print("[HUMAN_UDIT_IG] sender is page but no recipient_id — skipping")
+                return
+            timestamp = str(event.get("timestamp") or "")
+            _log_instagram(
+                sender_id=recipient_id,   # store under the customer's id
+                message_text="",
+                reply_text=text,
+                timestamp=timestamp,
+                source="HUMAN_UDIT_INSTAGRAM",
+            )
+            _pause_number(recipient_id)
+            print(f"[HUMAN_UDIT_IG] Udit replied on Instagram to {recipient_id} — auto-paused 4h")
+            return
+
         if not text:
             # Non-text event (image, sticker, reaction, etc.) — silent skip.
             return
@@ -3878,6 +4023,14 @@ def _process_instagram_event(event: dict) -> None:
         # paging the founder again.
         if _is_paused(sender_id):
             print(f"[PAUSED] Skipping reply — auto-pause active for IG sender {sender_id}")
+            return
+
+        # DB-backed safety net (survives Render restarts). If Udit
+        # manually replied on Instagram in the last 4h — recorded as a
+        # HUMAN_UDIT_INSTAGRAM row by the page-id detection above — skip
+        # silently. Mirrors the WATI _udit_replied_recently safety net.
+        if _udit_replied_recently_ig(sender_id):
+            print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
             return
 
         # Best-effort order context. Sender IDs are 17-digit FB IDs and
@@ -3924,6 +4077,7 @@ def _process_instagram_event(event: dict) -> None:
                     reply,
                     sender_info=ig_sender_info,
                     channel="Instagram",
+                    customer_id=sender_id,
                 )
                 tag = "DRAFT" if classification == "DRAFT+APPROVE" else "ESCALATE"
                 print(f"[INSTAGRAM-{tag}] Notified founder for {sender_id}")
