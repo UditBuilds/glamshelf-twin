@@ -445,6 +445,26 @@ def _is_paused(wa_id: str) -> bool:
     return wa_id in paused_numbers
 
 
+def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> None:
+    """Add `wa_id` (or Instagram sender_id — the dict is just keyed by
+    string) to the pause register with a TTL. While paused, the inbound
+    handlers short-circuit before any Claude call and the customer gets
+    no auto-replies.
+
+    Used by:
+      - _handle_pause_directive — when Udit types "#pause" outbound
+      - WATI webhook ESCALATE branch — auto-pause after holding reply
+      - Instagram webhook ESCALATE branch — same
+
+    Idempotent: extending the pause window (re-pausing an already-paused
+    number) just resets the expiry. Caller should log the auto-pause
+    with their own channel-specific prefix so the founder can grep.
+    """
+    if not wa_id:
+        return
+    paused_numbers[wa_id] = time.time() + ttl_seconds
+
+
 def _record_bot_outbound(reply_text: str, wati_response_data: dict | None = None) -> None:
     """Register a bot-sent reply so the subsequent WATI outbound webhook
     event for the same message is identified as bot-originated (not Udit's).
@@ -3013,6 +3033,15 @@ def webhook():
                 classification, text_body, reply, sender_info=sender_info
             )
             print(f"[ESCALATE] Notified founder for {wa_id}")
+            # Auto-pause this number for 4h so subsequent messages from
+            # the same customer don't re-trigger Claude + Telegram. The
+            # founder is now handling the conversation; the twin should
+            # stay out of the way. Manual #pause/#resume still work as
+            # before (this uses the same paused_numbers register), and
+            # the HUMAN_UDIT safety net is a separate, additive check
+            # that also short-circuits inbound when Udit replies via WATI.
+            _pause_number(wa_id)
+            print(f"[ESCALATE] Auto-paused {wa_id} for 4h after holding reply sent")
             elapsed_ms = int((time.time() - t_start) * 1000)
             _log_message(
                 wa_id, sender_name, text_body,
@@ -3841,6 +3870,16 @@ def _process_instagram_event(event: dict) -> None:
             _seen_ids.add(msg_id)
             _persist_seen_id(msg_id)
 
+        # Pause gate — same paused_numbers register the WATI flow uses.
+        # The dict is keyed by string, so IG sender_ids and wa_ids coexist
+        # cleanly. When the WATI/IG ESCALATE branches auto-pause a number
+        # after sending the holding reply, subsequent inbound messages
+        # from that sender short-circuit here without invoking Claude or
+        # paging the founder again.
+        if _is_paused(sender_id):
+            print(f"[PAUSED] Skipping reply — auto-pause active for IG sender {sender_id}")
+            return
+
         # Best-effort order context. Sender IDs are 17-digit FB IDs and
         # won't match Indian phone numbers in the orders table — function
         # returns "" for the no-match case, which is fine.
@@ -3893,6 +3932,17 @@ def _process_instagram_event(event: dict) -> None:
                     f"[INSTAGRAM-TG] Notification failed: "
                     f"{type(tg_err).__name__}: {tg_err}"
                 )
+
+        # Auto-pause this IG sender for 4h after ESCALATE so subsequent
+        # DMs from the same sender don't re-trigger Claude + Telegram.
+        # Mirrors the WATI ESCALATE auto-pause. Note: on IG the holding
+        # reply is ALREADY sent to the customer at this point (line above
+        # via _send_instagram_reply), so this pause specifically prevents
+        # the "customer sees repeat holding messages" bug. Manual
+        # #pause/#resume still apply; the pause register is shared.
+        if classification == "ESCALATE":
+            _pause_number(sender_id)
+            print(f"[ESCALATE] Auto-paused {sender_id} for 4h after holding reply sent")
     except Exception as e:
         print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
