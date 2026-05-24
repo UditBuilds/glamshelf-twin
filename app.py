@@ -859,8 +859,14 @@ def _log_message(
 
 
 def _load_conversation_history(wa_id: str) -> list[dict]:
-    """Pull up to 10 recent (customer msg, bot reply) exchanges with this
-    wa_id from the last 24 hours, oldest first.
+    """Pull up to 30 recent (customer msg, bot reply) exchanges with this
+    wa_id from the last 7 days, oldest first.
+
+    The 30-turn / 7-day window is sized for multi-day threads — refund
+    flows, return pickups, and Udit-handled escalations often span days,
+    and the twin needs to see the resolution context from earlier in
+    the thread so it doesn't restart the conversation as if it's a
+    fresh complaint when the customer follows up with "any update?".
 
     Only AUTO and ESCALATE rows are eligible — those are the only statuses
     that reflect a real reply the customer actually saw. DRAFT replies were
@@ -868,13 +874,19 @@ def _load_conversation_history(wa_id: str) -> list[dict]:
     including them would mislead Claude into thinking the customer saw
     text they never did.
 
+    Token-cost note: 30 turns × ~150 chars avg ≈ 4-5k chars of extra
+    context per Claude call. Well within Sonnet 4.6's window, and the
+    user-message portion of the prompt isn't cached, so this is a real
+    additive cost. Still net cheaper than re-asking the customer for
+    info already in the thread.
+
     Failures are logged-and-swallowed → returns []. Caller falls back to a
     plain single-turn call.
     """
     if not wa_id:
         return []
     try:
-        cutoff = time.time() - 24 * 3600
+        cutoff = time.time() - 7 * 24 * 3600  # 7 days
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(
@@ -887,7 +899,7 @@ def _load_conversation_history(wa_id: str) -> list[dict]:
               AND msg_text IS NOT NULL
               AND reply_text IS NOT NULL
             ORDER BY ts DESC
-            LIMIT 10
+            LIMIT 30
             """,
             (wa_id, cutoff),
         )
@@ -1251,13 +1263,24 @@ def _udit_replied_recently_ig(sender_id: str, window_seconds: int = HUMAN_HANDLI
 
 
 def _load_instagram_history(sender_id: str) -> list[dict]:
-    """Pull up to 10 recent (DM, reply) exchanges with this Instagram
-    sender from the last 24 hours, oldest first.
+    """Pull up to 30 recent (DM, reply) exchanges with this Instagram
+    sender from the last 7 days, oldest first.
+
+    Matches _load_conversation_history's window (30 turns × 7 days) so
+    multi-day IG threads (refund/return/collab follow-ups) keep their
+    resolution context. Same rationale as the WATI helper — without
+    this, the twin restarts the conversation as if it's a new complaint
+    when the customer follows up with "any update?".
 
     Returns the same shape as _load_conversation_history so it can be
     handed straight to ask_claude(history=...) — list of dicts with
     msg_text / reply_text / ts. ts is a placeholder (0) here since we
     don't need it for the prompt construction.
+
+    HUMAN_UDIT_INSTAGRAM rows (Udit's manual IG-app replies) are
+    excluded via the `message_text IS NOT NULL` filter because those
+    rows are written with empty message_text — they're for the safety-net
+    check, not the conversation context Claude should reply to.
 
     Failures return [] silently so the call falls back to single-turn
     behavior, identical to a brand-new sender.
@@ -1273,10 +1296,11 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
             FROM instagram_logs
             WHERE sender_id = ?
               AND message_text IS NOT NULL
+              AND message_text != ''
               AND reply_text IS NOT NULL
-              AND logged_at >= datetime('now', '-1 day')
+              AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
-            LIMIT 10
+            LIMIT 30
             """,
             (sender_id,),
         )
