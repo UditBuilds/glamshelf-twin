@@ -57,11 +57,36 @@ for _stream in (sys.stdout, sys.stderr):
 
 app = Flask(__name__)
 
-# Session secret for cookie signing. Override SECRET_KEY in Render's env vars.
-app.secret_key = os.environ.get("SECRET_KEY", "gs-twin-secret-xk92")
 
-# Single-user password gate. Override APP_PASSWORD in Render's env vars.
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "glamshelf2026")
+def _require_env(name: str) -> str:
+    """Read a required env var or raise on missing/empty.
+
+    Used for the three auth-critical vars (SECRET_KEY, APP_PASSWORD,
+    DASHBOARD_KEY) that previously had insecure hardcoded defaults
+    visible in the public GitHub source. Fail-fast on startup is far
+    safer than booting with a default that anyone reading the repo
+    could exploit.
+
+    If you're hitting this on a new deploy, set the missing var in
+    Render → Environment and redeploy.
+    """
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Required env var {name!r} is not set or is empty. "
+            f"Refusing to start with an insecure default — please set it on Render."
+        )
+    return value
+
+
+# Session secret for cookie signing. MUST be set in Render env vars —
+# without a stable secret, session cookies are unsigned/forgeable.
+app.secret_key = _require_env("SECRET_KEY")
+
+# Single-user password gate for the browser drafter UI. MUST be set on
+# Render — the previous "glamshelf2026" default was readable in the
+# public GitHub source.
+APP_PASSWORD = _require_env("APP_PASSWORD")
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
@@ -138,16 +163,21 @@ WATI_TIMEOUT_SECONDS = 10
 # The Glam Shelf's WhatsApp Business number. The webhook ignores any inbound
 # event where waId equals this number — prevents the twin from replying to
 # itself if WATI ever loops outbound / own messages through the webhook.
-BUSINESS_NUMBER = os.environ.get("BUSINESS_NUMBER", "919217470151")
+# Default removed (was the founder's personal number visible in public
+# GitHub source). Empty → the protected-number check just won't match
+# anything, which is a safer failure mode than baking PII into the repo.
+BUSINESS_NUMBER = os.environ.get("BUSINESS_NUMBER", "")
 
-# Founder's personal WhatsApp number. Defaults to the same value as
-# BUSINESS_NUMBER but can be set separately on Render if the founder's
-# personal phone differs from the registered business number. Both are
-# blocked from receiving auto-replies, both are skipped on inbound.
-OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "919217470151")
+# Founder's personal WhatsApp number. Same rationale as BUSINESS_NUMBER —
+# default removed because it was personal PII. Must be set on Render for
+# the protected-number filter to work.
+OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "")
 
-# Dashboard config — DASHBOARD_KEY gates /dashboard-data; override on Render.
-DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "changeme")
+# Dashboard config — DASHBOARD_KEY gates /dashboard, /dashboard-data,
+# /inventory-debug, /review-debug. MUST be set on Render — the previous
+# "changeme" default was readable in the public GitHub source and would
+# have allowed anyone to access the dashboard if env var were missing.
+DASHBOARD_KEY = _require_env("DASHBOARD_KEY")
 
 # SQLite path for message logs.
 #   - Legacy/local default: <tempdir>/glamshelf_logs.db (ephemeral on Render).
@@ -4130,9 +4160,9 @@ def _process_instagram_event(event: dict) -> None:
 def dashboard_data():
     """JSON snapshot of message logs for the founder's live dashboard.
 
-    Auth: ?key=<DASHBOARD_KEY> query param. Override DASHBOARD_KEY in
-    Render env vars; the default 'changeme' is intentionally embarrassing
-    so the env var is the only sane way to use this in production.
+    Auth: ?key=<DASHBOARD_KEY> query param. DASHBOARD_KEY is required
+    via Render env vars — the app refuses to start without it (see
+    _require_env at the top of this module).
 
     Sections:
       kpis           — today's counts and latency stats (IST midnight onward)
