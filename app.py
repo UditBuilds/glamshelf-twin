@@ -293,6 +293,11 @@ INSTAGRAM_PAGE_ACCESS_TOKEN = _clean_meta_token(
 # URL — required because the `me` alias is unreliable across IG flows.
 # Empty / unset → falls back to "me", which works for some token flavors.
 INSTAGRAM_PAGE_ID = os.environ.get("INSTAGRAM_PAGE_ID", "").strip()
+# Startup diagnostic — the HUMAN_UDIT_IG detection in
+# _process_instagram_event only works if INSTAGRAM_PAGE_ID is set (it
+# compares the echo's sender.id against this value). Log presence (not
+# the value) so it can be verified in Render logs without leaking the id.
+print(f"[INSTAGRAM] Page ID configured: {bool(INSTAGRAM_PAGE_ID)}")
 
 # API base URL. Default targets the Instagram Graph API (Instagram Login
 # flow) which is where instagram_business_manage_messages tokens have
@@ -1205,6 +1210,15 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
         )
         if resp.ok:
             print(f"[INSTAGRAM] Sent reply to {sender_id} ({len(text)} chars)")
+            # Register the sent text so the echo Meta loops back (sender ==
+            # PAGE_ID, is_echo == true) is recognized as the BOT's own
+            # outbound — NOT mistaken for Udit's manual reply by the
+            # HUMAN_UDIT_IG detection in _process_instagram_event. Without
+            # this, every bot AUTO reply's echo would auto-pause the
+            # customer for 4h and the IG flow would break. Mirrors the
+            # WATI _record_bot_outbound design (text-only here; IG echoes
+            # are matched by text, not msg id).
+            _record_bot_outbound(text)
         else:
             # On failure, surface diagnostic info about the token so
             # config issues are obvious from Render logs without leaking
@@ -4012,26 +4026,32 @@ def _process_instagram_event(event: dict) -> None:
         sender_id = ((event.get("sender") or {}).get("id") or "").strip()
         recipient_id = ((event.get("recipient") or {}).get("id") or "").strip()
         message = event.get("message") or {}
-
-        # Echoes are messages WE sent via the Send API (Meta loops them back).
-        # Skip silently — our outbound dispatcher already logged them.
-        if message.get("is_echo"):
-            return
-
         text = (message.get("text") or "").strip()
 
-        # HUMAN_UDIT_INSTAGRAM detection — when Udit manually replies to
-        # a customer from the Instagram app, Meta fires a webhook with
-        # sender=PAGE_ID and recipient=customer. We need to:
-        #   1. Log it as HUMAN_UDIT_INSTAGRAM so subsequent inbounds
-        #      from that customer can short-circuit (restart-safe).
-        #   2. Auto-pause the customer's sender_id (= recipient_id of
-        #      this event) for 4h so the twin stops replying.
-        # Order matters: this check goes BEFORE the empty-text/no-sender
-        # gates because Udit's manual sends always have text and a
-        # well-formed sender, but we don't want any other downstream
-        # processing to fire on them.
+        # ===== ORDER MATTERS — see below =====
+        #
+        # 1) PAGE-ID CHECK FIRST (HUMAN_UDIT_IG detection).
+        #
+        # Messages sent BY the page (sender.id == PAGE_ID) arrive as echoes
+        # (is_echo == true) for BOTH:
+        #   (a) the bot's own Send API replies, AND
+        #   (b) Udit's manual replies typed in the IG app / Business Suite.
+        # Meta provides no structural field to tell (a) from (b), so we match
+        # the echoed text against recently-sent bot replies (registered in
+        # _send_instagram_reply via _record_bot_outbound).
+        #
+        # This MUST run BEFORE the generic is_echo drop below — otherwise
+        # Udit's manual replies (which are also echoes) would be swallowed by
+        # the is_echo return and HUMAN_UDIT_IG would never fire. That was the
+        # ordering bug this block fixes.
         if INSTAGRAM_PAGE_ID and sender_id == INSTAGRAM_PAGE_ID:
+            if _is_bot_outbound(text):
+                # The bot's own reply echoing back — already handled on send.
+                # Skipping here is what KEEPS the IG AUTO flow working: without
+                # this match, every bot reply's echo would be tagged
+                # HUMAN_UDIT and auto-pause the customer for 4h.
+                return
+            # Not a recent bot send → Udit replied manually from the IG app.
             if not recipient_id:
                 print("[HUMAN_UDIT_IG] sender is page but no recipient_id — skipping")
                 return
@@ -4045,6 +4065,13 @@ def _process_instagram_event(event: dict) -> None:
             )
             _pause_number(recipient_id)
             print(f"[HUMAN_UDIT_IG] Udit replied on Instagram to {recipient_id} — auto-paused 4h")
+            return
+
+        # 2) ECHO CHECK SECOND — any other page echo (e.g. PAGE_ID unset, or
+        # an echo whose sender we couldn't match) is dropped silently. The
+        # bot's own sends from the page-id branch above already returned;
+        # this is the fallback for echoes not covered there.
+        if message.get("is_echo"):
             return
 
         if not text:
