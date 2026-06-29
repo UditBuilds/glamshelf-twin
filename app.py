@@ -627,6 +627,222 @@ def _udit_replied_recently(wa_id: str, window_seconds: int = HUMAN_HANDLING_WIND
         return False
 
 
+# Distinctive substrings that only ever appear in the bot's own TEMPLATED
+# sends (shipping/tracking + review request). Those go out via
+# send_whatsapp_reply but are NOT written to message_logs as reply_text, so
+# once the in-memory _bot_recent_replies TTL lapses we'd otherwise mistake
+# them for a human reply. Matching these signatures keeps them attributed
+# to the bot. Kept deliberately narrow (URLs / fixed template phrases) so a
+# message Udit actually types can't accidentally match.
+_BOT_TEXT_SIGNATURES = (
+    "shiprocket.in/tracking",
+    "here's your tracking link",
+    "glamshelf.in/pages/reviews",
+)
+
+
+def _norm_text(s: str | None) -> str:
+    """Whitespace-collapsed, lower-cased text for tolerant comparison.
+    WATI stores outbound text byte-for-byte as we sent it, so a strip +
+    internal-whitespace collapse + lowercase is enough to match reliably
+    without the exact-match brittleness the old _is_bot_outbound had."""
+    return " ".join((s or "").split()).strip().lower()
+
+
+def _extract_wati_message_items(data) -> list:
+    """Pull the message list out of a getMessages response across the
+    schema variations WATI returns on different plans. Known shapes:
+      {"messages": {"items": [...]}}   (most common)
+      {"messages": [...]}
+      {"items": [...]}
+    Returns [] for anything unrecognised (never raises)."""
+    if not isinstance(data, dict):
+        return []
+    msgs = data.get("messages")
+    if isinstance(msgs, dict) and isinstance(msgs.get("items"), list):
+        return msgs["items"]
+    if isinstance(msgs, list):
+        return msgs
+    if isinstance(data.get("items"), list):
+        return data["items"]
+    return []
+
+
+def _parse_wati_ts(item) -> float | None:
+    """Best-effort unix timestamp for a WATI message item. Tries the
+    numeric `timestamp` field first, then ISO-8601 `created`. Returns None
+    when neither parses — caller decides how to treat undateable items."""
+    if not isinstance(item, dict):
+        return None
+    raw = item.get("timestamp")
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    created = item.get("created")
+    if isinstance(created, str) and created.strip():
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(created.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
+def _recent_bot_texts(wa_id: str, window_seconds: int = HUMAN_HANDLING_WINDOW_SECONDS) -> set[str]:
+    """Normalized set of texts the BOT actually shipped to this customer
+    recently — the yardstick for telling the bot's own outbound apart from
+    Udit's manual replies. Two complementary sources:
+
+      - _bot_recent_replies (in-memory, every send_whatsapp_reply call,
+        ~5-min TTL): covers EVERY outbound path (Claude replies, shipping,
+        tracking, review, vision fallback) for the minutes after a send.
+      - message_logs reply_text for AUTO / DRAFT / ESCALATE rows in the
+        window: survives Render restarts and the 5-min TTL, durably
+        covering every Claude-generated reply the customer was sent.
+
+    Together they make bot-vs-human attribution restart-proof for the
+    common case (Claude replies) and TTL-covered for templated sends.
+    Never raises — degrades to whatever subset it could gather."""
+    texts: set[str] = set()
+    for t in list(_bot_recent_replies.keys()):
+        n = _norm_text(t)
+        if n:
+            texts.add(n)
+    if wa_id:
+        try:
+            cutoff = time.time() - window_seconds
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT reply_text FROM message_logs "
+                "WHERE wa_id = ? AND status IN ('AUTO','DRAFT','ESCALATE') "
+                "AND reply_text IS NOT NULL AND ts >= ? "
+                "ORDER BY ts DESC LIMIT 50",
+                (wa_id, cutoff),
+            )
+            for (rt,) in cur.fetchall():
+                n = _norm_text(rt)
+                if n:
+                    texts.add(n)
+            conn.close()
+        except Exception as e:
+            print(f"[HUMAN_CHECK] bot-text DB lookup failed: {type(e).__name__}: {e}")
+    return texts
+
+
+def _looks_like_bot_text(text: str, bot_texts: set[str]) -> bool:
+    """True if `text` was (almost certainly) sent by the bot, not a human.
+    Checks the durable/in-memory bot-text set first, then the narrow
+    templated-send signatures."""
+    n = _norm_text(text)
+    if not n:
+        return False
+    if n in bot_texts:
+        return True
+    return any(sig in n for sig in _BOT_TEXT_SIGNATURES)
+
+
+def _check_recent_human_reply(wa_id: str) -> bool:
+    """Ask WATI directly whether a human (Udit) has replied to this chat
+    more recently than the bot — the durable, restart-proof complement to
+    the in-memory _is_bot_outbound / _bot_recent_replies heuristic.
+
+    WHY: WATI tags BOTH the bot's API sends and Udit's dashboard replies as
+    owner=True, with no field to tell them apart. The old detection leaned
+    entirely on _bot_recent_replies (in-memory, ~5-min TTL, exact-text) — so
+    after a Render restart, after 5 minutes, or on a single-character diff
+    it silently failed and the twin talked over Udit (the May-13 "sorry,
+    our automation system is glitching" incident: the bot re-asked for the
+    order ID four times on top of Udit's manual replies).
+
+    STRATEGY: fetch the recent message history and look at the most recent
+    BUSINESS-side (owner=True) message — i.e. who spoke last on our side.
+      - If that message is one the bot sent (per _recent_bot_texts /
+        templated-send signatures) → the bot had the last word, no pending
+        takeover → return False.
+      - If it is NOT ours → a human sent it. Honour the 4h handling window
+        when the message is dateable (don't pause on a stale reply from a
+        long-dormant thread); if undateable, treat it as recent because
+        stopping the over-reply bug is the priority here.
+
+    Latency: one ~0.5-1s GET. The caller only invokes this when the number
+    is NOT already paused, and on a positive hit we pause immediately, so
+    it runs at most once per customer per 4h window.
+
+    Never raises. Any failure (missing config, HTTP error, unparseable
+    body) returns False so the caller falls through to normal Claude
+    processing — a possible duplicate reply is a smaller harm than dropping
+    a real customer message."""
+    if not WATI_API_KEY or not WATI_ENDPOINT:
+        return False
+    wa_id = (wa_id or "").strip()
+    if not wa_id:
+        return False
+
+    endpoint = WATI_ENDPOINT.rstrip("/")
+    url = f"{endpoint}/api/v1/getMessages/{wa_id}"
+    headers = {"Authorization": f"Bearer {WATI_API_KEY}"}
+    params = {"pageSize": "20"}
+
+    try:
+        resp = requests.get(
+            url, headers=headers, params=params, timeout=WATI_TIMEOUT_SECONDS
+        )
+        if not resp.ok:
+            print(f"[HUMAN_CHECK] getMessages HTTP {resp.status_code} for {wa_id} — skipping check")
+            return False
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"[HUMAN_CHECK] getMessages returned non-JSON for {wa_id} — skipping check")
+            return False
+
+        items = _extract_wati_message_items(data)
+        if not items:
+            print(f"[HUMAN_CHECK] No messages returned for {wa_id}")
+            return False
+
+        # Newest first so the first business-side hit is the latest one.
+        items = sorted(items, key=lambda m: _parse_wati_ts(m) or 0.0, reverse=True)
+
+        bot_texts = _recent_bot_texts(wa_id)
+        now = time.time()
+
+        for item in items:
+            if not isinstance(item, dict) or item.get("owner") is not True:
+                continue  # customer (owner=False) or malformed — ignore
+            text = item.get("text")
+            if isinstance(text, dict):
+                text = text.get("body")
+            text = (text or "").strip()
+            if not text:
+                continue
+
+            # This is the most recent business-side message — it decides the
+            # outcome either way, so we return on the first one we see.
+            if _looks_like_bot_text(text, bot_texts):
+                return False  # bot had the last word → no takeover
+
+            ts = _parse_wati_ts(item)
+            if ts is not None and (now - ts) > HUMAN_HANDLING_WINDOW_SECONDS:
+                print(f"[HUMAN_CHECK] Latest manual reply for {wa_id} is older than 4h — not pausing")
+                return False
+            age = f"{int(now - ts)}s ago" if ts is not None else "time unknown"
+            print(f"[HUMAN_CHECK] Detected manual reply for {wa_id} ({age}): {text[:80]!r}")
+            return True
+
+        # No business-side messages at all → nobody has replied → bot proceeds.
+        return False
+    except requests.RequestException as e:
+        print(f"[HUMAN_CHECK] Network error for {wa_id}: {type(e).__name__}: {e}")
+        return False
+    except Exception as e:
+        print(f"[HUMAN_CHECK] Unexpected error for {wa_id}: {type(e).__name__}: {e}")
+        return False
+
+
 def _process_wati_outbound(data: dict) -> None:
     """Handle a single WATI outbound event — Udit's manual reply OR the
     bot's own send echoing back. Distinguishes via _is_bot_outbound and
@@ -681,18 +897,23 @@ def _process_wati_outbound(data: dict) -> None:
         _reassign_to_bot(wa_id)
         return
 
-    # Plain Udit-manual-reply path. Log as HUMAN_UDIT so the safety-net
+    # Plain Udit-manual-reply path. Log as HUMAN_UDIT so the DB safety-net
     # check (_udit_replied_recently) on the next inbound suppresses the
-    # twin's auto-reply for 4h.
+    # twin's auto-reply for 4h, AND pause the number in-memory right now so
+    # the very next inbound short-circuits at the cheap _is_paused gate
+    # without waiting for the DB check or another WATI scan. (Previously
+    # this path only wrote the DB row; the in-memory pause closes the
+    # window between this manual reply and the next inbound.)
     _log_message(
         wa_id, sender_name, text_body,
         status="HUMAN_UDIT",
         reply_text=text_body,
     )
+    _pause_number(wa_id)
     if msg_id:
         _seen_ids.add(msg_id)
         _persist_seen_id(msg_id)
-    print(f"[HUMAN_UDIT] Logged manual reply for {wa_id} (sender={sender_name!r}, {len(text_body)} chars)")
+    print(f"[HUMAN_UDIT] Logged + paused manual reply for {wa_id} (sender={sender_name!r}, {len(text_body)} chars)")
     # Udit just replied by hand in WATI, which reassigned this chat to his
     # operator and switched off automation for it. Re-point it at the Bot
     # so the twin keeps receiving this customer's future messages — the
@@ -3182,6 +3403,27 @@ def webhook():
         if _udit_replied_recently(wa_id):
             print(f"[HUMAN_HANDLING] Udit replied recently — skipping auto-reply for {wa_id}")
             _log_message(wa_id, sender_name, text_body or "[image]", status="HUMAN_HANDLING")
+            return jsonify({"status": "human_handling"}), 200
+
+        # SUPPLEMENTARY SAFETY NET (WATI API scan) — the two checks above
+        # rely on local state: the in-memory pause register and a HUMAN_UDIT
+        # row written by the outbound webhook. Both miss the case where Udit
+        # replied from the WATI dashboard but WATI's outbound webhook never
+        # reached us (no HUMAN_UDIT row) and the worker has since restarted
+        # (empty pause register). That's the May-13 failure. So before
+        # spending a Claude call, ask WATI directly whether a human has
+        # replied more recently than the bot. Only reached when NOT paused
+        # (gate above already returned), so the ~0.5-1s GET is paid at most
+        # once per customer per 4h window — on a hit we write the durable
+        # HUMAN_UDIT row + pause so every later inbound short-circuits cheaply.
+        if _check_recent_human_reply(wa_id):
+            print(f"[HUMAN_UDIT] WATI scan found a manual reply for {wa_id} — pausing + skipping auto-reply")
+            _log_message(
+                wa_id, sender_name, text_body or "[image]",
+                status="HUMAN_UDIT",
+                reply_text="(human reply detected via WATI getMessages scan)",
+            )
+            _pause_number(wa_id)
             return jsonify({"status": "human_handling"}), 200
 
         # ----- VISION BRANCH -----
