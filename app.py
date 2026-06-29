@@ -717,7 +717,7 @@ def _recent_bot_texts(wa_id: str, window_seconds: int = HUMAN_HANDLING_WINDOW_SE
             cur = conn.cursor()
             cur.execute(
                 "SELECT reply_text FROM message_logs "
-                "WHERE wa_id = ? AND status IN ('AUTO','DRAFT','ESCALATE') "
+                "WHERE wa_id = ? AND status IN ('AUTO','DRAFT','DRAFT_SENT','ESCALATE') "
                 "AND reply_text IS NOT NULL AND ts >= ? "
                 "ORDER BY ts DESC LIMIT 50",
                 (wa_id, cutoff),
@@ -1136,9 +1136,9 @@ def _log_message(
         print(f"[DB] _log_message failed: {type(e).__name__}: {e}")
 
 
-def _load_conversation_history(wa_id: str) -> list[dict]:
-    """Pull up to 30 recent (customer msg, bot reply) exchanges with this
-    wa_id from the last 7 days, oldest first.
+def _load_wati_history(wa_id: str, max_turns: int = 30, max_age_days: int = 7) -> list[dict]:
+    """Pull up to `max_turns` recent (customer msg, bot reply) exchanges
+    with this wa_id from the last `max_age_days` days, oldest first.
 
     The 30-turn / 7-day window is sized for multi-day threads — refund
     flows, return pickups, and Udit-handled escalations often span days,
@@ -1146,25 +1146,44 @@ def _load_conversation_history(wa_id: str) -> list[dict]:
     the thread so it doesn't restart the conversation as if it's a
     fresh complaint when the customer follows up with "any update?".
 
-    Only AUTO and ESCALATE rows are eligible — those are the only statuses
-    that reflect a real reply the customer actually saw. DRAFT replies were
-    sent over Telegram to the founder, not delivered to WhatsApp, so
-    including them would mislead Claude into thinking the customer saw
-    text they never did.
+    DELIVERED-ONLY status allowlist — a row is eligible only if it
+    represents text the customer ACTUALLY received:
+      - AUTO        : bot reply sent straight to WhatsApp.
+      - ESCALATE    : holding reply for the escalation context.
+      - DRAFT_SENT  : a DRAFT+APPROVE reply that Udit approved (or edited)
+                      and shipped via the Telegram buttons. reply_text holds
+                      the exact text delivered (the edited version on edits).
+
+    Deliberately EXCLUDED:
+      - DRAFT       : the *drafted* text at creation time. A draft may be
+                      Skipped or timed-out (never sent) or Edited (sent text
+                      differs), so the raw DRAFT row can't be trusted as
+                      "what the customer saw". Its delivery, when it happens,
+                      is recorded separately as DRAFT_SENT.
+      - HUMAN_UDIT / HUMAN_HANDLING / PAUSE_DIRECTIVE / PAUSED / DEDUP /
+                      PROTECTED / ERROR : not clean customer→bot exchanges
+                      (no reply, Udit's own outbound, or placeholder text),
+                      so feeding them as user/assistant turns would mislead.
+
+    THE BUG THIS FIXES: the old filter was AUTO/ESCALATE only, so every
+    reply delivered through the DRAFT+APPROVE → Telegram-approve flow was
+    invisible to history. A customer whose substantive turns went through
+    approval (e.g. a makeup artist asking for bulk options) would hit a
+    full context reset on her next message — the bot would "forget"
+    everything it had already told her.
 
     Token-cost note: 30 turns × ~150 chars avg ≈ 4-5k chars of extra
-    context per Claude call. Well within Sonnet 4.6's window, and the
-    user-message portion of the prompt isn't cached, so this is a real
-    additive cost. Still net cheaper than re-asking the customer for
-    info already in the thread.
+    context per Claude call. Well within the model's window; the user-
+    message portion isn't cached, so it's a real additive cost — still
+    net cheaper than re-asking for info already in the thread.
 
     Failures are logged-and-swallowed → returns []. Caller falls back to a
-    plain single-turn call.
+    plain single-turn call. Never returns None.
     """
     if not wa_id:
         return []
     try:
-        cutoff = time.time() - 7 * 24 * 3600  # 7 days
+        cutoff = time.time() - max_age_days * 24 * 3600
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(
@@ -1172,26 +1191,32 @@ def _load_conversation_history(wa_id: str) -> list[dict]:
             SELECT ts, msg_text, reply_text
             FROM message_logs
             WHERE wa_id = ?
-              AND status IN ('AUTO', 'ESCALATE')
+              AND status IN ('AUTO', 'ESCALATE', 'DRAFT_SENT')
               AND ts >= ?
               AND msg_text IS NOT NULL
               AND reply_text IS NOT NULL
             ORDER BY ts DESC
-            LIMIT 30
+            LIMIT ?
             """,
-            (wa_id, cutoff),
+            (wa_id, cutoff, max_turns),
         )
         rows = cur.fetchall()
         conn.close()
-        rows.reverse()  # oldest -> newest
+        rows.reverse()  # oldest -> newest (Claude expects chronological order)
         history = [
             {"ts": r[0], "msg_text": r[1], "reply_text": r[2]} for r in rows
         ]
-        print(f"[MEMORY] Loaded {len(history)} messages for {wa_id}")
+        print(f"[HISTORY] Loaded {len(history)} turns for {wa_id}")
         return history
     except Exception as e:
-        print(f"[MEMORY] Failed to load history for {wa_id}: {type(e).__name__}: {e}")
+        print(f"[HISTORY] Failed to load history for {wa_id}: {type(e).__name__}: {e}")
         return []
+
+
+# Back-compat alias — kept so any existing call site / comment that refers
+# to the original name keeps working. Delegates with the default window.
+def _load_conversation_history(wa_id: str) -> list[dict]:
+    return _load_wati_history(wa_id)
 
 
 def _verify_shopify_hmac(raw_body: bytes, hmac_header: str | None) -> bool:
@@ -2109,6 +2134,15 @@ def _handle_telegram_callback(cb: dict) -> None:
             "callback_query_id": callback_id, "text": "Sending…"
         })
         send_whatsapp_reply(customer_number, draft["reply_text"])
+        # Record the DELIVERED reply as a history-eligible exchange so the
+        # twin remembers this turn on the customer's next message. Without
+        # this, approved-draft replies were invisible to _load_wati_history
+        # (only the un-delivered DRAFT row existed) and the conversation
+        # context reset. msg_text is the customer message the draft answered.
+        _log_message(
+            customer_number, customer_name, draft.get("customer_message") or "",
+            status="DRAFT_SENT", reply_text=draft["reply_text"],
+        )
         _finalize_draft_message(
             chat_id, message_id, original_text,
             f"✅ Sent to {name_for_display}",
@@ -2214,6 +2248,13 @@ def _handle_telegram_message(msg: dict) -> None:
     name_for_display = customer_name or customer_number
 
     send_whatsapp_reply(customer_number, text)
+    # Record the actually-sent EDITED text (not the pre-edit draft) as a
+    # history-eligible exchange so future turns remember what the customer
+    # really received. Mirrors the send-as-is branch in _handle_telegram_callback.
+    _log_message(
+        customer_number, customer_name, draft.get("customer_message") or "",
+        status="DRAFT_SENT", reply_text=text,
+    )
     # Sending an edited reply is a human takeover — keep the ticket on the
     # Bot so the webhook keeps receiving this customer's messages.
     _reassign_to_bot(customer_number)
@@ -3526,9 +3567,9 @@ def webhook():
 
         # Pull recent context for this customer so Claude sees the
         # ongoing conversation, not just the latest message in isolation.
-        # Best-effort — failures inside _load_conversation_history return []
-        # and we fall through to a single-turn call.
-        history = _load_conversation_history(wa_id)
+        # Best-effort — failures inside _load_wati_history return [] and we
+        # fall through to a single-turn call.
+        history = _load_wati_history(wa_id)
 
         # If the same customer has a Shopify order in the last 30 days,
         # surface it to Claude as order_context. Empty string when no
