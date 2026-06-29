@@ -160,6 +160,16 @@ WATI_API_KEY = os.environ.get("WATI_API_KEY", "")
 WATI_ENDPOINT = os.environ.get("WATI_ENDPOINT", "")
 WATI_TIMEOUT_SECONDS = 10
 
+# Operator identifier the chat should be reassigned to whenever a human
+# (Udit) takes over and WATI auto-reassigns the ticket away from the bot.
+# WATI disables all automation for a chat the moment it's assigned to a
+# human operator ("Automation will not work unless it's assigned back to
+# Bot") — so after every manual reply we re-point the ticket at the Bot to
+# keep the webhook alive. The literal "Bot" is what WATI's own event log
+# uses ("ticket has been assigned to Bot"); override in env only if your
+# WATI operator list names the AI agent differently.
+WATI_BOT_OPERATOR_EMAIL = os.environ.get("WATI_BOT_OPERATOR_EMAIL", "Bot")
+
 # The Glam Shelf's WhatsApp Business number. The webhook ignores any inbound
 # event where waId equals this number — prevents the twin from replying to
 # itself if WATI ever loops outbound / own messages through the webhook.
@@ -663,6 +673,12 @@ def _process_wati_outbound(data: dict) -> None:
         if msg_id:
             _seen_ids.add(msg_id)
             _persist_seen_id(msg_id)
+        # A #pause/#resume directive rides on a message Udit sent manually
+        # through WATI, so WATI has already reassigned this chat to his
+        # operator. Re-point it at the Bot so the webhook keeps receiving
+        # the customer's messages (the in-memory pause register, not the
+        # ticket assignment, is what suppresses auto-replies while paused).
+        _reassign_to_bot(wa_id)
         return
 
     # Plain Udit-manual-reply path. Log as HUMAN_UDIT so the safety-net
@@ -677,6 +693,12 @@ def _process_wati_outbound(data: dict) -> None:
         _seen_ids.add(msg_id)
         _persist_seen_id(msg_id)
     print(f"[HUMAN_UDIT] Logged manual reply for {wa_id} (sender={sender_name!r}, {len(text_body)} chars)")
+    # Udit just replied by hand in WATI, which reassigned this chat to his
+    # operator and switched off automation for it. Re-point it at the Bot
+    # so the twin keeps receiving this customer's future messages — the
+    # HUMAN_UDIT safety net (not the ticket assignment) is what holds the
+    # twin back from auto-replying for the next 4h.
+    _reassign_to_bot(wa_id)
 
 
 def _handle_pause_directive(wa_id: str, text_body: str) -> str | None:
@@ -1499,6 +1521,13 @@ _restore_db_from_github()
 _init_db()
 _start_backup_loop()
 
+# Confirm the auto-reassign feature is wired up. Runs at import time so it
+# shows in both the gunicorn (prod) and __main__ (local) boot logs.
+if WATI_API_KEY and WATI_ENDPOINT:
+    print(f"[REASSIGN] Auto-reassign to Bot enabled (operator={WATI_BOT_OPERATOR_EMAIL!r})")
+else:
+    print("[REASSIGN] Auto-reassign to Bot inactive — WATI_API_KEY/WATI_ENDPOINT not set")
+
 # Anthropic client picks up ANTHROPIC_API_KEY from the environment.
 client = Anthropic()
 
@@ -1863,6 +1892,9 @@ def _handle_telegram_callback(cb: dict) -> None:
             chat_id, message_id, original_text,
             f"✅ Sent to {name_for_display}",
         )
+        # Approving a draft is a human takeover of the conversation — keep
+        # the ticket on the Bot so the webhook keeps hearing this customer.
+        _reassign_to_bot(customer_number)
         # Already popped at top — no del needed.
         print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
 
@@ -1900,6 +1932,10 @@ def _handle_telegram_callback(cb: dict) -> None:
             chat_id, message_id, original_text,
             "⛔ Skipped — handle manually in WATI",
         )
+        # Skip means Udit will reply by hand in WATI, which reassigns the
+        # ticket to him. Pin it back to the Bot pre-emptively so the webhook
+        # stays alive (idempotent — a no-op if it's still Bot-assigned).
+        _reassign_to_bot(customer_number)
         # Already popped at top — no del needed.
         print(f"[TELEGRAM DRAFT] Skipped for {customer_number} (draft {draft_id})")
 
@@ -1957,6 +1993,9 @@ def _handle_telegram_message(msg: dict) -> None:
     name_for_display = customer_name or customer_number
 
     send_whatsapp_reply(customer_number, text)
+    # Sending an edited reply is a human takeover — keep the ticket on the
+    # Bot so the webhook keeps receiving this customer's messages.
+    _reassign_to_bot(customer_number)
     _telegram_api("sendMessage", {
         "chat_id": chat_id,
         "text": f"✅ Sent your edit to {name_for_display}",
@@ -2108,6 +2147,96 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         print(f"[WATI] Network error: {type(e).__name__}: {e}")
     except Exception as e:
         print(f"[WATI] Unexpected error: {type(e).__name__}: {e}")
+
+
+def _reassign_to_bot(wa_id: str) -> None:
+    """Re-point a WATI chat's ticket back at the Bot operator.
+
+    THE root-cause fix: every time Udit manually replies to a customer in
+    the WATI dashboard, WATI reassigns that chat from "Bot" to his operator
+    email and DISABLES all automation for it — the twin's webhook then goes
+    deaf to that customer until the chat is reassigned back to Bot. This
+    helper makes that reassignment automatic, called from every spot where
+    we detect a human takeover (HUMAN_UDIT outbound, #pause directive,
+    ESCALATE, and the Telegram approval buttons).
+
+    Uses WATI's assignOperator endpoint — same base URL / Bearer auth as
+    send_whatsapp_reply, only the path and params differ:
+        POST /api/v1/assignOperator?email=<operator>&whatsappNumber=<waId>
+    The operator we assign to is WATI_BOT_OPERATOR_EMAIL (default "Bot").
+
+    Contract (mirrors send_whatsapp_reply):
+      - Idempotent: re-assigning an already-Bot-assigned chat is a no-op on
+        WATI's side, so calling this twice never errors.
+      - Defensive: NEVER raises. Every failure path (missing config,
+        protected number, network error, WATI logical rejection on HTTP
+        200) is logged with a [REASSIGN] tag and swallowed so the webhook
+        always returns 200.
+      - WhatsApp-only: Instagram doesn't use WATI ticketing, so the IG
+        flow deliberately does NOT call this (see _process_instagram_event).
+    """
+    if not WATI_API_KEY or not WATI_ENDPOINT:
+        print("[REASSIGN] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
+        return
+    if not WATI_BOT_OPERATOR_EMAIL:
+        print("[REASSIGN] Skipped: WATI_BOT_OPERATOR_EMAIL not set")
+        return
+
+    wa_id = (wa_id or "").strip()
+    if not wa_id:
+        print("[REASSIGN] Skipped: empty wa_id")
+        return
+
+    # Defense in depth: never touch tickets for the business/owner numbers.
+    target = normalize_wa(wa_id)
+    if target and target in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
+        print(f"[REASSIGN] Skipped protected number {wa_id}")
+        return
+
+    endpoint = WATI_ENDPOINT.rstrip("/")
+    url = f"{endpoint}/api/v1/assignOperator"
+    headers = {
+        "Authorization": f"Bearer {WATI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    # assignOperator takes email + whatsappNumber as URL QUERY params, the
+    # same query-string convention sendSessionMessage uses (not a JSON body).
+    params = {"email": WATI_BOT_OPERATOR_EMAIL, "whatsappNumber": wa_id}
+
+    print(f"[REASSIGN] Re-pointing {wa_id} -> operator {WATI_BOT_OPERATOR_EMAIL!r}")
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            params=params,
+            json={},
+            timeout=WATI_TIMEOUT_SECONDS,
+        )
+
+        # WATI returns HTTP 200 even on logical failures — the real outcome
+        # is in the JSON body as {"result": true|false, "info": ...}, same
+        # as send_whatsapp_reply. Log the body so failures are visible.
+        body_preview = (response.text or "(empty body)")[:1000]
+        print(f"[REASSIGN] HTTP {response.status_code}")
+        print(f"[REASSIGN] Response body: {body_preview}")
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+
+        if isinstance(data, dict) and data.get("result") is False:
+            info = data.get("info") or data.get("message") or "(no detail)"
+            print(f"[REASSIGN] WATI rejected the reassign: {info}")
+        elif response.ok:
+            print(f"[REASSIGN] Chat for {wa_id} reassigned back to Bot")
+        else:
+            print(f"[REASSIGN] HTTP failure {response.status_code}")
+    except requests.RequestException as e:
+        print(f"[REASSIGN] Network error: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[REASSIGN] Unexpected error: {type(e).__name__}: {e}")
 
 
 def send_whatsapp_template(
@@ -3225,6 +3354,11 @@ def webhook():
             # that also short-circuits inbound when Udit replies via WATI.
             _pause_number(wa_id)
             print(f"[ESCALATE] Auto-paused {wa_id} for 4h after holding reply sent")
+            # Udit is about to take this conversation over by hand in WATI,
+            # which will reassign the ticket to him and kill automation. Pin
+            # it to the Bot now so the webhook stays alive for this customer;
+            # the 4h pause above is what keeps the twin quiet meanwhile.
+            _reassign_to_bot(wa_id)
             elapsed_ms = int((time.time() - t_start) * 1000)
             _log_message(
                 wa_id, sender_name, text_body,
