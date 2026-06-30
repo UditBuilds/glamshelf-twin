@@ -30,7 +30,7 @@ It also closes the loop on every order: automated shipping notifications, tracki
   - Order confirmation → extracts order ID + customer details → routes through normal reply flow
   - Eye photo → detects eye shape → recommends a suitable lash style
   - Other / unclear → neutral fallback message
-- **Live Shopify inventory injection** — every Claude call sees current stock from the storefront feed; no manual brain updates when products restock or sell out
+- **Live Shopify inventory injection** — every text call sees current stock from the storefront feed; no manual brain updates when products restock or sell out
 - **Multi-day conversation memory** — last 30 turns / 7 days. Lets the twin recognize ongoing refund/return flows instead of treating "any update?" as a fresh complaint and re-asking for the order ID
 
 ### Shipping + order lifecycle
@@ -116,7 +116,7 @@ It also closes the loop on every order: automated shipping notifications, tracki
 1. Customer sends image → WATI webhook fires with `type=image`
 2. Download media from WATI (auth header) → send to Claude Vision API with extraction schema
 3. Branch on extracted `image_type` (text replies still use DeepSeek):
-   - `order_screenshot` with high-confidence order ID → synthesize `"My order ID is #1042…"` → fall through to normal Claude pipeline
+   - `order_screenshot` with high-confidence order ID → synthesize `"My order ID is #1042…"` → fall through to normal text pipeline (DeepSeek)
    - `eye_photo` with detected shape → synthesize `"…my eye shape looks hooded. Can you recommend a lash?"`
    - Otherwise → deterministic neutral fallback (no Claude call)
 
