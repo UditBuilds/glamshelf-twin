@@ -1,4 +1,5 @@
 flask
+openai
 anthropic
 python-dotenv
 gunicorn

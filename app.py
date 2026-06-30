@@ -6,9 +6,9 @@ Runs on:
   - Local Windows: `python app.py` → Flask dev server on http://localhost:5000
   - Render (Linux): `gunicorn app:app` via Procfile, binds to $PORT
 
-Auth: ANTHROPIC_API_KEY environment variable.
-  - Local: put it in .env (loaded by python-dotenv)
-  - Render: set it in the service's Environment dashboard
+Auth: DEEPSEEK_API_KEY (text replies) + ANTHROPIC_API_KEY (vision/image extraction)
+  - Local: put both in .env (loaded by python-dotenv)
+  - Render: set them in the service's Environment dashboard
 """
 
 import base64
@@ -29,6 +29,7 @@ from functools import wraps
 from pathlib import Path
 
 import requests
+from openai import OpenAI
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from flask import (
@@ -90,19 +91,21 @@ APP_PASSWORD = _require_env("APP_PASSWORD")
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
-MODEL = "claude-sonnet-4-6"
+DEEPSEEK_MODEL = "deepseek-chat"        # all text replies
+CLAUDE_MODEL = "claude-sonnet-4-6"      # vision only (image extraction)
 MAX_TOKENS = 2048
 
 # ----- Vision (image understanding) config -----
 #
 # When a WATI inbound event has type=image, the handler downloads the
-# image, sends it to Claude's vision API for order-info extraction, and
-# then either (a) synthesizes a text query and runs the normal Claude
-# reply pipeline, or (b) on low confidence / failure, sends the
-# deterministic fallback reply asking the customer to type their order ID.
+# image, sends it to the LLM's vision API for order-info extraction, and
+# then either (a) synthesizes a text query and runs the normal reply
+# pipeline, or (b) on low confidence / failure, sends the deterministic
+# fallback reply asking the customer to type their order ID.
 #
-# Uses the same MODEL constant as text replies — claude-sonnet-4-6 has
-# vision capability built in; no separate vision-only model needed.
+# Vision runs on CLAUDE_MODEL via claude_client — DeepSeek's deepseek-chat
+# is text-only and rejects image inputs, so image extraction stays on
+# Claude's native vision API. Text replies go through DeepSeek separately.
 VISION_MAX_TOKENS = 512                # extraction output is short JSON
 VISION_DOWNLOAD_TIMEOUT_SECONDS = 10   # per spec — give up fast on slow WATI media
 
@@ -1774,8 +1777,22 @@ if WATI_API_KEY and WATI_ENDPOINT:
 else:
     print("[REASSIGN] Auto-reassign to Bot inactive — WATI_API_KEY/WATI_ENDPOINT not set")
 
-# Anthropic client picks up ANTHROPIC_API_KEY from the environment.
-client = Anthropic()
+# Hybrid LLM setup — two independent clients, two keys, no shared state.
+#   - deepseek_client: every TEXT reply (cheap, ~90% of calls) via the
+#     OpenAI-compatible SDK pointed at DeepSeek.
+#   - claude_client: VISION ONLY (order screenshots + eye selfies) — DeepSeek's
+#     deepseek-chat is text-only, so image extraction stays on Claude's API.
+# Both keys must be set on Render / in .env (no usable default).
+deepseek_client = OpenAI(
+    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+    base_url="https://api.deepseek.com",
+)
+claude_client = Anthropic(
+    api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+)
+
+print(f"[INIT] DeepSeek text client configured: {bool(os.environ.get('DEEPSEEK_API_KEY', ''))}")
+print(f"[INIT] Claude vision client configured: {bool(os.environ.get('ANTHROPIC_API_KEY', ''))}")
 
 
 def send_telegram_notification(
@@ -2737,10 +2754,10 @@ def draft_reply_logic(
     # current stock at the very top of the system prompt. Empty string on
     # any failure (silent fallback) — brain alone is still a complete
     # working prompt; the inventory block is additive context. See
-    # get_live_inventory() doc for details. The 5-minute cache there
-    # plus Anthropic's 5-minute ephemeral system-prompt cache mean the
-    # system prompt's content changes at most ~once per 5 minutes; the
-    # cache churn cost is acceptable for the freshness gain.
+    # get_live_inventory() doc for details. The 5-minute cache there means
+    # the system prompt's content changes at most ~once per 5 minutes.
+    # (DeepSeek does its own automatic server-side context caching; there's
+    # no client-side cache directive to manage.)
     live_stock = get_live_inventory()
     if live_stock:
         brain = live_stock + "\n\n" + brain
@@ -2831,7 +2848,7 @@ def build_user_message(
     source: str = "WhatsApp",
 ) -> str:
     """The per-request user prompt. The brain itself goes in the `system`
-    parameter (with cache_control) — see ask_claude().
+    message — see ask_claude().
 
     `source` labels the channel in the prompt header so Claude knows
     where the message came from. Default "WhatsApp" keeps every existing
@@ -2981,11 +2998,13 @@ def _extract_image_info(image_url: str) -> dict | None:
     print(f"[VISION] Downloaded image ({len(image_bytes)} bytes, type={content_type})")
 
     # ----- Step 2: send to Claude Vision for extraction -----
+    # Vision stays on Claude (claude_client) — DeepSeek's deepseek-chat is
+    # text-only. Small payload: image + short prompt, no brain, 512 tokens.
     raw = ""  # so it's defined for the except branch below
     try:
         b64 = base64.standard_b64encode(image_bytes).decode("ascii")
-        message = client.messages.create(
-            model=MODEL,
+        message = claude_client.messages.create(
+            model=CLAUDE_MODEL,
             max_tokens=VISION_MAX_TOKENS,
             system=VISION_SYSTEM_PROMPT,
             messages=[{
@@ -3007,6 +3026,11 @@ def _extract_image_info(image_url: str) -> dict | None:
             }],
         )
         raw = "".join(b.text for b in message.content if b.type == "text").strip()
+        usage = message.usage
+        print(
+            f"[VISION] Claude extraction done "
+            f"(input: {usage.input_tokens}, output: {usage.output_tokens} tokens)"
+        )
         cleaned, _ = strip_markdown_fences(raw)
         parsed = json.loads(cleaned)
         if not isinstance(parsed, dict):
@@ -3017,7 +3041,7 @@ def _extract_image_info(image_url: str) -> dict | None:
         print(f"[VISION] JSON parse error: {e}; raw={raw[:200]!r}")
         return None
     except Exception as e:
-        print(f"[VISION] Claude Vision error: {type(e).__name__}: {e}")
+        print(f"[VISION] Vision error: {type(e).__name__}: {e}")
         return None
 
 
@@ -3028,72 +3052,63 @@ def ask_claude(
     history: list[dict] | None = None,
     source: str = "WhatsApp",
 ) -> str:
-    """Call the Anthropic Messages API.
+    """Call the DeepSeek chat-completions API (OpenAI-compatible SDK).
 
-    The brain content is sent as the `system` prompt with `cache_control`
-    (ephemeral / 5-minute cache). Since brain.md is identical across all
-    requests in a busy session, cache hits make follow-up requests
-    significantly cheaper and lower-latency. The customer message and
-    order context go in the user prompt and are *not* cached.
+    The brain content is sent as the first `system` message. DeepSeek
+    applies its own automatic server-side context caching (no client-side
+    cache directive needed), so a repeated identical brain prefix is billed
+    at the cheaper cache-hit rate. The customer message and order context
+    go in the user prompt.
 
     `history`, when provided, is a list of {ts, msg_text, reply_text} dicts
     representing prior exchanges with the same customer (oldest first).
     Each entry becomes a user/assistant pair preceding the current
-    user message, so Claude treats the request as a real multi-turn
+    user message, so the model treats the request as a real multi-turn
     conversation rather than a one-shot question.
 
     `source` labels the channel ("WhatsApp" by default, "Instagram DM"
     for IG webhook calls). Surfaced in the per-request user prompt
-    header; doesn't affect the cached system prompt.
+    header; doesn't affect the system prompt.
     """
     user_text = build_user_message(customer_message, order_context, source=source)
     print(
-        f"[CLAUDE] Calling {MODEL} "
+        f"[LLM] Calling {DEEPSEEK_MODEL} "
         f"(brain: {len(brain)} chars, user: {len(user_text)} chars, "
         f"history: {len(history) if history else 0} turns, source: {source})"
     )
 
-    # Build the messages list. When history is non-empty, prior exchanges
-    # are interleaved as alternating user/assistant turns BEFORE the current
-    # task-shaped user message. Empty / None history → single-turn (unchanged).
-    messages: list[dict] = []
+    # Build the messages list. The brain is the first system message; when
+    # history is non-empty, prior exchanges are interleaved as alternating
+    # user/assistant turns BEFORE the current task-shaped user message.
+    # Empty / None history → single-turn (system + one user message).
+    all_messages: list[dict] = [{"role": "system", "content": brain}]
     if history:
         for turn in history:
-            messages.append({"role": "user", "content": turn["msg_text"]})
-            messages.append({"role": "assistant", "content": turn["reply_text"]})
-    messages.append({"role": "user", "content": user_text})
+            all_messages.append({"role": "user", "content": turn["msg_text"]})
+            all_messages.append({"role": "assistant", "content": turn["reply_text"]})
+    all_messages.append({"role": "user", "content": user_text})
 
-    message = client.messages.create(
-        model=MODEL,
+    message = deepseek_client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
         max_tokens=MAX_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": brain,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=messages,
+        messages=all_messages,
     )
 
-    # Combine any top-level text blocks (usually just one).
-    raw = "".join(b.text for b in message.content if b.type == "text").strip()
+    raw = (message.choices[0].message.content or "").strip()
 
     usage = message.usage
     print(
-        f"[CLAUDE] Got {len(raw)} chars back. "
-        f"Tokens — input: {usage.input_tokens}, "
-        f"output: {usage.output_tokens}, "
-        f"cache_create: {getattr(usage, 'cache_creation_input_tokens', 0)}, "
-        f"cache_read: {getattr(usage, 'cache_read_input_tokens', 0)}"
+        f"[LLM] Got {len(raw)} chars back. "
+        f"Tokens — input: {usage.prompt_tokens}, "
+        f"output: {usage.completion_tokens}"
     )
 
     preview = raw[:300] + ("..." if len(raw) > 300 else "")
-    print(f"[CLAUDE] Raw response preview:\n        {preview}")
+    print(f"[LLM] Raw response preview:\n        {preview}")
 
     cleaned, was_fenced = strip_markdown_fences(raw)
     if was_fenced:
-        print("[CLAUDE] NOTE: markdown code fences were detected and stripped")
+        print("[LLM] NOTE: markdown code fences were detected and stripped")
     return cleaned
 
 
@@ -3148,8 +3163,10 @@ def healthz():
         "status": "ok",
         "brain_present": BRAIN_FILE.exists(),
         "brain_path": str(BRAIN_FILE),
-        "model": MODEL,
-        "anthropic_api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "model": DEEPSEEK_MODEL,
+        "vision_model": CLAUDE_MODEL,
+        "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
+        "claude_vision_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
         "db": db_status,
         "total_logged": total_logged,
         "total_orders": total_orders,
@@ -4874,7 +4891,8 @@ if __name__ == "__main__":
     print("=" * 60)
     print("  Glam Shelf Twin — Phase 0")
     print(f"  Brain file: {BRAIN_FILE}")
-    print(f"  Model:      {MODEL}")
+    print(f"  Text model:   {DEEPSEEK_MODEL}")
+    print(f"  Vision model: {CLAUDE_MODEL}")
     print(f"  Open this in your browser: http://{host}:{port}")
     print("  Press CTRL+C in this terminal to stop the server.")
     print("=" * 60)
