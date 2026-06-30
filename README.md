@@ -12,7 +12,7 @@ It also closes the loop on every order: automated shipping notifications, tracki
 
 - **Language / runtime** — Python 3.14
 - **Web framework** — Flask, served by gunicorn on Render
-- **LLM** — Anthropic Claude (Sonnet 4.6, multimodal — text + vision)
+- **LLM** — DeepSeek v3 for text replies + Anthropic Claude (Sonnet 4.6) for vision/image extraction
 - **Database** — SQLite, with hourly GitHub-backed snapshots for redeploy persistence
 - **WhatsApp** — WATI Business API (session messages within the 24h window, approved HSM template messages outside it)
 - **Instagram** — Meta Instagram Graph API (Instagram Login flow)
@@ -24,7 +24,7 @@ It also closes the loop on every order: automated shipping notifications, tracki
 
 ### Customer-facing
 
-- **WhatsApp + Instagram auto-replies** in a defined brand voice — the 45 KB `brain/brain.md` system prompt is loaded with Anthropic's ephemeral cache (5-minute TTL) so token cost stays low even at high volume
+- **WhatsApp + Instagram auto-replies** in a defined brand voice — the 45 KB `brain/brain.md` is loaded as the system prompt on every call, with a local 5-minute in-memory cache to avoid re-reading from disk
 - **Three-tier classification** per message: `AUTO` (send as-is), `DRAFT+APPROVE` (founder reviews on Telegram), `ESCALATE` (founder takes over directly)
 - **Vision pipeline** — when a customer sends a screenshot, Claude reads it:
   - Order confirmation → extracts order ID + customer details → routes through normal reply flow
@@ -63,33 +63,32 @@ It also closes the loop on every order: automated shipping notifications, tracki
 ```
                          ┌──────────────────────┐
                          │   brain/brain.md     │  ← brand voice + rules
-                         │  (system prompt,     │
-                         │   ephemerally cached)│
+                         │  (system prompt)     │
                          └──────────┬───────────┘
                                     │
-   ┌──────────┐    POST       ┌─────▼─────┐         ┌─────────────────┐
-   │  WATI    ├──────────────►│           ├────────►│  Anthropic API  │
-   │ WhatsApp │               │           │         │  Claude Sonnet  │
-   └──────────┘               │           │         │ (text + vision) │
-                              │           │         └─────────────────┘
-   ┌──────────┐               │   Flask   │
-   │   Meta   ├──────────────►│   app     │         ┌─────────────────┐
-   │ Instagram│               │           │         │     SQLite      │
-   └──────────┘               │  Routes:  │◄───────►│   logs, orders, │
-                              │ /webhook  │         │   ig_logs,      │
-   ┌──────────┐               │ /shopify-*│         │   shipping_     │
-   │ Shopify  ├──────────────►│ /telegram-│         │   notifications │
-   │ webhooks │               │  callback │         └────────┬────────┘
-   └──────────┘               │ /instagram│                  │ hourly
-                              │   etc.    │                  ▼
-   ┌──────────┐               │           │         ┌─────────────────┐
-   │ Storefront│              │           │         │ GitHub backup   │
-   │ inventory├──────────────►│           │         │   repository    │
-   │   feed    │ (5 min cache)│           │         └─────────────────┘
-   └──────────┘               └─────┬─────┘
-                                    │
-              ┌─────────────────────┼─────────────────────────┐
-              │                     │                         │
+   ┌──────────┐    POST       ┌─────▼─────┐    text    ┌─────────────────┐
+   │  WATI    ├──────────────►│           ├───────────►│  DeepSeek v3    │
+   │ WhatsApp │               │           │            │  (text replies) │
+   └──────────┘               │           │            └─────────────────┘
+                              │           │
+   ┌──────────┐               │           │   vision   ┌─────────────────┐
+   │   Meta   ├──────────────►│   Flask   ├───────────►│  Claude Sonnet  │
+   │ Instagram│               │   app     │            │  (image only)   │
+   └──────────┘               │           │            └─────────────────┘
+                              │           │
+   ┌──────────┐               │  Routes:  │◄───────►┌───────────────────┐
+   │ Shopify  ├──────────────►│ /webhook  │         │     SQLite        │
+   │ webhooks │               │ /shopify-*│         │   logs, orders,   │
+   └──────────┘               │ /telegram-│         │   ig_logs,        │
+                              │  callback │         │   shipping_       │
+   ┌──────────┐               │ /instagram│         │   notifications   │
+   │Storefront│               │   etc.    │         └────────┬──────────┘
+   │inventory ├──────────────►│           │                  │ hourly
+   │  feed    │ (5 min cache) │           │                  ▼
+   └──────────┘               └─────┬─────┘         ┌───────────────────┐
+                                    │               │ GitHub backup     │
+              ┌─────────────────────┼───────────────┤   repository      │
+              │                     │               └───────────────────┘
               ▼                     ▼                         ▼
        ┌────────────┐        ┌────────────┐           ┌──────────────┐
        │   WATI     │        │  Meta IG   │           │   Telegram   │
@@ -105,7 +104,7 @@ It also closes the loop on every order: automated shipping notifications, tracki
 1. Customer sends a WhatsApp message → WATI forwards to `/webhook`
 2. Defense gates in order: message-id dedup → protected-number check → in-memory pause register → DB-backed HUMAN_UDIT check
 3. Load conversation history (30 turns / 7 days), recent Shopify order context, live inventory block
-4. Call Claude with cached system prompt + history + current message
+4. Call DeepSeek with system prompt + history + current message. Vision calls (order screenshots, eye photos) route to Claude.
 5. Parse classification: `AUTO` / `DRAFT+APPROVE` / `ESCALATE`
 6. Dispatch:
    - `AUTO` → send to customer via WATI
@@ -115,8 +114,8 @@ It also closes the loop on every order: automated shipping notifications, tracki
 **Image inbound flow** (vision):
 
 1. Customer sends image → WATI webhook fires with `type=image`
-2. Download media from WATI (auth header) → send to Claude Vision with extraction schema
-3. Branch on extracted `image_type`:
+2. Download media from WATI (auth header) → send to Claude Vision API with extraction schema
+3. Branch on extracted `image_type` (text replies still use DeepSeek):
    - `order_screenshot` with high-confidence order ID → synthesize `"My order ID is #1042…"` → fall through to normal Claude pipeline
    - `eye_photo` with detected shape → synthesize `"…my eye shape looks hooded. Can you recommend a lash?"`
    - Otherwise → deterministic neutral fallback (no Claude call)
@@ -126,7 +125,7 @@ It also closes the loop on every order: automated shipping notifications, tracki
 - Webhook idempotency (in-memory + file-cached `msg_id` set)
 - DB-persisted shipping-notification dedup (survives restarts)
 - HUMAN_UDIT detection on both channels — in-memory pause register (fast) + DB-backed safety net (restart-proof)
-- Brain cache (5-minute TTL local) + Anthropic ephemeral cache
+- Brain cache (5-minute TTL local, in-memory)
 - All webhook handlers always return HTTP 200 to prevent provider retry storms
 - HMAC verification on every Shopify webhook (`/shopify-webhook`, `/shopify-fulfillment`, `/shopify-order-update`)
 - Founder-chat-id check on every Telegram callback before any state mutation
