@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -2720,6 +2721,48 @@ def get_live_inventory() -> str:
     return block
 
 
+
+# ===== Deterministic escalation pre-filter =====
+#
+# Explicit, unambiguous high-risk phrases must hit ESCALATE every time —
+# not "usually, depending on how the LLM reads it this call". This filter
+# runs alongside the LLM classification and can only UPGRADE the result to
+# ESCALATE; it never downgrades an LLM decision. The phrase list is
+# deliberately short and founder-confirmed — do not extend it with soft
+# signals (tone, sentiment, non-Hindi anger); those stay with the LLM.
+#
+# Rollback: set ESCALATION_PREFILTER_DISABLED=1 in the environment and
+# restart. Do not edit brain.md to compensate for filter behavior.
+#
+# Word boundaries matter: \bpolice\b must not fire on "policy" — a return
+# policy question is one of the most common AUTO messages the twin sees.
+_ESCALATION_PREFILTER_PATTERNS = re.compile(
+    r"\b("
+    r"lawyer"
+    r"|consumer\s+court"
+    r"|legal\s+notice"
+    r"|police"
+    r"|refund\s+karo"        # imperative refund demand (Hinglish). Variants pending Udit's confirmed list — do not add unconfirmed spellings.
+    r"|post\s+(?:this\s+|it\s+)?on\s+social\s+media"
+    r"|post\s+(?:this|it)\s+online"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _escalation_prefilter_hit(message: str) -> str | None:
+    """Return the matched high-risk phrase, or None.
+
+    Returns None unconditionally when ESCALATION_PREFILTER_DISABLED is
+    set (rollback switch — read per call so a Render env change takes
+    effect on restart without code edits).
+    """
+    if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+        return None
+    m = _ESCALATION_PREFILTER_PATTERNS.search(message or "")
+    return m.group(0) if m else None
+
+
 def draft_reply_logic(
     message: str,
     order_context: str = "",
@@ -2762,6 +2805,12 @@ def draft_reply_logic(
     if live_stock:
         brain = live_stock + "\n\n" + brain
 
+    # Deterministic pre-filter — evaluated on the raw customer message
+    # before the LLM call so the outcome can't depend on the model's
+    # judgment. The LLM still runs (we want its drafted reply for the
+    # Telegram notification); the filter only pins the classification.
+    prefilter_phrase = _escalation_prefilter_hit(message)
+
     raw = ask_claude(brain, message, order_context, history=history, source=source)
 
     classification = ""
@@ -2772,6 +2821,16 @@ def draft_reply_logic(
         reply = (parsed.get("reply") or "").strip()
     except json.JSONDecodeError:
         print("[TWIN] Claude's response wasn't valid JSON — leaving classification/reply empty")
+
+
+    # Upgrade-only override: a matched high-risk phrase forces ESCALATE
+    # regardless of what the LLM decided. Never the other direction.
+    if prefilter_phrase and classification != "ESCALATE":
+        print(
+            f"[PREFILTER] Forcing ESCALATE (was {classification or 'unparsed'!r}) — "
+            f"matched high-risk phrase {prefilter_phrase!r}"
+        )
+        classification = "ESCALATE"
 
     return classification, reply, raw
 
