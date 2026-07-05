@@ -15,6 +15,7 @@
 - **Shipping timelines corrected to match live policy:** dispatch 2–5 business days, delivery 7–10 business days across India (was: 24–48h dispatch, 3–5 day metro tiers — over-promised ~2x)
 - **New event-date guardrail:** customer names an event/date the standard window can't comfortably meet → flag it explicitly + DRAFT+APPROVE
 - **Classification:** return and exchange requests route 🟡 DRAFT+APPROVE while the new policy beds in
+- **Product links (data-sync):** GS3 handle corrected to `gs3-luxe-light-half-lash-tray-10-pairs` (old handle was a hard 404); direct buy links added for MINK DUO, MINK TRIO, and EVERYDAY + GLAM DUO (all verified HTTP 200)
 
 **v1.7 → v1.8 (June 2026)** — Bulk quote-vs-commit split, non-lash conversation rule, evaluation order preamble, relocated/renumbered pause triggers, output contract, template trims, voice note rule.
 
@@ -803,11 +804,14 @@ Just confirm and give the direct product link:
 (The "Free shipping since it's above ₹799" line applies to the trays at ₹849. For single pairs / combos priced at or below ₹799, drop that line — those don't qualify for free shipping on their own.)
 
 **Product handles:**
-- Half lashes / GS3 → `glamshelf.in/products/gs3-luxe-light-half-lash-tray`
+- Half lashes / GS3 → `glamshelf.in/products/gs3-luxe-light-half-lash-tray-10-pairs`
 - GS1 → `glamshelf.in/products/gs1-luxe-light-lash-tray`
 - GS2 → `glamshelf.in/products/gs2-luxe-light-lash-tray`
 - Clean Girl → `glamshelf.in/products/clean-girl-natural-hair-lashes`
 - KAWAII → `glamshelf.in/products/kawaii-faux-mink-lashes`
+- MINK DUO → `glamshelf.in/products/mink-duo-faux-mink-lash-combo-2-pairs`
+- MINK TRIO → `glamshelf.in/products/mink-trio-faux-mink-lash-set-3-pairs`
+- EVERYDAY + GLAM DUO → `glamshelf.in/products/everyday-glam-duo-lash-set-2-pairs`
 
 **Stock check still applies:** before sending a buy link, defer to the `[LIVE INVENTORY]` block. If the named product is SOLD OUT, do NOT send the link — use the out-of-stock / waitlist flow instead.
 
