@@ -23,3 +23,5 @@ Thumbs.db
 # Claude Code local
 .claude/settings.local.json
 .claude/worktrees/
+audit-classification-logic-2026-07-05.md
+reconciliation-live-vs-hardcoded-2026-07-05.md
