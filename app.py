@@ -1814,11 +1814,11 @@ def send_telegram_notification(
     which contact to reply to.
 
     `channel` (default "WhatsApp") tunes the action-footer phrasing per
-    channel: WhatsApp says "from your WhatsApp Business app" and ESCALATE
-    instructs to NOT send (because the WATI handler suppresses the reply
-    on ESCALATE/DRAFT). Instagram says "from your Instagram DMs" and
-    ESCALATE notes the holding reply was already sent (because the IG
-    handler ships every classification's reply). Default preserves the
+    channel: WhatsApp says "from your WhatsApp Business app", Instagram
+    says "from your Instagram DMs". On BOTH channels ESCALATE now means
+    the handler suppressed the customer reply — the IG handler gates
+    sends on classification the same way the WATI handler does. Default
+    preserves the existing WATI behavior byte-for-byte.
     existing WATI behavior byte-for-byte.
 
     `customer_id` is the wa_id (WATI) or IG sender_id. When provided AND
@@ -1844,7 +1844,7 @@ def send_telegram_notification(
     if channel == "Instagram":
         approve_destination = "your Instagram DMs"
         escalate_action = (
-            "→ Holding reply already sent on Instagram. "
+            "→ No reply sent on Instagram. "
             "Take over the conversation directly."
         )
     else:
@@ -1963,10 +1963,18 @@ def send_draft_for_approval(
     customer_name: str,
     customer_message: str,
     reply_text: str,
+    channel: str = "WhatsApp",
+    ig_timestamp: str = "",
 ) -> bool:
     """Send a Telegram message with [✅ Send as-is | ✏️ Edit | ⛔ Skip]
     inline buttons and register the draft in _pending_drafts so the
     /telegram-callback handler can action it.
+
+    `channel` ("WhatsApp" default, or "Instagram") is stored on the draft
+    and decides the outbound path when Udit approves: send_whatsapp_reply
+    for WhatsApp, _send_instagram_reply for Instagram. For Instagram,
+    customer_number carries the IG sender_id and ig_timestamp carries the
+    original event timestamp (used when logging the delivered exchange).
 
     Returns True if the buttoned message was sent and state was registered;
     False on any failure (caller may fall back to plain-text notification).
@@ -1979,8 +1987,9 @@ def send_draft_for_approval(
     sender_block = (
         f"{customer_name} ({customer_number})" if customer_name else customer_number
     )
+    header = "🟡 DRAFT + APPROVE"
     text = (
-        "🟡 DRAFT + APPROVE\n\n"
+        f"{header}\n\n"
         f"From: {sender_block}\n\n"
         "Customer said:\n"
         f'"{customer_message}"\n\n'
@@ -1989,8 +1998,9 @@ def send_draft_for_approval(
     )
 
     # callback_data must be ≤ 64 bytes (Telegram hard limit). Our format:
-    #   "action:<verb>|num:<wa_id>|id:<8-hex>"
-    # Worst case: action:send (11) + |num: (5) + 12 wa_id + |id: (4) + 8 = 40 bytes.
+    #   "action:<verb>|num:<wa_id-or-ig-sender-id>|id:<8-hex>"
+    # Worst case: action:send (11) + |num: (5) + 17-digit IG sender_id
+    # + |id: (4) + 8 = 45 bytes (12-digit wa_id: 40 bytes).
     keyboard = {
         "inline_keyboard": [[
             {"text": "✅ Send as-is", "callback_data": f"action:send|num:{customer_number}|id:{draft_id}"},
@@ -2018,6 +2028,8 @@ def send_draft_for_approval(
         "telegram_message_id": result.get("message_id"),
         "awaiting_edit": False,
         "created_at": time.time(),
+        "channel": channel,
+        "ig_timestamp": ig_timestamp,
     }
 
     # Opportunistic prune — clean entries older than TTL so the dict
@@ -2151,23 +2163,36 @@ def _handle_telegram_callback(cb: dict) -> None:
         _telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id, "text": "Sending…"
         })
-        send_whatsapp_reply(customer_number, draft["reply_text"])
-        # Record the DELIVERED reply as a history-eligible exchange so the
-        # twin remembers this turn on the customer's next message. Without
-        # this, approved-draft replies were invisible to _load_wati_history
-        # (only the un-delivered DRAFT row existed) and the conversation
-        # context reset. msg_text is the customer message the draft answered.
-        _log_message(
-            customer_number, customer_name, draft.get("customer_message") or "",
-            status="DRAFT_SENT", reply_text=draft["reply_text"],
-        )
+        if draft.get("channel") == "Instagram":
+            # IG draft: customer_number holds the IG sender_id. Deliver via
+            # the Graph API and record the exchange in instagram_logs so
+            # _load_instagram_history sees this turn (the pending-draft row
+            # was written with a NULL reply and is invisible to history).
+            # No _reassign_to_bot — that's a WATI-only concept.
+            _send_instagram_reply(customer_number, draft["reply_text"])
+            _log_instagram(
+                customer_number, draft.get("customer_message") or "",
+                draft["reply_text"], draft.get("ig_timestamp") or "",
+                source="DRAFT_SENT_IG",
+            )
+        else:
+            send_whatsapp_reply(customer_number, draft["reply_text"])
+            # Record the DELIVERED reply as a history-eligible exchange so the
+            # twin remembers this turn on the customer's next message. Without
+            # this, approved-draft replies were invisible to _load_wati_history
+            # (only the un-delivered DRAFT row existed) and the conversation
+            # context reset. msg_text is the customer message the draft answered.
+            _log_message(
+                customer_number, customer_name, draft.get("customer_message") or "",
+                status="DRAFT_SENT", reply_text=draft["reply_text"],
+            )
+            # Approving a draft is a human takeover of the conversation — keep
+            # the ticket on the Bot so the webhook keeps hearing this customer.
+            _reassign_to_bot(customer_number)
         _finalize_draft_message(
             chat_id, message_id, original_text,
             f"✅ Sent to {name_for_display}",
         )
-        # Approving a draft is a human takeover of the conversation — keep
-        # the ticket on the Bot so the webhook keeps hearing this customer.
-        _reassign_to_bot(customer_number)
         # Already popped at top — no del needed.
         print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
 
@@ -2201,14 +2226,20 @@ def _handle_telegram_callback(cb: dict) -> None:
         _telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id, "text": "Skipped"
         })
-        _finalize_draft_message(
-            chat_id, message_id, original_text,
-            "⛔ Skipped — handle manually in WATI",
-        )
-        # Skip means Udit will reply by hand in WATI, which reassigns the
-        # ticket to him. Pin it back to the Bot pre-emptively so the webhook
-        # stays alive (idempotent — a no-op if it's still Bot-assigned).
-        _reassign_to_bot(customer_number)
+        if draft.get("channel") == "Instagram":
+            _finalize_draft_message(
+                chat_id, message_id, original_text,
+                "⛔ Skipped — handle manually in Instagram DMs",
+            )
+        else:
+            _finalize_draft_message(
+                chat_id, message_id, original_text,
+                "⛔ Skipped — handle manually in WATI",
+            )
+            # Skip means Udit will reply by hand in WATI, which reassigns the
+            # ticket to him. Pin it back to the Bot pre-emptively so the webhook
+            # stays alive (idempotent — a no-op if it's still Bot-assigned).
+            _reassign_to_bot(customer_number)
         # Already popped at top — no del needed.
         print(f"[TELEGRAM DRAFT] Skipped for {customer_number} (draft {draft_id})")
 
@@ -2265,17 +2296,25 @@ def _handle_telegram_message(msg: dict) -> None:
     customer_name = draft.get("customer_name") or ""
     name_for_display = customer_name or customer_number
 
-    send_whatsapp_reply(customer_number, text)
     # Record the actually-sent EDITED text (not the pre-edit draft) as a
     # history-eligible exchange so future turns remember what the customer
     # really received. Mirrors the send-as-is branch in _handle_telegram_callback.
-    _log_message(
-        customer_number, customer_name, draft.get("customer_message") or "",
-        status="DRAFT_SENT", reply_text=text,
-    )
-    # Sending an edited reply is a human takeover — keep the ticket on the
-    # Bot so the webhook keeps receiving this customer's messages.
-    _reassign_to_bot(customer_number)
+    if draft.get("channel") == "Instagram":
+        _send_instagram_reply(customer_number, text)
+        _log_instagram(
+            customer_number, draft.get("customer_message") or "",
+            text, draft.get("ig_timestamp") or "",
+            source="DRAFT_SENT_IG",
+        )
+    else:
+        send_whatsapp_reply(customer_number, text)
+        _log_message(
+            customer_number, customer_name, draft.get("customer_message") or "",
+            status="DRAFT_SENT", reply_text=text,
+        )
+        # Sending an edited reply is a human takeover — keep the ticket on the
+        # Bot so the webhook keeps receiving this customer's messages.
+        _reassign_to_bot(customer_number)
     _telegram_api("sendMessage", {
         "chat_id": chat_id,
         "text": f"✅ Sent your edit to {name_for_display}",
@@ -4624,53 +4663,84 @@ def _process_instagram_event(event: dict) -> None:
             traceback.print_exc()
             return
 
-        if not reply:
+        if not classification or not reply:
             print(
-                f"[INSTAGRAM] Twin returned empty reply "
-                f"(classification={classification!r}); not sending"
+                f"[INSTAGRAM] Twin returned empty result "
+                f"(classification={classification!r}, reply_len={len(reply)}); not sending"
             )
             return
 
-        _send_instagram_reply(sender_id, reply)
-        _log_instagram(sender_id, text, reply, timestamp)
-        print(f"[INSTAGRAM] Logged DM exchange for {sender_id} ({classification})")
+        ig_sender_info = f"Instagram DM — sender {sender_id}"
 
-        # Page the founder on Telegram for non-AUTO classifications,
-        # mirroring the WATI webhook. AUTO sends nothing (the bot's
-        # reply is safe to ship as-is and doesn't warrant a ping). The
-        # IG channel is passed explicitly so the action footer reflects
-        # Instagram-specific guidance (e.g. "holding reply already sent").
-        # Wrapped in its own try so a Telegram outage doesn't take down
-        # the IG flow.
-        if classification in ("DRAFT+APPROVE", "ESCALATE"):
+        # Classification gate — mirrors the WATI /webhook branch. Only
+        # AUTO ships a customer-facing reply immediately; DRAFT+APPROVE
+        # waits for a Telegram button tap; ESCALATE sends nothing and
+        # hands the thread to the founder.
+        if classification == "AUTO":
+            _send_instagram_reply(sender_id, reply)
+            _log_instagram(sender_id, text, reply, timestamp)
+            print(f"[INSTAGRAM-AUTO] Replied to {sender_id}")
+
+        elif classification == "DRAFT+APPROVE":
+            # Same buttoned approval flow WhatsApp uses, keyed on the IG
+            # sender_id via the shared _pending_drafts dict. The customer
+            # reply ships from /telegram-callback when Udit taps Send (or
+            # completes an Edit) — nothing is sent here. Falls back to a
+            # plain-text notification if the buttoned send fails so Udit
+            # always gets *some* heads-up about the pending draft.
+            sent_with_buttons = send_draft_for_approval(
+                customer_number=sender_id,
+                customer_name="",
+                customer_message=text,
+                reply_text=reply,
+                channel="Instagram",
+                ig_timestamp=timestamp,
+            )
+            if not sent_with_buttons:
+                try:
+                    send_telegram_notification(
+                        classification, text, reply,
+                        sender_info=ig_sender_info, channel="Instagram",
+                    )
+                except Exception as tg_err:
+                    print(
+                        f"[INSTAGRAM-TG] Fallback notification failed: "
+                        f"{type(tg_err).__name__}: {tg_err}"
+                    )
+            # Log the pending draft with a NULL reply: _load_instagram_history
+            # filters on reply_text IS NOT NULL, so an un-approved draft never
+            # appears in conversation context as if the customer received it.
+            # The delivered exchange is logged (DRAFT_SENT_IG) on approval.
+            _log_instagram(sender_id, text, None, timestamp, source="DRAFT_PENDING_IG")
+            print(f"[INSTAGRAM-DRAFT] Notified founder for {sender_id} (buttons={sent_with_buttons})")
+
+        elif classification == "ESCALATE":
+            # No customer-facing reply — same as WhatsApp. The founder
+            # takes over directly; the notification carries the 🛑 Stop
+            # button (customer_id) and the 4h auto-pause keeps the twin
+            # quiet on this thread meanwhile. Wrapped in its own try so a
+            # Telegram outage doesn't take down the IG flow.
             try:
-                ig_sender_info = f"Instagram DM — sender {sender_id}"
                 send_telegram_notification(
-                    classification,
-                    text,
-                    reply,
+                    classification, text, reply,
                     sender_info=ig_sender_info,
                     channel="Instagram",
                     customer_id=sender_id,
                 )
-                tag = "DRAFT" if classification == "DRAFT+APPROVE" else "ESCALATE"
-                print(f"[INSTAGRAM-{tag}] Notified founder for {sender_id}")
+                print(f"[INSTAGRAM-ESCALATE] Notified founder for {sender_id}")
             except Exception as tg_err:
                 print(
                     f"[INSTAGRAM-TG] Notification failed: "
                     f"{type(tg_err).__name__}: {tg_err}"
                 )
-
-        # Auto-pause this IG sender for 4h after ESCALATE so subsequent
-        # DMs from the same sender don't re-trigger Claude + Telegram.
-        # Mirrors the WATI ESCALATE auto-pause. Note: on IG the holding
-        # reply is ALREADY sent to the customer at this point (line above
-        # via _send_instagram_reply), so this pause specifically prevents
-        # the "customer sees repeat holding messages" bug. Manual
-        # #pause/#resume still apply; the pause register is shared.
-        if classification == "ESCALATE":
             _pause_number(sender_id)
-            print(f"[ESCALATE] Auto-paused {sender_id} for 4h after holding reply sent")
+            # NULL reply keeps this row out of _load_instagram_history —
+            # the customer never received anything for this message.
+            _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
+            print(f"[ESCALATE] Auto-paused {sender_id} for 4h — no reply sent")
+
+        else:
+            print(f"[INSTAGRAM] Unknown classification {classification!r} — no dispatch")
     except Exception as e:
         print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
