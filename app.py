@@ -27,6 +27,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from html import unescape
 from pathlib import Path
 
 import requests
@@ -193,17 +194,24 @@ OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "")
 # have allowed anyone to access the dashboard if env var were missing.
 DASHBOARD_KEY = _require_env("DASHBOARD_KEY")
 
-# SQLite path for message logs.
+# SQLite path for ALL persistent state (message logs, Instagram logs,
+# orders, shipping dedup, paused senders, pending drafts).
 #   - Legacy/local default: <tempdir>/glamshelf_logs.db (ephemeral on Render).
-#   - Production on Render: set DASHBOARD_DB_PATH to a path on a mounted
-#     persistent disk, e.g. /var/data/glamshelf_logs.db. The disk needs to
-#     be created in Render → Settings → Disks (any small size, mounted at
-#     /var/data). Without that, every redeploy still wipes the DB.
+#   - Production on Render: set DB_PATH (preferred) or DASHBOARD_DB_PATH
+#     (legacy name, still honored) to a path on a mounted persistent disk,
+#     e.g. /var/data/glamshelf.db. The disk needs to be created in
+#     Render → Settings → Disks (any small size, mounted at /var/data).
+#     Without that, every redeploy still wipes the DB — moving state into
+#     SQLite only helps once this path survives restarts.
 #   - On startup, if a legacy /tmp DB exists and the persistent path is
 #     empty, _init_db() copies the file across once so historical rows
 #     aren't lost when you flip on the persistent disk.
 _LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
-DB_PATH = os.environ.get("DASHBOARD_DB_PATH", _LEGACY_DB_PATH)
+DB_PATH = (
+    os.environ.get("DB_PATH")
+    or os.environ.get("DASHBOARD_DB_PATH")
+    or _LEGACY_DB_PATH
+)
 
 # GitHub backup config — when all three env vars are set, the SQLite DB
 # is restored from GitHub on cold start (if no local copy) and backed up
@@ -398,14 +406,17 @@ _brain_cache_loaded_at: float = 0.0
 
 # Human-takeover pause register. When Udit sends an outbound WATI message
 # containing "#pause" (typically appended to a real reply to the customer),
-# that customer's wa_id is added here with a 4-hour expiry. While present,
+# that customer's wa_id is registered with a 4-hour expiry. While present,
 # the WATI webhook handler short-circuits before any Claude call so the
 # twin stops auto-replying — the human is on it. "#resume" removes the
-# entry immediately. The register is in-memory only (resets on Render
-# restart, which is acceptable; the brain's Section 7 protocol covers
-# this anyway).
+# entry immediately.
+#
+# State lives in the paused_senders SQLite table (see _init_db), NOT in
+# memory — Render's free tier restarts the process on its own schedule,
+# and an in-memory register silently cut every 4h ESCALATE pause short.
+# Note: SQLite only survives restarts once DB_PATH points at persistent
+# storage; on the default tempdir path the table resets with the disk.
 PAUSED_TTL_SECONDS = 4 * 60 * 60  # 4 hours
-paused_numbers: dict[str, float] = {}  # wa_id -> expiry unix timestamp
 
 # Bot's-own-outbound recognition. When send_whatsapp_reply() ships a reply,
 # we register the text (and ideally the WATI-assigned msg_id) here so the
@@ -466,39 +477,181 @@ REVIEW_REQUEST_TEMPLATE = (
 # When the WATI webhook classifies a message as DRAFT+APPROVE, instead of
 # sending a plain Telegram notification we send a message with three
 # inline buttons (✅ Send as-is / ✏️ Edit / ⛔ Skip) and register the
-# pending draft in _pending_drafts. The /telegram-callback endpoint
-# receives the button tap (or Udit's edited text) and actions it.
+# pending draft in the pending_drafts SQLite table. The /telegram-callback
+# endpoint receives the button tap (or Udit's edited text) and actions it.
 #
-# State is in-memory only — a worker restart loses any pending drafts.
-# Acceptable: orphaned Telegram buttons just return an "Already handled"
-# toast via the dedup check (draft_id not in _pending_drafts), and Udit
-# gets a fresh draft on the next inbound from the same customer.
+# State lives in SQLite (see _init_db), NOT in memory — the previous
+# in-memory dict dropped every pending draft whenever Render restarted
+# the worker, leaving Udit tapping dead buttons ("Already handled") on
+# drafts that were never sent. As with paused_senders, persistence is
+# only real once DB_PATH points at storage that survives restarts.
 #
-# Key is the short draft_id (8 hex chars from secrets.token_hex(4)) so
-# callback_data fits in Telegram's 64-byte hard limit alongside action
-# and customer phone.
+# The draft dict is stored as a JSON blob keyed by the short draft_id
+# (8 hex chars from secrets.token_hex(4)) so callback_data fits in
+# Telegram's 64-byte hard limit alongside action and customer id.
+#
+# One deliberate gap: the ✏️ Edit flow's 10-minute timeout is a
+# threading.Timer, which does NOT survive a restart. An awaiting-edit
+# draft orphaned by a restart is cleaned up by the 24h TTL prune instead
+# of the 10-min timer — Udit's edit text after a restart still works,
+# because _drafts_awaiting_edit reads the DB, not thread state.
 PENDING_DRAFT_TTL_SECONDS = 24 * 60 * 60     # opportunistic prune cutoff
 EDIT_TIMEOUT_SECONDS = 10 * 60                # 10 min per spec
-_pending_drafts: dict[str, dict] = {}
+
+
+def _draft_register(draft_id: str, draft: dict) -> bool:
+    """Insert or update a pending draft row. Returns False on DB failure
+    so send_draft_for_approval can fall back to the plain notification
+    (a buttoned Telegram message whose state was never saved would be a
+    dead button)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_drafts (draft_id, data, created_at) VALUES (?, ?, ?)",
+            (draft_id, json.dumps(draft), draft.get("created_at") or time.time()),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[DRAFT-DB] register failed for {draft_id}: {type(e).__name__}: {e}")
+        return False
+
+
+def _draft_get(draft_id: str) -> dict | None:
+    """Read a pending draft without removing it. None if absent or on error."""
+    if not draft_id:
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT data FROM pending_drafts WHERE draft_id = ?", (draft_id,)
+        ).fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else None
+    except Exception as e:
+        print(f"[DRAFT-DB] get failed for {draft_id}: {type(e).__name__}: {e}")
+        return None
+
+
+def _draft_take(draft_id: str) -> dict | None:
+    """Atomically remove and return a pending draft (None if absent).
+
+    This is the restart-safe equivalent of the old dict.pop dedup: two
+    rapid taps on "Send as-is" race into a BEGIN IMMEDIATE transaction;
+    only one sees the row, the other gets None and hits the
+    "Already handled" branch. Without the write lock, both taps could
+    read the row before either deleted it and the customer would get
+    the reply twice.
+    """
+    if not draft_id:
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.isolation_level = None  # manual transaction control
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT data FROM pending_drafts WHERE draft_id = ?", (draft_id,)
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM pending_drafts WHERE draft_id = ?", (draft_id,))
+        conn.execute("COMMIT")
+        conn.close()
+        return json.loads(row[0]) if row else None
+    except Exception as e:
+        print(f"[DRAFT-DB] take failed for {draft_id}: {type(e).__name__}: {e}")
+        return None
+
+
+def _draft_delete(draft_id: str) -> None:
+    """Remove a pending draft row. Best effort."""
+    if not draft_id:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM pending_drafts WHERE draft_id = ?", (draft_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DRAFT-DB] delete failed for {draft_id}: {type(e).__name__}: {e}")
+
+
+def _drafts_awaiting_edit(chat_id) -> list[tuple[str, dict]]:
+    """All drafts flagged awaiting_edit for this Telegram chat, as
+    (draft_id, draft) pairs. The awaiting_edit flag lives inside the JSON
+    blob, so rows are filtered in Python — the table holds at most a
+    handful of drafts at any time. Returns [] on any failure."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("SELECT draft_id, data FROM pending_drafts").fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[DRAFT-DB] awaiting-edit scan failed: {type(e).__name__}: {e}")
+        return []
+    out = []
+    for did, data in rows:
+        try:
+            d = json.loads(data)
+        except Exception:
+            continue
+        if d.get("awaiting_edit") and d.get("telegram_chat_id") == chat_id:
+            out.append((did, d))
+    return out
+
+
+def _drafts_prune(cutoff: float) -> None:
+    """Delete drafts created before `cutoff` — the opportunistic TTL prune
+    that keeps the table bounded even if drafts are never actioned."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        pruned = conn.execute(
+            "DELETE FROM pending_drafts WHERE created_at < ?", (cutoff,)
+        ).rowcount
+        conn.commit()
+        conn.close()
+        if pruned:
+            print(f"[DRAFT-DB] Pruned {pruned} stale draft(s) past 24h TTL")
+    except Exception as e:
+        print(f"[DRAFT-DB] prune failed: {type(e).__name__}: {e}")
 
 
 def _is_paused(wa_id: str) -> bool:
     """Return True if this number is currently in a human-takeover window.
-    Also opportunistically prunes any expired entries so the dict stays
-    bounded — no separate cleanup job needed."""
+    Reads the paused_senders table (restart-safe) and opportunistically
+    prunes expired rows so the table stays bounded — no cleanup job needed.
+
+    Fails open (False) on any DB error, matching the convention of the
+    other DB-backed gates (_udit_replied_recently etc.) — a DB hiccup
+    shouldn't silence the bot for every customer.
+    """
+    if not wa_id:
+        return False
     now = time.time()
-    expired = [num for num, exp in paused_numbers.items() if exp < now]
-    for num in expired:
-        del paused_numbers[num]
-        print(f"[PAUSE] Auto-expired for {num} (4h elapsed)")
-    return wa_id in paused_numbers
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        pruned = conn.execute(
+            "DELETE FROM paused_senders WHERE paused_until < ?", (now,)
+        ).rowcount
+        conn.commit()
+        if pruned:
+            print(f"[PAUSE] Auto-expired {pruned} pause(s) (4h elapsed)")
+        hit = conn.execute(
+            "SELECT 1 FROM paused_senders WHERE sender_id = ? AND paused_until >= ?",
+            (wa_id, now),
+        ).fetchone()
+        conn.close()
+        return hit is not None
+    except Exception as e:
+        print(f"[PAUSE] _is_paused DB check failed for {wa_id}: {type(e).__name__}: {e}")
+        return False
 
 
 def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> None:
-    """Add `wa_id` (or Instagram sender_id — the dict is just keyed by
-    string) to the pause register with a TTL. While paused, the inbound
-    handlers short-circuit before any Claude call and the customer gets
-    no auto-replies.
+    """Add `wa_id` (or Instagram sender_id — the register is just keyed by
+    string) to the paused_senders table with a TTL. While paused, the
+    inbound handlers short-circuit before any Claude call and the customer
+    gets no auto-replies. Survives process restarts (given a persistent
+    DB_PATH), unlike the in-memory dict this replaced.
 
     Used by:
       - _handle_pause_directive — when Udit types "#pause" outbound
@@ -508,10 +661,39 @@ def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> None:
     Idempotent: extending the pause window (re-pausing an already-paused
     number) just resets the expiry. Caller should log the auto-pause
     with their own channel-specific prefix so the founder can grep.
+    DB failures are logged and swallowed — same convention as _log_message.
     """
     if not wa_id:
         return
-    paused_numbers[wa_id] = time.time() + ttl_seconds
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR REPLACE INTO paused_senders (sender_id, paused_until) VALUES (?, ?)",
+            (wa_id, time.time() + ttl_seconds),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[PAUSE] _pause_number DB write failed for {wa_id}: {type(e).__name__}: {e}")
+
+
+def _unpause_number(wa_id: str) -> bool:
+    """Remove `wa_id` from the pause register (Udit's "#resume" directive).
+    Returns True if an entry was actually removed, False if there was
+    nothing to clear (or the DB write failed)."""
+    if not wa_id:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        removed = conn.execute(
+            "DELETE FROM paused_senders WHERE sender_id = ?", (wa_id,)
+        ).rowcount
+        conn.commit()
+        conn.close()
+        return removed > 0
+    except Exception as e:
+        print(f"[PAUSE] _unpause_number DB write failed for {wa_id}: {type(e).__name__}: {e}")
+        return False
 
 
 def _record_bot_outbound(reply_text: str, wati_response_data: dict | None = None) -> None:
@@ -882,7 +1064,7 @@ def _process_wati_outbound(data: dict) -> None:
 
     # #pause / #resume directives ride along on outbound messages too.
     # Tag those as PAUSE_DIRECTIVE so the conversation-history view stays
-    # clean; the actual pause state is in the in-memory paused_numbers dict.
+    # clean; the actual pause state is in the paused_senders table.
     directive = _handle_pause_directive(wa_id, text_body)
     if directive is not None:
         _log_message(
@@ -944,15 +1126,14 @@ def _handle_pause_directive(wa_id: str, text_body: str) -> str | None:
     """
     lower = text_body.lower()
     if "#pause" in lower:
-        paused_numbers[wa_id] = time.time() + PAUSED_TTL_SECONDS
+        _pause_number(wa_id)
         print(
             f"[PAUSE] Human takeover activated for {wa_id} "
             f"(expires in {PAUSED_TTL_SECONDS}s = 4h)"
         )
         return "pause"
     if "#resume" in lower:
-        if wa_id in paused_numbers:
-            del paused_numbers[wa_id]
+        if _unpause_number(wa_id):
             print(f"[PAUSE] Human takeover released for {wa_id}")
         else:
             print(f"[PAUSE] #resume seen for {wa_id} but no active pause to clear")
@@ -1095,6 +1276,35 @@ def _init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_shipping_sent_at ON shipping_notifications(sent_at)")
+
+        # Pause register — previously an in-memory dict (paused_numbers)
+        # that reset on every Render restart, silently cutting 4h ESCALATE
+        # pauses short. sender_id is a wa_id or IG sender_id; paused_until
+        # is a unix timestamp. Expired rows are pruned opportunistically
+        # by _is_paused.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paused_senders (
+                sender_id TEXT PRIMARY KEY,
+                paused_until REAL NOT NULL
+            )
+            """
+        )
+
+        # Telegram DRAFT+APPROVE approval queue — previously the in-memory
+        # _pending_drafts dict, which dropped every pending draft on
+        # restart (buttons went dead with "Already handled"). The full
+        # draft dict is stored as a JSON blob; created_at is duplicated
+        # as a column for the TTL prune query.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_drafts (
+                draft_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
 
         conn.commit()
         conn.close()
@@ -1554,8 +1764,8 @@ def _udit_replied_recently_ig(sender_id: str, window_seconds: int = HUMAN_HANDLI
     4h?"
 
     Returns False on any failure (fail-open, same convention as the WATI
-    helper) — the in-memory paused_numbers register is the primary gate;
-    this DB check is the post-restart backup.
+    helper) — the paused_senders register is the primary gate; this check
+    is the additive backup for manual IG-app replies.
     """
     if not sender_id:
         return False
@@ -1967,8 +2177,8 @@ def send_draft_for_approval(
     ig_timestamp: str = "",
 ) -> bool:
     """Send a Telegram message with [✅ Send as-is | ✏️ Edit | ⛔ Skip]
-    inline buttons and register the draft in _pending_drafts so the
-    /telegram-callback handler can action it.
+    inline buttons and register the draft in the pending_drafts table so
+    the /telegram-callback handler can action it (restart-safe).
 
     `channel` ("WhatsApp" default, or "Instagram") is stored on the draft
     and decides the outbound path when Udit approves: send_whatsapp_reply
@@ -2009,34 +2219,44 @@ def send_draft_for_approval(
         ]]
     }
 
+    # Register the draft BEFORE sending the buttoned message: if the DB
+    # write fails, we return False so the caller falls back to the plain
+    # notification instead of showing Udit buttons backed by no state.
+    result_placeholder = {
+        "reply_text": reply_text,
+        "customer_number": customer_number,
+        "customer_name": customer_name,
+        "customer_message": customer_message,
+        "original_text": text,
+        "telegram_chat_id": None,
+        "telegram_message_id": None,
+        "awaiting_edit": False,
+        "created_at": time.time(),
+        "channel": channel,
+        "ig_timestamp": ig_timestamp,
+    }
+    if not _draft_register(draft_id, result_placeholder):
+        return False
+
     resp = _telegram_api("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "reply_markup": keyboard,
     })
     if not resp or not resp.get("ok"):
+        _draft_delete(draft_id)  # no buttons exist — drop the orphan row
         return False
 
+    # Backfill the Telegram message coordinates now that the send
+    # succeeded (needed by the edit flow to annotate the original message).
     result = resp.get("result") or {}
-    _pending_drafts[draft_id] = {
-        "reply_text": reply_text,
-        "customer_number": customer_number,
-        "customer_name": customer_name,
-        "customer_message": customer_message,
-        "original_text": text,
-        "telegram_chat_id": (result.get("chat") or {}).get("id"),
-        "telegram_message_id": result.get("message_id"),
-        "awaiting_edit": False,
-        "created_at": time.time(),
-        "channel": channel,
-        "ig_timestamp": ig_timestamp,
-    }
+    result_placeholder["telegram_chat_id"] = (result.get("chat") or {}).get("id")
+    result_placeholder["telegram_message_id"] = result.get("message_id")
+    _draft_register(draft_id, result_placeholder)
 
-    # Opportunistic prune — clean entries older than TTL so the dict
+    # Opportunistic prune — clean entries older than TTL so the table
     # stays bounded even if some drafts are never actioned.
-    cutoff = time.time() - PENDING_DRAFT_TTL_SECONDS
-    for stale_id in [k for k, v in _pending_drafts.items() if v["created_at"] < cutoff]:
-        del _pending_drafts[stale_id]
+    _drafts_prune(time.time() - PENDING_DRAFT_TTL_SECONDS)
 
     print(f"[TELEGRAM DRAFT] Sent buttoned draft id={draft_id} for {customer_number}")
     return True
@@ -2062,7 +2282,7 @@ def _finalize_draft_message(
     """Strip the inline keyboard from a draft message and append a status
     line so Udit can see what happened without scrolling. Best effort —
     failures here just mean the buttons stick around looking active, but
-    the dedup check (draft_id not in _pending_drafts) still prevents
+    the dedup check (draft row already deleted) still prevents
     duplicate actions on subsequent taps.
     """
     _telegram_api("editMessageReplyMarkup", {
@@ -2104,7 +2324,7 @@ def _handle_telegram_callback(cb: dict) -> None:
     customer_number = parsed.get("num")
 
     # ESCALATE "🛑 Stop bot for this customer" button — handled first
-    # because it has no _pending_drafts state. The `id` in the callback
+    # because it has no pending_drafts state. The `id` in the callback
     # is the customer's wa_id (WATI) or sender_id (IG), and we just need
     # to pause that number for 4h.
     if action == "pause_escalate":
@@ -2137,15 +2357,15 @@ def _handle_telegram_callback(cb: dict) -> None:
         print(f"[ESCALATE-PAUSE] Udit tapped Stop bot — paused {customer_id} for 4h")
         return
 
-    # Atomic pop — dict.pop is thread-safe in CPython, so two rapid taps
-    # racing into this function only one of them gets the draft; the other
-    # gets None and falls through to the "already handled" dedup branch.
-    # Without this, a fast double-tap on "Send as-is" could pass the
-    # "if not draft" check twice and double-send to the customer.
+    # Atomic take — _draft_take removes-and-returns inside a BEGIN
+    # IMMEDIATE transaction, so two rapid taps racing into this function
+    # only one gets the draft; the other gets None and falls through to
+    # the "already handled" dedup branch. Without this, a fast double-tap
+    # on "Send as-is" could double-send to the customer.
     #
-    # The edit branch below re-inserts the draft (with awaiting_edit=True)
+    # The edit branch below re-registers the draft (with awaiting_edit=True)
     # because the follow-up text message handler needs to find it.
-    draft = _pending_drafts.pop(draft_id, None) if draft_id else None
+    draft = _draft_take(draft_id) if draft_id else None
 
     # Dedup — second tap on same button (or post-restart orphan).
     if not draft:
@@ -2197,12 +2417,12 @@ def _handle_telegram_callback(cb: dict) -> None:
         print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
 
     elif action == "edit":
-        # Re-insert the draft so the next text message from this chat can
+        # Re-register the draft so the next text message from this chat can
         # find it via _handle_telegram_message. Flip awaiting_edit so the
         # message handler routes to the edit flow.
         draft["awaiting_edit"] = True
         draft["edit_started_at"] = time.time()
-        _pending_drafts[draft_id] = draft
+        _draft_register(draft_id, draft)
         _telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id, "text": "Send your edit"
         })
@@ -2276,22 +2496,19 @@ def _handle_telegram_message(msg: dict) -> None:
     # practice there's at most one because hitting Edit removes buttons
     # from that message immediately.
     target_id: str | None = None
+    draft: dict | None = None
     target_started: float = float("inf")
-    for did, d in _pending_drafts.items():
-        if (
-            d.get("awaiting_edit")
-            and d.get("telegram_chat_id") == chat_id
-            and d.get("edit_started_at", float("inf")) < target_started
-        ):
+    for did, d in _drafts_awaiting_edit(chat_id):
+        started = d.get("edit_started_at", float("inf"))
+        if started < target_started:
             target_id = did
-            target_started = d.get("edit_started_at", float("inf"))
+            draft = d
+            target_started = started
 
-    if not target_id:
+    if not target_id or draft is None:
         # Not part of an edit flow — could be Udit typing anything in the
         # bot chat. Ignore (no command system yet).
         return
-
-    draft = _pending_drafts[target_id]
     customer_number = draft["customer_number"]
     customer_name = draft.get("customer_name") or ""
     name_for_display = customer_name or customer_number
@@ -2330,7 +2547,7 @@ def _handle_telegram_message(msg: dict) -> None:
             f"✏️ Edited and sent to {name_for_display}",
         )
 
-    del _pending_drafts[target_id]
+    _draft_delete(target_id)
     print(f"[TELEGRAM DRAFT] Edit completed for {customer_number} (draft {target_id})")
 
 
@@ -2338,10 +2555,13 @@ def _edit_timeout_check(draft_id: str) -> None:
     """Fires EDIT_TIMEOUT_SECONDS after Edit was tapped. If the draft is
     still awaiting an edit at that point, auto-skip and notify Telegram.
 
-    No-op if the user already sent the edit, hit Skip, or the worker
-    restarted (draft would no longer be in _pending_drafts).
+    No-op if the user already sent the edit or hit Skip (row gone or flag
+    cleared). Note the Timer itself does NOT survive a worker restart —
+    an awaiting-edit draft orphaned by a restart stays actionable (the
+    edit text still lands via _drafts_awaiting_edit) until the 24h TTL
+    prune collects it.
     """
-    draft = _pending_drafts.get(draft_id)
+    draft = _draft_get(draft_id)
     if not draft or not draft.get("awaiting_edit"):
         return  # already actioned
     customer_number = draft.get("customer_number") or "(unknown)"
@@ -2363,7 +2583,7 @@ def _edit_timeout_check(draft_id: str) -> None:
             chat_id, orig_msg, original_text,
             "⏱️ Edit timed out — auto-skipped",
         )
-    _pending_drafts.pop(draft_id, None)
+    _draft_delete(draft_id)
 
 
 def normalize_wa(number: str) -> str:
@@ -2666,6 +2886,100 @@ def send_whatsapp_template(
         return False
 
 
+def _strip_html(raw: str) -> str:
+    """Reduce an HTML fragment to compact plain text: drop script/style,
+    strip tags, unescape entities, collapse whitespace."""
+    if not raw:
+        return ""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _html_to_blocks(raw: str) -> list[str]:
+    """Split an HTML fragment into plain-text blocks along block-level
+    boundaries (</p>, </li>, headings, <br>, <hr>). Used for chunking
+    product descriptions and policy pages — keeps semantically-related
+    sentences together instead of cutting mid-thought."""
+    if not raw:
+        return []
+    s = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+    s = re.sub(r"</(p|li|h[1-6]|div|tr|ul|ol)>|<br\s*/?>|<hr\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = unescape(s)
+    blocks = [re.sub(r"\s+", " ", b).strip() for b in s.split("\n")]
+    return [b for b in blocks if b]
+
+
+# ----- Live policy pages (Phase 0 quick win) -----
+#
+# The published Shopify policy pages are the single source of truth for
+# returns and shipping — injecting them alongside brain.md means a policy
+# edit in Shopify Admin reaches the bot within one cache interval, and a
+# brain.md-vs-store contradiction (like the v1.8 "no returns" incident)
+# can't silently persist. Cached with the same TTL as brain.md.
+_POLICY_PROMPT_PAGES = (
+    ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
+    ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
+)
+_policy_cache: dict = {"text": "", "fetched_at": 0.0}
+
+
+def _fetch_policy_page_html(url: str) -> str:
+    """Fetch one Shopify policy page and return the policy body HTML
+    (the shopify-policy__body div — clean policy text without theme
+    chrome), or the whole page HTML as fallback. "" on any failure."""
+    try:
+        resp = requests.get(url, timeout=SHOPIFY_TIMEOUT_SECONDS)
+        if not resp.ok:
+            print(f"[POLICY] HTTP {resp.status_code} for {url}")
+            return ""
+        m = re.search(
+            r'<div[^>]*class="[^"]*shopify-policy__body[^"]*"[^>]*>(.*?)</div>',
+            resp.text, re.S,
+        )
+        return m.group(1) if m else resp.text
+    except Exception as e:
+        print(f"[POLICY] Fetch failed for {url}: {type(e).__name__}: {e}")
+        return ""
+
+
+def get_live_policies() -> str:
+    """Plain-text block of the live published refund + shipping policies,
+    for the system prompt. Cached for BRAIN_CACHE_TTL_SECONDS (same
+    interval as brain.md). On fetch failure, serves the last good copy
+    (even past TTL) rather than dropping the block; returns "" only when
+    no copy has ever been fetched — callers treat "" as a no-op."""
+    now = time.time()
+    age = now - _policy_cache["fetched_at"]
+    if _policy_cache["text"] and age < BRAIN_CACHE_TTL_SECONDS:
+        return _policy_cache["text"]
+
+    sections = []
+    for name, url in _POLICY_PROMPT_PAGES:
+        text = _strip_html(_fetch_policy_page_html(url))
+        if text:
+            sections.append(f"== {name} (live page) ==\n{text}")
+
+    if not sections:
+        if _policy_cache["text"]:
+            print("[POLICY] Refresh failed — serving last cached policy text")
+        return _policy_cache["text"]
+
+    block = (
+        "[LIVE STORE POLICIES - published at glamshelf.in]\n"
+        "The following is the store's live published policy text, for factual "
+        "reference when answering policy questions. It does not override any "
+        "classification, escalation, or Never-list rule above.\n\n"
+        + "\n\n".join(sections)
+    )
+    _policy_cache["text"] = block
+    _policy_cache["fetched_at"] = now
+    print(f"[POLICY] Refreshed live policy block ({len(block)} chars)")
+    return block
+
+
 def get_live_inventory() -> str:
     """Fetch current stock for every product in Shopify and return a
     plaintext block suitable for prepending to the brain on every Claude
@@ -2737,10 +3051,18 @@ def get_live_inventory() -> str:
         available = variants[0].get("available")
         if available is None:
             continue
-        if available:
-            lines.append(f"{title}: IN STOCK")
-        else:
-            lines.append(f"{title}: SOLD OUT")
+        # Enrich each line with SKU and a ~200-char slice of the real
+        # product description (body_html was previously fetched and
+        # discarded) so the model answers detail questions from actual
+        # product copy instead of brain.md's generic claims.
+        parts = [f"{title}: {'IN STOCK' if available else 'SOLD OUT'}"]
+        sku = (variants[0].get("sku") or "").strip()
+        if sku:
+            parts.append(f"SKU {sku}")
+        desc = _strip_html(p.get("body_html") or "")[:200].strip()
+        if desc:
+            parts.append(desc)
+        lines.append(" | ".join(parts))
 
     # If Shopify returned products but none had usable availability data,
     # we'd still produce a one-line block (just the header). That's not
@@ -2759,6 +3081,475 @@ def get_live_inventory() -> str:
     )
     return block
 
+
+
+# ===== RAG retrieval layer (Point A — audit 2026-07-05 §4/§7) =====
+#
+# Corpus: product descriptions (Shopify body_html, chunked by block) +
+# 3 policy pages (returns / shipping / terms, chunked by section).
+# Explicitly excluded: conversation logs, order records, anything
+# customer-identified. Stock status and price are never embedded — those
+# stay live API data (audit 5.2/5.3).
+#
+# Storage: rag_chunks (+ rag_vec vec0 virtual table when the sqlite-vec
+# extension loads) in the SAME SQLite file as everything else (DB_PATH),
+# so index persistence rides on the persistent-disk decision like all
+# other state. If sqlite-vec can't load, retrieval falls back to a
+# brute-force numpy scan over the stored embeddings — at ~40 chunks the
+# difference is microseconds.
+#
+# Failure posture (audit 5.5): every entry point is wrapped; a missing
+# model, missing index, or any exception degrades to brain.md-only
+# behavior. Retrieval can enrich a reply; it must never break a webhook.
+#
+# Embeddings run locally via fastembed (Qdrant's ONNX Runtime port of
+# all-MiniLM-L6-v2, quantized): no torch (the original torch build
+# measured 481MB RSS — over the 512MB Render Starter budget), no API
+# key, no per-call cost, no network dependency at query time (the
+# OpenAI-API attempt died on unfunded billing). Third and intended-final
+# embedding backend. The ~83MB model downloads once into
+# RAG_MODEL_CACHE_DIR — kept next to the DB so a persistent-disk
+# DB_PATH also makes the model survive Render redeploys (no re-download
+# on boot).
+RAG_EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # fastembed's quantized ONNX build (v0.8.0 name — the old AllMiniLML6V2Q enum is gone)
+RAG_EMBED_DIM = 384
+RAG_MODEL_CACHE_DIR = os.path.join(os.path.dirname(DB_PATH) or ".", "fastembed_cache")
+RAG_TOP_K = 2
+RAG_CANDIDATES = 8                 # over-fetch, then apply the product filter
+RAG_MAX_CONTEXT_CHARS = 2000       # ≈500 tokens (audit 5.4 budget)
+RAG_CHUNK_MAX_CHARS = 500
+RAG_REINDEX_INTERVAL_SECONDS = 60 * 60   # hourly fallback re-index
+
+_RAG_POLICY_SOURCES = (
+    ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
+    ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
+    ("Terms of Service", "https://glamshelf.in/policies/terms-of-service"),
+)
+
+_rag_embedder = None  # fastembed TextEmbedding, loaded once at startup; None = retrieval disabled
+
+# Gate: retrieval only fires when the message plausibly overlaps the
+# product/policy corpus. A miss is a hard no-op (no embedding cost).
+_RAG_TRIGGER_RE = re.compile(
+    r"\b(gs ?1|gs ?2|gs ?3|kawaii|clean girl|mink|duo|trio|tray(s)?|lash(es)?|"
+    r"half ?lash(es)?|band|glue|wear(s)?|reusab\w*|material(s)?|fiber(s)?|"
+    r"colou?r(s)?|black|brown|shade(s)?|"
+    r"return(s|ed)?|refund(s|ed)?|exchange(s|d)?|ship(ping|ped|s)?|"
+    r"deliver(y|ies|ed)?|polic(y|ies)|cancel(led|lation)?|cod|payment(s)?|"
+    r"track(ing)?|courier|damaged?|broken|replace(ment)?|warranty)\b",
+    re.IGNORECASE,
+)
+
+# Specific-product detection for the audit 5.3 wrong-SKU guard: when the
+# customer names a product, product-sourced chunks are restricted to that
+# product (policy chunks always allowed).
+_RAG_NAMED_PRODUCT_TERMS = (
+    ("gs1", "gs1"), ("gs 1", "gs1"),
+    ("gs2", "gs2"), ("gs 2", "gs2"),
+    ("gs3", "gs3"), ("gs 3", "gs3"),
+    ("half lash", "gs3"),
+    ("kawaii", "kawaii"),
+    ("clean girl", "clean-girl"),
+)
+
+
+def _rag_clean_broken_model_cache() -> None:
+    """Remove INCOMPLETE HuggingFace-layout model dirs from the fastembed
+    cache. On hosts without symlink support (Windows without Developer
+    Mode — Udit's machine), the HF fetch dies mid-download and leaves a
+    partial models--* dir. fastembed then treats that dir as a valid
+    cache on the next boot and fails with "Could not find
+    tokenizer_config.json" — permanently, on every boot, even though a
+    complete tarball-extracted copy (fast-*) sits right next to it.
+    Deleting the broken dir lets the loader fall through to the good
+    copy or re-download cleanly. Dirs with a complete snapshot (the
+    normal case on Linux/Render) are left alone.
+    """
+    try:
+        if not os.path.isdir(RAG_MODEL_CACHE_DIR):
+            return
+        for name in os.listdir(RAG_MODEL_CACHE_DIR):
+            if not name.startswith("models--"):
+                continue
+            model_dir = os.path.join(RAG_MODEL_CACHE_DIR, name)
+            snap_root = os.path.join(model_dir, "snapshots")
+            complete = False
+            if os.path.isdir(snap_root):
+                for snap in os.listdir(snap_root):
+                    snap_dir = os.path.join(snap_root, snap)
+                    if all(
+                        os.path.exists(os.path.join(snap_dir, f))
+                        for f in ("model.onnx", "tokenizer_config.json", "config.json")
+                    ):
+                        complete = True
+                        break
+            if not complete:
+                shutil.rmtree(model_dir, ignore_errors=True)
+                shutil.rmtree(os.path.join(RAG_MODEL_CACHE_DIR, ".locks"), ignore_errors=True)
+                print(f"[RAG] Removed incomplete model cache dir {name} (interrupted download)")
+    except Exception as e:
+        print(f"[RAG] Model cache cleanup skipped: {type(e).__name__}: {e}")
+
+
+def _rag_load_model() -> None:
+    """Load the fastembed model once at startup (NOT lazily on first
+    request — audit 5.5's cold-start rule). First-ever load downloads
+    ~83MB into RAG_MODEL_CACHE_DIR; subsequent loads read from the cache.
+
+    Two attempts with a broken-cache cleanup before each: an interrupted
+    HF download poisons the cache dir in a way that otherwise fails
+    every future boot (see _rag_clean_broken_model_cache). On final
+    failure _rag_embedder stays None and retrieval is disabled for the
+    process lifetime; webhooks run exactly as before the RAG layer."""
+    global _rag_embedder
+    try:
+        from fastembed import TextEmbedding
+    except Exception as e:
+        _rag_embedder = None
+        print(f"[RAG] fastembed not importable ({type(e).__name__}: {e}) — retrieval disabled, brain-only behavior")
+        return
+
+    for attempt in (1, 2):
+        _rag_clean_broken_model_cache()
+        try:
+            t0 = time.time()
+            _rag_embedder = TextEmbedding(
+                model_name=RAG_EMBED_MODEL_NAME,
+                cache_dir=RAG_MODEL_CACHE_DIR,
+            )
+            print(
+                f"[RAG] fastembed model loaded in {time.time() - t0:.1f}s "
+                f"({RAG_EMBED_MODEL_NAME}, {RAG_EMBED_DIM}d, cache={RAG_MODEL_CACHE_DIR})"
+            )
+            return
+        except Exception as e:
+            print(f"[RAG] fastembed load attempt {attempt} failed: {type(e).__name__}: {e}")
+
+    _rag_embedder = None
+    print("[RAG] fastembed model unavailable after retry — retrieval disabled, brain-only behavior")
+
+
+def _rag_db() -> tuple:
+    """Open a DB connection and try to load sqlite-vec into it.
+    Returns (conn, vec_loaded)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return conn, True
+    except Exception:
+        return conn, False
+
+
+def _rag_embed(texts: list[str]):
+    """float32 embedding matrix from local fastembed inference, or None
+    on ANY failure — callers treat None as "skip retrieval / keep
+    existing index". No network access, no API key, no per-call cost.
+
+    Embeddings are explicitly re-normalized (fastembed's MiniLM output
+    is already unit-length, but the guarantee is what makes vec0's
+    default L2 ranking equivalent to cosine ranking — cheap insurance
+    against a library version changing postprocessing).
+    """
+    if _rag_embedder is None or not texts:
+        return None
+    try:
+        import numpy as np
+        # batch_size=8: onnxruntime's memory arena grows with the largest
+        # batch it has ever run. Embedding the whole 46-chunk corpus in
+        # one batch measurably balloons peak RSS — a real constraint on
+        # the 512MB Render Starter instance. Small batches keep the
+        # arena small; per-query cost is unaffected (queries are 1 text).
+        vecs = np.asarray(list(_rag_embedder.embed(texts, batch_size=8)), dtype=np.float32)
+        if vecs.shape != (len(texts), RAG_EMBED_DIM):
+            print(f"[RAG] Unexpected embedding shape {vecs.shape} — skipping")
+            return None
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vecs / norms
+    except Exception as e:
+        print(f"[RAG] Embedding failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _rag_merge_blocks(blocks: list[str], max_chars: int = RAG_CHUNK_MAX_CHARS) -> list[str]:
+    """Merge text blocks into chunks of at most max_chars, never splitting
+    a block unless it alone exceeds the cap."""
+    chunks: list[str] = []
+    current = ""
+    for b in blocks:
+        if len(b) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(b), max_chars):
+                chunks.append(b[i:i + max_chars])
+            continue
+        if current and len(current) + len(b) + 1 > max_chars:
+            chunks.append(current)
+            current = b
+        else:
+            current = f"{current} {b}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _rag_build_corpus() -> list[tuple[str, str, str]]:
+    """Assemble the (source, title, content) chunk list from live Shopify
+    data. Product/policy text ONLY — no conversation logs, no orders, no
+    customer identifiers, no stock status, no prices-as-text."""
+    chunks: list[tuple[str, str, str]] = []
+
+    try:
+        resp = requests.get(
+            SHOPIFY_PRODUCTS_URL,
+            params={"limit": SHOPIFY_PRODUCTS_LIMIT},
+            timeout=SHOPIFY_TIMEOUT_SECONDS,
+        )
+        products = (resp.json() or {}).get("products") or [] if resp.ok else []
+    except Exception as e:
+        print(f"[RAG] Product fetch failed: {type(e).__name__}: {e}")
+        products = []
+
+    for p in products:
+        title = (p.get("title") or "").strip()
+        handle = (p.get("handle") or "").strip()
+        blocks = _html_to_blocks(p.get("body_html") or "")
+        for c in _rag_merge_blocks(blocks):
+            chunks.append((f"product:{handle}", title, c))
+
+    for name, url in _RAG_POLICY_SOURCES:
+        blocks = _html_to_blocks(_fetch_policy_page_html(url))
+        for c in _rag_merge_blocks(blocks):
+            chunks.append((f"policy:{name}", name, c))
+
+    return chunks
+
+
+def _rag_reindex(reason: str = "manual") -> int:
+    """Rebuild the vector index from live product + policy data. Returns
+    the chunk count (0 = failed or skipped). A failed fetch never wipes
+    the existing index — stale beats empty."""
+    if _rag_embedder is None:
+        print("[RAG] Reindex skipped — no embedding model")
+        return 0
+
+    chunks = _rag_build_corpus()
+    if not chunks:
+        print("[RAG] Reindex aborted — corpus fetch returned nothing (keeping existing index)")
+        return 0
+
+    embs = _rag_embed([c[2] for c in chunks])
+    if embs is None:
+        print("[RAG] Reindex aborted — embedding failed (keeping existing index)")
+        return 0
+
+    try:
+        import numpy as np
+        conn, vec_loaded = _rag_db()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rag_chunks (
+                id INTEGER PRIMARY KEY,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding BLOB NOT NULL
+            )
+            """
+        )
+        if vec_loaded:
+            # DROP + recreate (not DELETE): the embedding dimension is
+            # baked into the vec0 table definition, so an embedding-model
+            # change (e.g. the 384d MiniLM → 1536d OpenAI swap) needs a
+            # fresh virtual table. Vector spaces can't be mixed.
+            conn.execute("DROP TABLE IF EXISTS rag_vec")
+            conn.execute(
+                f"CREATE VIRTUAL TABLE rag_vec USING vec0(embedding float[{embs.shape[1]}])"
+            )
+        conn.execute("DELETE FROM rag_chunks")
+        for i, ((source, title, content), emb) in enumerate(zip(chunks, embs), start=1):
+            blob = np.asarray(emb, dtype=np.float32).tobytes()
+            conn.execute(
+                "INSERT INTO rag_chunks (id, source, title, content, embedding) VALUES (?, ?, ?, ?, ?)",
+                (i, source, title, content, blob),
+            )
+            if vec_loaded:
+                conn.execute(
+                    "INSERT INTO rag_vec (rowid, embedding) VALUES (?, ?)", (i, blob)
+                )
+        # Record which embedder built this index. Dimension alone can't
+        # tell two 384d models apart (torch MiniLM vs fastembed's
+        # quantized ONNX MiniLM produce different vectors) — the startup
+        # check compares this name and rebuilds on mismatch so corpus
+        # and queries are always embedded by the same model.
+        conn.execute("CREATE TABLE IF NOT EXISTS rag_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT OR REPLACE INTO rag_meta (key, value) VALUES ('embed_model', ?)",
+            (RAG_EMBED_MODEL_NAME,),
+        )
+        conn.commit()
+        conn.close()
+        print(f"[RAG] Reindexed {len(chunks)} chunks ({reason}; sqlite-vec={'yes' if vec_loaded else 'no, brute-force fallback'})")
+        return len(chunks)
+    except Exception as e:
+        print(f"[RAG] Reindex failed: {type(e).__name__}: {e}")
+        return 0
+
+
+def _rag_reindex_async(reason: str) -> None:
+    """Fire a reindex on a daemon thread so webhook handlers return fast."""
+    threading.Thread(target=_rag_reindex, args=(reason,), daemon=True).start()
+
+
+def _start_rag_reindex_loop() -> None:
+    """Startup: index immediately if the table is empty, unreachable, or
+    was built under a different embedding dimension (a model swap makes
+    old vectors unusable — better an eager rebuild than every query
+    failing the vec0 dimension check). Then re-index hourly as the
+    fallback for missed Shopify webhooks."""
+    def loop():
+        count, dim, meta_model = 0, None, None
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            count = conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
+            row = conn.execute("SELECT embedding FROM rag_chunks LIMIT 1").fetchone()
+            try:
+                m = conn.execute(
+                    "SELECT value FROM rag_meta WHERE key = 'embed_model'"
+                ).fetchone()
+                meta_model = m[0] if m else None
+            except Exception:
+                meta_model = None  # pre-meta index (built before this check existed)
+            conn.close()
+            if row and row[0]:
+                dim = len(row[0]) // 4  # float32 blob → dimension
+        except Exception:
+            count = 0
+        if count == 0:
+            _rag_reindex("startup")
+        elif dim != RAG_EMBED_DIM:
+            print(f"[RAG] Index dimension {dim} != expected {RAG_EMBED_DIM} (embedding model changed) — rebuilding")
+            _rag_reindex("startup-dimension-change")
+        elif meta_model != RAG_EMBED_MODEL_NAME:
+            # Same dimension, different (or unrecorded) embedder — vectors
+            # aren't comparable across models even at equal size.
+            print(f"[RAG] Index built by {meta_model!r}, expected {RAG_EMBED_MODEL_NAME!r} — rebuilding")
+            _rag_reindex("startup-model-change")
+        else:
+            print(f"[RAG] Existing index found ({count} chunks, {dim}d, {meta_model}) — hourly refresh scheduled")
+        while True:
+            time.sleep(RAG_REINDEX_INTERVAL_SECONDS)
+            _rag_reindex("hourly")
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+def _rag_named_products(message: str) -> set[str]:
+    low = (message or "").lower()
+    return {key for term, key in _RAG_NAMED_PRODUCT_TERMS if term in low}
+
+
+def _rag_retrieve(message: str) -> str:
+    """Point A retrieval: keyword gate → embed query → top-K chunks →
+    [RETRIEVED CONTEXT] block. Returns "" (a strict no-op for the caller)
+    when the gate misses, the embedding model/index is unavailable, or
+    anything throws. Never raises."""
+    if _rag_embedder is None or not message:
+        return ""
+    try:
+        if not _RAG_TRIGGER_RE.search(message):
+            return ""
+        t0 = time.time()
+        q = _rag_embed([message])
+        if q is None:
+            return ""
+        import numpy as np
+        qv = np.asarray(q[0], dtype=np.float32)
+
+        conn, vec_loaded = _rag_db()
+        candidates: list[tuple[str, str, str, float]] = []  # source, title, content, score
+        try:
+            if vec_loaded:
+                rows = conn.execute(
+                    "SELECT rowid, distance FROM rag_vec WHERE embedding MATCH ? AND k = ?",
+                    (qv.tobytes(), RAG_CANDIDATES),
+                ).fetchall()
+                for rowid, dist in rows:
+                    r = conn.execute(
+                        "SELECT source, title, content FROM rag_chunks WHERE id = ?",
+                        (rowid,),
+                    ).fetchone()
+                    if r:
+                        candidates.append((r[0], r[1], r[2], -float(dist)))
+            else:
+                rows = conn.execute(
+                    "SELECT source, title, content, embedding FROM rag_chunks"
+                ).fetchall()
+                scored = [
+                    (s, t, c, float(np.dot(qv, np.frombuffer(b, dtype=np.float32))))
+                    for s, t, c, b in rows
+                ]
+                scored.sort(key=lambda x: x[3], reverse=True)
+                candidates = scored[:RAG_CANDIDATES]
+        finally:
+            conn.close()
+
+        if not candidates:
+            return ""
+
+        # Wrong-SKU guard (audit 5.3): a named product restricts
+        # product-sourced chunks to that product; policy chunks pass.
+        named = _rag_named_products(message)
+        if named:
+            candidates = [
+                c for c in candidates
+                if c[0].startswith("policy:") or any(n in c[0] for n in named)
+            ]
+
+        picked, total = [], 0
+        for source, title, content, _score in candidates:
+            if len(picked) >= RAG_TOP_K:
+                break
+            if total + len(content) > RAG_MAX_CONTEXT_CHARS:
+                continue
+            picked.append(f"• ({title}) {content}")
+            total += len(content)
+
+        if not picked:
+            return ""
+
+        elapsed_ms = int((time.time() - t0) * 1000)
+        print(f"[RAG] Retrieved {len(picked)} chunk(s) in {elapsed_ms}ms")
+        return (
+            "[RETRIEVED CONTEXT]\n"
+            "The following is supplementary factual information about products "
+            "or policies. It does not override any classification, escalation, "
+            "or Never-list rule above.\n\n"
+            + "\n\n".join(picked)
+        )
+    except Exception as e:
+        print(f"[RAG] Retrieval failed (falling back to brain-only): {type(e).__name__}: {e}")
+        return ""
+
+
+# RAG layer startup — runs at import (same pattern as _init_db above, but
+# placed here because it needs the definitions in this section). Model
+# load is synchronous and up-front (audit 5.5: no lazy first-request
+# latency spike); indexing runs on a daemon thread so a slow Shopify
+# fetch never delays boot. Both degrade gracefully: model unavailable →
+# retrieval disabled, brain-only behavior.
+_rag_load_model()
+_start_rag_reindex_loop()
+
+# Warm the live-policy cache at startup so the first webhook doesn't pay
+# the two page fetches. Failure is fine — get_live_policies retries on
+# the next call and returns "" (no-op) until a fetch succeeds.
+get_live_policies()
 
 
 # ===== Deterministic escalation pre-filter =====
@@ -2843,6 +3634,21 @@ def draft_reply_logic(
     live_stock = get_live_inventory()
     if live_stock:
         brain = live_stock + "\n\n" + brain
+
+    # Live published policy pages (Phase 0 quick win) — appended AFTER
+    # brain.md so classification/escalation rules keep prompt priority;
+    # the block is factual reference only. Empty string (never fetched
+    # successfully) degrades to the pre-Phase-0 prompt unchanged.
+    live_policies = get_live_policies()
+    if live_policies:
+        brain = brain + "\n\n" + live_policies
+
+    # RAG retrieval (Point A) — supplementary product/policy chunks,
+    # appended LAST so brain rules and policies keep priority. Empty
+    # retrieval (gate not hit, no model, no index, any error) is a no-op.
+    retrieved = _rag_retrieve(message)
+    if retrieved:
+        brain = brain + "\n\n" + retrieved
 
     # Deterministic pre-filter — evaluated on the raw customer message
     # before the LLM call so the outcome can't depend on the model's
@@ -3715,7 +4521,7 @@ def webhook():
         elif classification == "DRAFT+APPROVE":
             # New buttoned approval flow: Telegram message with
             # ✅ Send as-is / ✏️ Edit / ⛔ Skip inline buttons. State is
-            # registered in _pending_drafts; the actual customer reply
+            # registered in the pending_drafts table; the actual customer reply
             # ships from the /telegram-callback handler when Udit taps
             # Send or completes an Edit. Falls back to the legacy plain-
             # text notification if the buttoned send fails (missing
@@ -3747,7 +4553,7 @@ def webhook():
             # the same customer don't re-trigger Claude + Telegram. The
             # founder is now handling the conversation; the twin should
             # stay out of the way. Manual #pause/#resume still work as
-            # before (this uses the same paused_numbers register), and
+            # before (this uses the same paused_senders register), and
             # the HUMAN_UDIT safety net is a separate, additive check
             # that also short-circuits inbound when Udit replies via WATI.
             _pause_number(wa_id)
@@ -4267,6 +5073,34 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             print(f"[REVIEW] Schedule call failed for order #{order_number}: {type(e).__name__}: {e}")
 
 
+@app.route("/shopify-product-webhook", methods=["POST"])
+def shopify_product_webhook():
+    """Receive Shopify products/create, products/update, products/delete
+    webhooks and refresh the RAG corpus so product-description chunks
+    track Shopify edits within seconds instead of the hourly fallback.
+
+    Auth: same SHOPIFY_WEBHOOK_SECRET / HMAC scheme as /shopify-webhook.
+    The reindex runs on a daemon thread — Shopify gets its 200 back
+    immediately (it retries and eventually disables slow webhooks).
+    Payload body is ignored: any product change rebuilds the whole
+    ~40-chunk corpus, which is cheaper than diffing.
+    """
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
+    topic = (request.headers.get("X-Shopify-Topic") or "").strip().lower()
+
+    if not _verify_shopify_hmac(raw_body, hmac_header):
+        print("[RAG] Product webhook: invalid HMAC signature")
+        return jsonify({"error": "invalid signature"}), 401
+
+    if topic.startswith("products/"):
+        _rag_reindex_async(f"webhook:{topic}")
+        print(f"[RAG] Product webhook {topic} — reindex scheduled")
+    else:
+        print(f"[RAG] Product webhook ignored — unexpected topic {topic!r}")
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/shopify-fulfillment", methods=["POST"])
 def shopify_fulfillment():
     """Receive Shopify fulfillments/create and fulfillments/update webhooks,
@@ -4628,7 +5462,7 @@ def _process_instagram_event(event: dict) -> None:
             _seen_ids.add(msg_id)
             _persist_seen_id(msg_id)
 
-        # Pause gate — same paused_numbers register the WATI flow uses.
+        # Pause gate — same paused_senders register the WATI flow uses.
         # The dict is keyed by string, so IG sender_ids and wa_ids coexist
         # cleanly. When the WATI/IG ESCALATE branches auto-pause a number
         # after sending the holding reply, subsequent inbound messages
@@ -4683,7 +5517,7 @@ def _process_instagram_event(event: dict) -> None:
 
         elif classification == "DRAFT+APPROVE":
             # Same buttoned approval flow WhatsApp uses, keyed on the IG
-            # sender_id via the shared _pending_drafts dict. The customer
+            # sender_id via the shared pending_drafts table. The customer
             # reply ships from /telegram-callback when Udit taps Send (or
             # completes an Edit) — nothing is sent here. Falls back to a
             # plain-text notification if the buttoned send fails so Udit

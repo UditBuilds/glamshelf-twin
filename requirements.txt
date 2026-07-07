@@ -4,3 +4,6 @@ anthropic
 python-dotenv
 gunicorn
 requests
+sqlite-vec
+numpy
+fastembed
