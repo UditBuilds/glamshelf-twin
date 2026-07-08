@@ -1654,12 +1654,59 @@ def _was_shipping_sent(order_id: str, message_type: str) -> bool:
         return False
 
 
-def _send_instagram_reply(sender_id: str, text: str) -> None:
+# Send-failure Telegram alerting. When an outbound customer send fails
+# (Instagram Graph API or WATI), Udit gets a Telegram alert so an outage
+# like an expired IG token is noticed in minutes, not hours (the July 8
+# token expiry ran silent for ~9h because failures only lived in Render
+# logs). Rate-limited per (channel, error) signature: the first failure
+# alerts, repeats of the SAME error within the window are suppressed —
+# otherwise a token outage would page once per customer message.
+SEND_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
+_send_failure_last_alert: dict[str, float] = {}
+
+
+def _alert_send_failure(channel: str, error: str, customer_id: str) -> None:
+    """Telegram-alert Udit that a customer reply failed to send.
+
+    Reuses the same bot/chat as the draft-approval flow via _telegram_api.
+    Never raises — alerting is a side effect and must not break the
+    webhook 200 response, same contract as every other Telegram call.
+    """
+    key = f"{channel}|{error[:120]}"
+    now = time.time()
+    if now - _send_failure_last_alert.get(key, 0.0) < SEND_FAILURE_ALERT_COOLDOWN_SECONDS:
+        print(f"[ALERT] Suppressed repeat send-failure alert ({channel}): {error[:80]}")
+        return
+    # Stamp before sending so a Telegram hiccup can't turn into an
+    # alert-per-message storm during an outage.
+    _send_failure_last_alert[key] = now
+
+    if not TELEGRAM_CHAT_ID:
+        print("[ALERT] Skipped: TELEGRAM_CHAT_ID not set")
+        return
+    text = (
+        f"⚠️ {channel} send FAILED\n"
+        f"Customer {customer_id} did not get a reply.\n"
+        f"Error: {error[:300]}\n\n"
+        f"(Repeats of this error muted for 30 min)"
+    )
+    try:
+        _telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e:
+        print(f"[ALERT] Telegram alert failed: {type(e).__name__}: {e}")
+
+
+def _send_instagram_reply(sender_id: str, text: str) -> tuple[bool, str]:
     """Send an outbound Instagram DM via the Meta Graph Messages API.
 
     Endpoint: POST https://graph.facebook.com/v19.0/me/messages
     Auth via ?access_token=... query param (Meta's documented pattern).
     Body: {"recipient": {"id": <sender>}, "message": {"text": <reply>}}
+
+    Returns (True, "") on a confirmed delivery, (False, error) on any
+    failure — callers that log success MUST check this instead of
+    assuming the send worked. Actual API/network failures also fire a
+    rate-limited Telegram alert via _alert_send_failure.
 
     All exceptions are logged-and-swallowed — Instagram delivery must
     never break the webhook 200 response. Missing access token →
@@ -1667,9 +1714,9 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
     """
     if not INSTAGRAM_PAGE_ACCESS_TOKEN:
         print("[INSTAGRAM] Skipped: INSTAGRAM_PAGE_ACCESS_TOKEN not set")
-        return
+        return False, "INSTAGRAM_PAGE_ACCESS_TOKEN not set"
     if not sender_id or not text:
-        return
+        return False, "empty sender_id or text"
 
     # INSTAGRAM_PAGE_ID resolves to the Instagram Business Account ID when
     # set, else "me" as a fallback. INSTAGRAM_API_BASE defaults to the
@@ -1701,6 +1748,7 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
             # WATI _record_bot_outbound design (text-only here; IG echoes
             # are matched by text, not msg id).
             _record_bot_outbound(text)
+            return True, ""
         else:
             # On failure, surface diagnostic info about the token so
             # config issues are obvious from Render logs without leaking
@@ -1713,10 +1761,27 @@ def _send_instagram_reply(sender_id: str, text: str) -> None:
                 f"{resp.text[:300]} "
                 f"(token len={tok_len}, prefix={tok_prefix!r})"
             )
+            # Prefer the Graph API's own error message (e.g. "Error
+            # validating access token: ...") — it's stable across repeats
+            # of the same failure, which is what the alert rate limit
+            # keys on.
+            try:
+                api_msg = resp.json().get("error", {}).get("message", "")
+            except ValueError:
+                api_msg = ""
+            error = f"HTTP {resp.status_code}: {api_msg or resp.text[:120]}"
+            _alert_send_failure("Instagram", error, sender_id)
+            return False, error
     except requests.RequestException as e:
         print(f"[INSTAGRAM] Network error: {type(e).__name__}: {e}")
+        error = f"Network error: {type(e).__name__}"
+        _alert_send_failure("Instagram", error, sender_id)
+        return False, error
     except Exception as e:
         print(f"[INSTAGRAM] Unexpected error: {type(e).__name__}: {e}")
+        error = f"Unexpected error: {type(e).__name__}"
+        _alert_send_failure("Instagram", error, sender_id)
+        return False, error
 
 
 def _log_instagram(
@@ -2596,8 +2661,13 @@ def normalize_wa(number: str) -> str:
     return "".join(c for c in (number or "") if c.isdigit()).lstrip("0")
 
 
-def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
+def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
     """Send an outbound WhatsApp text message to a customer via WATI.
+
+    Returns (True, "") on a confirmed delivery, (False, error) on any
+    failure — callers that log success MUST check this instead of
+    assuming the send worked. Actual API/network failures also fire a
+    rate-limited Telegram alert via _alert_send_failure.
 
     Endpoint choice — sendSessionMessage vs sendTemplateMessage:
       - /api/v1/sendSessionMessage/{wa_id} — used for replies WITHIN the
@@ -2625,7 +2695,7 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
     """
     if not WATI_API_KEY or not WATI_ENDPOINT:
         print("[WATI] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
-        return
+        return False, "WATI_API_KEY or WATI_ENDPOINT not set"
 
     # Defense in depth: never auto-send to the business or owner number,
     # even if some future change in the inbound filter ever lets one through.
@@ -2633,7 +2703,7 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
     target = normalize_wa(wa_id)
     if target and target in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
         print(f"[WATI] BLOCKED outbound to protected number {wa_id}")
-        return
+        return False, "blocked: protected number"
 
     endpoint = WATI_ENDPOINT.rstrip("/")
     url = f"{endpoint}/api/v1/sendSessionMessage/{wa_id}"
@@ -2673,6 +2743,9 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
         if isinstance(data, dict) and data.get("result") is False:
             info = data.get("info") or data.get("message") or "(no detail)"
             print(f"[WATI] API rejected the message: {info}")
+            error = f"WATI rejected: {info}"
+            _alert_send_failure("WhatsApp", error, wa_id)
+            return False, error
         elif response.ok:
             print(f"[WATI] Sent reply to {wa_id} ({len(reply_text)} chars)")
             # Register the outbound so WATI's subsequent outbound webhook
@@ -2680,12 +2753,22 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> None:
             # rather than Udit's manual reply — prevents HUMAN_UDIT mis-tagging
             # that would otherwise suppress the AUTO flow.
             _record_bot_outbound(reply_text, data if isinstance(data, dict) else None)
+            return True, ""
         else:
             print(f"[WATI] HTTP failure {response.status_code}")
+            error = f"HTTP {response.status_code}: {body_preview[:120]}"
+            _alert_send_failure("WhatsApp", error, wa_id)
+            return False, error
     except requests.RequestException as e:
         print(f"[WATI] Network error: {type(e).__name__}: {e}")
+        error = f"Network error: {type(e).__name__}"
+        _alert_send_failure("WhatsApp", error, wa_id)
+        return False, error
     except Exception as e:
         print(f"[WATI] Unexpected error: {type(e).__name__}: {e}")
+        error = f"Unexpected error: {type(e).__name__}"
+        _alert_send_failure("WhatsApp", error, wa_id)
+        return False, error
 
 
 def _reassign_to_bot(wa_id: str) -> None:
@@ -4511,8 +4594,14 @@ def webhook():
         sender_info = f"{sender_name} ({wa_id})" if sender_name else wa_id
 
         if classification == "AUTO":
-            send_whatsapp_reply(wa_id, reply)
-            print(f"[AUTO] Replied to {wa_id}")
+            # Same false-success guard as the Instagram AUTO branch: WATI
+            # failures (including result=false on HTTP 200) must not log
+            # "Replied".
+            sent, send_err = send_whatsapp_reply(wa_id, reply)
+            if sent:
+                print(f"[AUTO] Replied to {wa_id}")
+            else:
+                print(f"[AUTO] Send FAILED to {wa_id}: {send_err}")
             elapsed_ms = int((time.time() - t_start) * 1000)
             _log_message(
                 wa_id, sender_name, text_body,
@@ -4726,9 +4815,12 @@ def _send_review_request(order_id: str) -> None:
             f"to {customer_number} (name={customer_name or '(none)'})"
         )
         message = REVIEW_REQUEST_TEMPLATE.format(first_name=first_name)
-        send_whatsapp_reply(customer_number, message)
+        sent, send_err = send_whatsapp_reply(customer_number, message)
         _scheduled_reviews.pop(order_id, None)
-        print(f"[REVIEW] Sent review request for order {order_number} to {customer_number}")
+        if sent:
+            print(f"[REVIEW] Sent review request for order {order_number} to {customer_number}")
+        else:
+            print(f"[REVIEW] Send FAILED for order {order_number} to {customer_number}: {send_err}")
     except Exception as e:
         print(f"[REVIEW] Send error for order_id={order_id}: {type(e).__name__}: {e}")
         traceback.print_exc()
@@ -4918,9 +5010,12 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
                 f"Track your order: https://shiprocket.in/tracking/{tracking_number}\n\n"
                 f"Feel free to reach out if you need anything!"
             )
-            send_whatsapp_reply(wa_id, tracking_message)
+            sent, send_err = send_whatsapp_reply(wa_id, tracking_message)
             _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
-            print(f"[SHIPPING] Sent tracking link for order #{order_number} to {wa_id}")
+            if sent:
+                print(f"[SHIPPING] Sent tracking link for order #{order_number} to {wa_id}")
+            else:
+                print(f"[SHIPPING] Tracking link send FAILED for order #{order_number} to {wa_id}: {send_err}")
 
     # ----- STATUS MESSAGE -----
     if pre_shipment_silent:
@@ -5511,9 +5606,15 @@ def _process_instagram_event(event: dict) -> None:
         # waits for a Telegram button tap; ESCALATE sends nothing and
         # hands the thread to the founder.
         if classification == "AUTO":
-            _send_instagram_reply(sender_id, reply)
+            # Only claim success when the Graph API actually accepted the
+            # send — a 400 (e.g. expired token) used to still log
+            # "Replied", which hid the July 8 token outage for ~9h.
+            sent, send_err = _send_instagram_reply(sender_id, reply)
             _log_instagram(sender_id, text, reply, timestamp)
-            print(f"[INSTAGRAM-AUTO] Replied to {sender_id}")
+            if sent:
+                print(f"[INSTAGRAM-AUTO] Replied to {sender_id}")
+            else:
+                print(f"[INSTAGRAM-AUTO] Send FAILED to {sender_id}: {send_err}")
 
         elif classification == "DRAFT+APPROVE":
             # Same buttoned approval flow WhatsApp uses, keyed on the IG
