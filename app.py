@@ -1410,6 +1410,10 @@ def _load_wati_history(wa_id: str, max_turns: int = 30, max_age_days: int = 7) -
                       differs), so the raw DRAFT row can't be trusted as
                       "what the customer saw". Its delivery, when it happens,
                       is recorded separately as DRAFT_SENT.
+      - AUTO_FAILED / DRAFT_SEND_FAILED : the send was attempted but WATI
+                      did not confirm delivery — the customer never saw
+                      this text, so replaying it as an assistant turn would
+                      make the twin reference a reply that never arrived.
       - HUMAN_UDIT / HUMAN_HANDLING / PAUSE_DIRECTIVE / PAUSED / DEDUP /
                       PROTECTED / ERROR : not clean customer→bot exchanges
                       (no reply, Udit's own outbound, or placeholder text),
@@ -2015,6 +2019,8 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
               AND message_text IS NOT NULL
               AND message_text != ''
               AND reply_text IS NOT NULL
+              AND (source IS NULL
+                   OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG'))
               AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
             LIMIT 30
@@ -2579,33 +2585,53 @@ def _handle_telegram_callback(cb: dict) -> None:
             # the Graph API and record the exchange in instagram_logs so
             # _load_instagram_history sees this turn (the pending-draft row
             # was written with a NULL reply and is invisible to history).
-            # No _reassign_to_bot — that's a WATI-only concept.
-            _send_instagram_reply(customer_number, draft["reply_text"])
+            # Failed sends get DRAFT_SEND_FAILED_IG, which the history
+            # loader excludes. No _reassign_to_bot — WATI-only concept.
+            sent, send_err = _send_instagram_reply(
+                customer_number, draft["reply_text"]
+            )
             _log_instagram(
                 customer_number, draft.get("customer_message") or "",
                 draft["reply_text"], draft.get("ig_timestamp") or "",
-                source="DRAFT_SENT_IG",
+                source="DRAFT_SENT_IG" if sent else "DRAFT_SEND_FAILED_IG",
             )
         else:
-            send_whatsapp_reply(customer_number, draft["reply_text"])
-            # Record the DELIVERED reply as a history-eligible exchange so the
-            # twin remembers this turn on the customer's next message. Without
-            # this, approved-draft replies were invisible to _load_wati_history
-            # (only the un-delivered DRAFT row existed) and the conversation
-            # context reset. msg_text is the customer message the draft answered.
+            sent, send_err = send_whatsapp_reply(
+                customer_number, draft["reply_text"]
+            )
+            # Record the reply as history-eligible (DRAFT_SENT) ONLY when
+            # the send was confirmed — a failed approval send is recorded
+            # as DRAFT_SEND_FAILED, outside _load_wati_history's allowlist,
+            # so the twin never treats it as text the customer saw.
+            # msg_text is the customer message the draft answered.
             _log_message(
                 customer_number, customer_name, draft.get("customer_message") or "",
-                status="DRAFT_SENT", reply_text=draft["reply_text"],
+                status="DRAFT_SENT" if sent else "DRAFT_SEND_FAILED",
+                reply_text=draft["reply_text"],
+                error=None if sent else send_err,
             )
             # Approving a draft is a human takeover of the conversation — keep
             # the ticket on the Bot so the webhook keeps hearing this customer.
             _reassign_to_bot(customer_number)
-        _finalize_draft_message(
-            chat_id, message_id, original_text,
-            f"✅ Sent to {name_for_display}",
-        )
-        # Already popped at top — no del needed.
-        print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
+        # The Telegram status line must tell Udit the truth: a failed send
+        # annotated "✅ Sent" means he walks away believing the customer
+        # was answered. (_alert_send_failure has already fired inside the
+        # sender; this is the in-context confirmation.)
+        if sent:
+            _finalize_draft_message(
+                chat_id, message_id, original_text,
+                f"✅ Sent to {name_for_display}",
+            )
+            print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
+        else:
+            _finalize_draft_message(
+                chat_id, message_id, original_text,
+                f"⚠️ Send FAILED to {name_for_display} — {send_err}",
+            )
+            print(
+                f"[TELEGRAM DRAFT] Send-as-is FAILED for {customer_number} "
+                f"(draft {draft_id}): {send_err}"
+            )
 
     elif action == "edit":
         # Re-register the draft so the next text message from this chat can
@@ -2706,27 +2732,40 @@ def _handle_telegram_message(msg: dict) -> None:
 
     # Record the actually-sent EDITED text (not the pre-edit draft) as a
     # history-eligible exchange so future turns remember what the customer
-    # really received. Mirrors the send-as-is branch in _handle_telegram_callback.
+    # really received. Mirrors the send-as-is branch in _handle_telegram_callback,
+    # including the failed-send split: a failed edit-send is logged with a
+    # *_FAILED status (invisible to history) and reported honestly to Udit.
     if draft.get("channel") == "Instagram":
-        _send_instagram_reply(customer_number, text)
+        sent, send_err = _send_instagram_reply(customer_number, text)
         _log_instagram(
             customer_number, draft.get("customer_message") or "",
             text, draft.get("ig_timestamp") or "",
-            source="DRAFT_SENT_IG",
+            source="DRAFT_SENT_IG" if sent else "DRAFT_SEND_FAILED_IG",
         )
     else:
-        send_whatsapp_reply(customer_number, text)
+        sent, send_err = send_whatsapp_reply(customer_number, text)
         _log_message(
             customer_number, customer_name, draft.get("customer_message") or "",
-            status="DRAFT_SENT", reply_text=text,
+            status="DRAFT_SENT" if sent else "DRAFT_SEND_FAILED",
+            reply_text=text,
+            error=None if sent else send_err,
         )
         # Sending an edited reply is a human takeover — keep the ticket on the
         # Bot so the webhook keeps receiving this customer's messages.
         _reassign_to_bot(customer_number)
-    _telegram_api("sendMessage", {
-        "chat_id": chat_id,
-        "text": f"✅ Sent your edit to {name_for_display}",
-    })
+    if sent:
+        _telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"✅ Sent your edit to {name_for_display}",
+        })
+    else:
+        _telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"⚠️ Send FAILED to {name_for_display} — {send_err}",
+        })
+        print(
+            f"[TELEGRAM DRAFT] Edit-send FAILED for {customer_number}: {send_err}"
+        )
 
     # Annotate the original draft message so the chat history reads cleanly.
     orig_chat = draft.get("telegram_chat_id")
@@ -4771,12 +4810,16 @@ def webhook(token=""):
             else:
                 # Path (c): low confidence, unrecognized image type, or no URL.
                 print(f"[VISION] Low confidence / unrecognized image (confidence={confidence!r} type={image_type!r}) — falling back to neutral reply")
-                send_whatsapp_reply(wa_id, FALLBACK_VISION_REPLY)
+                # Same delivered-vs-failed split as the text AUTO branch —
+                # a fallback reply that never sent must not enter history.
+                sent, send_err = send_whatsapp_reply(wa_id, FALLBACK_VISION_REPLY)
                 elapsed_ms = int((time.time() - t_start) * 1000)
                 _log_message(
                     wa_id, sender_name, "[image]",
-                    status="AUTO", reply_text=FALLBACK_VISION_REPLY,
+                    status="AUTO" if sent else "AUTO_FAILED",
+                    reply_text=FALLBACK_VISION_REPLY,
                     latency_ms=elapsed_ms,
+                    error=None if sent else send_err,
                 )
                 print("=" * 60 + "\n")
                 return jsonify({"status": "ok"}), 200
@@ -4814,17 +4857,25 @@ def webhook(token=""):
         if classification == "AUTO":
             # Same false-success guard as the Instagram AUTO branch: WATI
             # failures (including result=false on HTTP 200) must not log
-            # "Replied".
+            # "Replied". Failed sends get status AUTO_FAILED — a status
+            # deliberately OUTSIDE _load_wati_history's delivered-only
+            # allowlist, so a reply the customer never received can't be
+            # referenced by the twin as if it had been seen.
             sent, send_err = send_whatsapp_reply(wa_id, reply)
+            elapsed_ms = int((time.time() - t_start) * 1000)
             if sent:
                 print(f"[AUTO] Replied to {wa_id}")
+                _log_message(
+                    wa_id, sender_name, text_body,
+                    status="AUTO", reply_text=reply, latency_ms=elapsed_ms,
+                )
             else:
                 print(f"[AUTO] Send FAILED to {wa_id}: {send_err}")
-            elapsed_ms = int((time.time() - t_start) * 1000)
-            _log_message(
-                wa_id, sender_name, text_body,
-                status="AUTO", reply_text=reply, latency_ms=elapsed_ms,
-            )
+                _log_message(
+                    wa_id, sender_name, text_body,
+                    status="AUTO_FAILED", reply_text=reply,
+                    latency_ms=elapsed_ms, error=send_err,
+                )
         elif classification == "DRAFT+APPROVE":
             # New buttoned approval flow: Telegram message with
             # ✅ Send as-is / ✏️ Edit / ⛔ Skip inline buttons. State is
@@ -5862,11 +5913,18 @@ def _process_instagram_event(event: dict) -> None:
             # Only claim success when the Graph API actually accepted the
             # send — a 400 (e.g. expired token) used to still log
             # "Replied", which hid the July 8 token outage for ~9h.
+            # Failed sends keep the attempted text for audit but carry
+            # source=AUTO_FAILED_IG, which _load_instagram_history
+            # excludes — the twin must never reference a reply the
+            # customer didn't receive.
             sent, send_err = _send_instagram_reply(sender_id, reply)
-            _log_instagram(sender_id, text, reply, timestamp)
             if sent:
+                _log_instagram(sender_id, text, reply, timestamp)
                 print(f"[INSTAGRAM-AUTO] Replied to {sender_id}")
             else:
+                _log_instagram(
+                    sender_id, text, reply, timestamp, source="AUTO_FAILED_IG"
+                )
                 print(f"[INSTAGRAM-AUTO] Send FAILED to {sender_id}: {send_err}")
 
         elif classification == "DRAFT+APPROVE":
