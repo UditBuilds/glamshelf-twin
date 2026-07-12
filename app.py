@@ -34,6 +34,15 @@ import requests
 from openai import OpenAI
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+from pricing_rules import (
+    ACTION_ESCALATE,
+    BULK_MIN_TRAYS,
+    BULK_RATE_INR,
+    INTENT_COMMIT,
+    detect_bulk_commit_quantity,
+    resolve_pricing_action,
+)
 from flask import (
     Flask,
     jsonify,
@@ -3676,6 +3685,27 @@ def _escalation_prefilter_hit(message: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _bulk_commit_prefilter_hit(message: str) -> int | None:
+    """Return the tray quantity if the message is a deterministic bulk-commit
+    that must ESCALATE per resolve_pricing_action(), else None.
+
+    Rate-only asks never fire here — pricing_rules resolves those to AUTO
+    (brain.md v1.10: the Hard Money Threshold covers commitments only, so an
+    implied quote value >₹1,500 is not an escalation ground). Shares the
+    ESCALATION_PREFILTER_DISABLED rollback switch with the phrase filter.
+    """
+    if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+        return None
+    qty = detect_bulk_commit_quantity(message)
+    if qty is None:
+        return None
+    # Implied amount is only known for bulk quantities (tray rate applies);
+    # below 20 the product mix is unknown, so pass None rather than guess.
+    amount = qty * BULK_RATE_INR if qty >= BULK_MIN_TRAYS else None
+    action = resolve_pricing_action(quantity=qty, amount=amount, intent=INTENT_COMMIT)
+    return qty if action == ACTION_ESCALATE else None
+
+
 def draft_reply_logic(
     message: str,
     order_context: str = "",
@@ -3738,6 +3768,7 @@ def draft_reply_logic(
     # judgment. The LLM still runs (we want its drafted reply for the
     # Telegram notification); the filter only pins the classification.
     prefilter_phrase = _escalation_prefilter_hit(message)
+    bulk_commit_qty = _bulk_commit_prefilter_hit(message)
 
     raw = ask_claude(brain, message, order_context, history=history, source=source)
 
@@ -3757,6 +3788,14 @@ def draft_reply_logic(
         print(
             f"[PREFILTER] Forcing ESCALATE (was {classification or 'unparsed'!r}) — "
             f"matched high-risk phrase {prefilter_phrase!r}"
+        )
+        classification = "ESCALATE"
+
+    if bulk_commit_qty is not None and classification != "ESCALATE":
+        print(
+            f"[PREFILTER] Forcing ESCALATE (was {classification or 'unparsed'!r}) — "
+            f"bulk commit signal for {bulk_commit_qty} trays "
+            f"(Rule 3b-i / Hard Money Threshold, resolve_pricing_action)"
         )
         classification = "ESCALATE"
 
