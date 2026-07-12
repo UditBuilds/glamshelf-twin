@@ -339,6 +339,33 @@ INSTAGRAM_API_BASE = os.environ.get(
 
 INSTAGRAM_TIMEOUT_SECONDS = 10
 
+# Webhook origin verification — secrets for the three non-Shopify inbound
+# endpoints (Shopify already verifies via SHOPIFY_WEBHOOK_SECRET above).
+# All three fail CLOSED: missing/empty secret means every POST to that
+# endpoint 401s until the env var is set on Render. Each provider has an
+# independent request-time kill switch (same pattern as
+# ESCALATION_PREFILTER_DISABLED — set to 1/true/yes to bypass
+# verification without a redeploy if a provider changes its scheme):
+#   WATI_WEBHOOK_VERIFY_DISABLED
+#   INSTAGRAM_WEBHOOK_VERIFY_DISABLED
+#   TELEGRAM_WEBHOOK_VERIFY_DISABLED
+#
+# INSTAGRAM_APP_SECRET — Meta App Dashboard → App settings → Basic →
+#   "App secret". Meta signs every webhook POST body with HMAC-SHA256
+#   using this key and sends it as X-Hub-Signature-256.
+# TELEGRAM_WEBHOOK_SECRET — self-chosen random string, registered with
+#   Telegram once via setWebhook's secret_token param; Telegram then
+#   echoes it on every callback in X-Telegram-Bot-Api-Secret-Token.
+# WATI_WEBHOOK_TOKEN — self-chosen random string. WATI offers no webhook
+#   signing (their dashboard configures URL/status/events only), so the
+#   token rides in the URL path instead: point WATI at
+#   /webhook/<token> and /wati-outbound/<token>. Accepted tradeoff:
+#   the token appears in request logs; rotate by changing the env var
+#   and updating the WATI dashboard URL.
+INSTAGRAM_APP_SECRET = os.environ.get("INSTAGRAM_APP_SECRET", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+WATI_WEBHOOK_TOKEN = os.environ.get("WATI_WEBHOOK_TOKEN", "").strip()
+
 # Recent message-id dedup. Backed by a short-lived cache file in the OS
 # temp dir so the dedup set survives worker restarts within a single
 # deploy — without this, every Render worker recycle re-opens the
@@ -1468,6 +1495,75 @@ def _verify_shopify_hmac(raw_body: bytes, hmac_header: str | None) -> bool:
     except Exception as e:
         print(f"[SHOPIFY] HMAC verify error: {type(e).__name__}: {e}")
         return False
+
+
+def _webhook_verify_disabled(provider: str) -> bool:
+    """Request-time kill switch for webhook origin verification.
+
+    Reads {PROVIDER}_WEBHOOK_VERIFY_DISABLED from the environment on every
+    call (not at import) so flipping the Render env var takes effect on
+    the next worker restart with no code redeploy — same rollback pattern
+    as ESCALATION_PREFILTER_DISABLED.
+    """
+    value = (os.environ.get(f"{provider}_WEBHOOK_VERIFY_DISABLED") or "").strip().lower()
+    if value in ("1", "true", "yes"):
+        print(f"[SECURITY] {provider} webhook verification DISABLED via kill switch")
+        return True
+    return False
+
+
+def _verify_meta_signature(raw_body: bytes, sig_header: str | None) -> bool:
+    """Constant-time verification of Meta's X-Hub-Signature-256 header.
+
+    Meta computes HMAC-SHA256 of the raw request body keyed with the app
+    secret and sends "sha256=" + lowercase hex digest. Like the Shopify
+    verifier, this must run against the RAW body bytes, before any JSON
+    parsing. Fails closed: unset secret or missing header → False.
+    """
+    if _webhook_verify_disabled("INSTAGRAM"):
+        return True
+    if not INSTAGRAM_APP_SECRET or not sig_header:
+        return False
+    try:
+        computed = "sha256=" + hmac.new(
+            INSTAGRAM_APP_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(computed, sig_header.strip())
+    except Exception as e:
+        print(f"[INSTAGRAM] Signature verify error: {type(e).__name__}: {e}")
+        return False
+
+
+def _verify_telegram_secret(header_value: str | None) -> bool:
+    """Verify Telegram's X-Telegram-Bot-Api-Secret-Token header.
+
+    Telegram echoes back, verbatim, the secret_token we registered via
+    setWebhook. Constant-time compare; fails closed when the env secret
+    is unset or the header is missing. This runs BEFORE the existing
+    chat-id check, which stays as a second layer.
+    """
+    if _webhook_verify_disabled("TELEGRAM"):
+        return True
+    if not TELEGRAM_WEBHOOK_SECRET or not header_value:
+        return False
+    return hmac.compare_digest(TELEGRAM_WEBHOOK_SECRET, header_value.strip())
+
+
+def _verify_wati_token(token: str | None) -> bool:
+    """Verify the shared-secret path token on the WATI endpoints.
+
+    WATI has no webhook signing, so authenticity rests on WATI being the
+    only party that knows the full URL /webhook/<token>. Constant-time
+    compare; fails closed when the env token is unset or the request hit
+    the bare (token-less) route.
+    """
+    if _webhook_verify_disabled("WATI"):
+        return True
+    if not WATI_WEBHOOK_TOKEN or not token:
+        return False
+    return hmac.compare_digest(WATI_WEBHOOK_TOKEN, token.strip())
 
 
 def _phone_to_10digit(raw: str) -> str:
@@ -4406,17 +4502,27 @@ def draft():
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
-@app.route("/webhook", methods=["GET"])
-def webhook_verify():
+@app.route("/webhook", methods=["GET"], defaults={"token": ""})
+@app.route("/webhook/<token>", methods=["GET"])
+def webhook_verify(token=""):
     """Some platforms (and WATI's URL test) send a GET to verify the
-    webhook endpoint is reachable. Just respond 200 OK."""
+    webhook endpoint is reachable. Just respond 200 OK — the GET ping
+    carries no event data, so it stays unauthenticated."""
     print("[WEBHOOK] GET verification ping")
     return jsonify({"status": "ok"}), 200
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+@app.route("/webhook", methods=["POST"], defaults={"token": ""})
+@app.route("/webhook/<token>", methods=["POST"])
+def webhook(token=""):
     """WATI calls this when a customer sends us an inbound WhatsApp message.
+
+    Auth: shared-secret path token — WATI must be pointed at
+    /webhook/<WATI_WEBHOOK_TOKEN>. The bare /webhook and any wrong token
+    401 (exception to the always-200 rule below: legit WATI traffic
+    always carries the right token, so 401 retries only ever hit a
+    misconfigured or forged caller). Kill switch:
+    WATI_WEBHOOK_VERIFY_DISABLED=1.
 
     We ALWAYS return 200, even when nothing is processed or an internal
     error occurs — WATI retries on non-2xx responses, which would cause
@@ -4428,6 +4534,9 @@ def webhook():
       AUTO classification           →  send_whatsapp_reply(wa_id, reply)
       DRAFT+APPROVE / ESCALATE      →  send_telegram_notification(...) with sender_info
     """
+    if not _verify_wati_token(token):
+        print("[WEBHOOK] Rejected: bad or missing WATI token")
+        return jsonify({"error": "unauthorized"}), 401
     print("\n" + "=" * 60)
     try:
         # Start timer here so latency_ms covers the entire handler — the
@@ -4774,10 +4883,15 @@ def webhook():
         return jsonify({"status": "ok"}), 200
 
 
-@app.route("/wati-outbound", methods=["POST"])
-def wati_outbound():
+@app.route("/wati-outbound", methods=["POST"], defaults={"token": ""})
+@app.route("/wati-outbound/<token>", methods=["POST"])
+def wati_outbound(token=""):
     """Dedicated outbound-message webhook for WATI plans that allow
     configuring inbound and outbound URLs separately.
+
+    Auth: same shared-secret path token as /webhook — point WATI at
+    /wati-outbound/<WATI_WEBHOOK_TOKEN>. Bad/missing token → 401.
+    Kill switch: WATI_WEBHOOK_VERIFY_DISABLED=1.
 
     Treats EVERY event arriving here as outbound, regardless of payload
     shape. Use this URL in WATI Dashboard → Webhooks → Outgoing Message
@@ -4788,6 +4902,9 @@ def wati_outbound():
 
     Always returns 200 so WATI doesn't retry on internal errors.
     """
+    if not _verify_wati_token(token):
+        print("[OUTBOUND] Rejected: bad or missing WATI token")
+        return jsonify({"error": "unauthorized"}), 401
     print("\n" + "=" * 60)
     try:
         data = request.get_json(silent=True) or {}
@@ -5488,15 +5605,26 @@ def telegram_callback():
     Register with Telegram via:
       POST https://api.telegram.org/bot<TOKEN>/setWebhook
         ?url=https://glamshelf-twin.onrender.com/telegram-callback
+        &secret_token=<TELEGRAM_WEBHOOK_SECRET>
         &allowed_updates=["callback_query","message"]
 
-    Auth: only events whose chat.id matches TELEGRAM_CHAT_ID are honored
-    (see _is_authorized_telegram_chat). Unauthorized events get silently
-    dropped (callback queries are answered with "Not authorized" so the
-    button doesn't spin).
+    Auth, two layers:
+      1) X-Telegram-Bot-Api-Secret-Token header must match
+         TELEGRAM_WEBHOOK_SECRET (registered with setWebhook above) —
+         otherwise 401. Proves the POST came from Telegram's servers.
+         Kill switch: TELEGRAM_WEBHOOK_VERIFY_DISABLED=1.
+      2) Only events whose chat.id matches TELEGRAM_CHAT_ID are honored
+         (see _is_authorized_telegram_chat). Unauthorized events get
+         silently dropped (callback queries are answered with "Not
+         authorized" so the button doesn't spin).
 
     Always returns 200 so Telegram doesn't retry on internal hiccups.
     """
+    if not _verify_telegram_secret(
+        request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    ):
+        print("[TELEGRAM DRAFT] Rejected: bad or missing secret token header")
+        return jsonify({"error": "unauthorized"}), 401
     try:
         update = request.get_json(silent=True) or {}
 
@@ -5549,15 +5677,31 @@ def instagram_webhook_verify():
 def instagram_webhook():
     """Receive Instagram DM webhook events from Meta.
 
-    Always returns 200 — Meta retries on non-2xx, which would create
-    duplicate replies. Echoes (messages we sent) and non-text events
-    are silently ignored. Each text DM runs through the full twin
-    pipeline (history → brain → Claude) and the reply ships back via
-    the Graph API.
+    Auth: Meta signs every delivery — HMAC-SHA256 of the raw body keyed
+    with the app secret, sent as X-Hub-Signature-256. Bad/missing
+    signature → 401 (Meta only retries transport errors on ITS side;
+    forged posts never carry a valid signature). Kill switch:
+    INSTAGRAM_WEBHOOK_VERIFY_DISABLED=1.
+
+    Always returns 200 past the signature gate — Meta retries on
+    non-2xx, which would create duplicate replies. Echoes (messages we
+    sent) and non-text events are silently ignored. Each text DM runs
+    through the full twin pipeline (history → brain → Claude) and the
+    reply ships back via the Graph API.
     """
+    # Raw bytes first — the signature covers the exact wire body, so it
+    # must be read before any JSON parsing (same rule as Shopify HMAC).
+    raw_body = request.get_data()
+    if not _verify_meta_signature(
+        raw_body, request.headers.get("X-Hub-Signature-256")
+    ):
+        print("[INSTAGRAM] Rejected: bad or missing X-Hub-Signature-256")
+        return jsonify({"error": "unauthorized"}), 401
     print("\n" + "=" * 60)
     try:
-        data = request.get_json(silent=True) or {}
+        data = json.loads(raw_body) if raw_body else {}
+        if not isinstance(data, dict):
+            data = {}
         for entry in data.get("entry", []) or []:
             for event in entry.get("messaging", []) or []:
                 _process_instagram_event(event)
