@@ -3321,17 +3321,51 @@ def _rag_load_model() -> None:
     print("[RAG] fastembed model unavailable after retry — retrieval disabled, brain-only behavior")
 
 
+# Last sqlite-vec load failure, kept for /healthz so the real reason is
+# visible from the public probe without log-diving. None = loading works
+# (or hasn't been attempted yet). Logged once, not per connection —
+# _rag_db() runs on every retrieval and would spam the Render log stream.
+_rag_vec_load_error: str | None = None
+_rag_vec_load_error_logged = False
+
+
 def _rag_db() -> tuple:
     """Open a DB connection and try to load sqlite-vec into it.
     Returns (conn, vec_loaded)."""
+    global _rag_vec_load_error, _rag_vec_load_error_logged
     conn = sqlite3.connect(DB_PATH)
     try:
         import sqlite_vec
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
+        _rag_vec_load_error = None
         return conn, True
-    except Exception:
+    except Exception as e:
+        # Classify the two known failure families so the log line already
+        # points at the fix instead of just naming an exception:
+        #   AttributeError            -> this CPython build has loadable-
+        #                                extension support compiled out
+        #                                (no enable_load_extension at all)
+        #   ImportError               -> sqlite-vec package not installed
+        #   OperationalError / OSError -> the bundled vec0 binary exists but
+        #                                won't load on this OS/arch/libc
+        if isinstance(e, AttributeError):
+            hint = "CPython built without loadable-extension support"
+        elif isinstance(e, ImportError):
+            hint = "sqlite-vec package not installed"
+        elif isinstance(e, (sqlite3.OperationalError, OSError)):
+            hint = "vec0 binary incompatible with this platform"
+        else:
+            hint = "unrecognized failure"
+        _rag_vec_load_error = f"{type(e).__name__}: {e} [{hint}]"
+        if not _rag_vec_load_error_logged:
+            _rag_vec_load_error_logged = True
+            print(
+                f"[RAG] sqlite-vec load FAILED — numpy brute-force fallback active "
+                f"(python {sys.version.split()[0]}, sqlite {sqlite3.sqlite_version}): "
+                f"{_rag_vec_load_error}"
+            )
         return conn, False
 
 
@@ -4167,6 +4201,16 @@ def home():
     return render_template("index.html")
 
 
+def _healthz_sqlite_vec_status() -> dict:
+    """Probe sqlite-vec loading for /healthz. Never raises."""
+    try:
+        conn, vec_loaded = _rag_db()
+        conn.close()
+        return {"loaded": vec_loaded, "error": _rag_vec_load_error}
+    except Exception as e:
+        return {"loaded": False, "error": f"probe failed: {type(e).__name__}: {e}"}
+
+
 @app.route("/healthz")
 def healthz():
     """Liveness probe. Render can ping this to confirm the deploy works.
@@ -4194,6 +4238,11 @@ def healthz():
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
         "claude_vision_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
         "db": db_status,
+        # Live sqlite-vec probe: loads the extension on a fresh connection
+        # right now, so this reflects the current runtime, not a cached
+        # boot-time result. error carries the classified failure reason
+        # when loaded=false (see _rag_db); null while loading works.
+        "sqlite_vec": _healthz_sqlite_vec_status(),
         "total_logged": total_logged,
         "total_orders": total_orders,
         "total_instagram": total_instagram,
