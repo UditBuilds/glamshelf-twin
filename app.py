@@ -1519,21 +1519,42 @@ def _verify_meta_signature(raw_body: bytes, sig_header: str | None) -> bool:
     secret and sends "sha256=" + lowercase hex digest. Like the Shopify
     verifier, this must run against the RAW body bytes, before any JSON
     parsing. Fails closed: unset secret or missing header → False.
+
+    SIG-DIAG forensics (added during the July 12 incident where real
+    Meta deliveries 401'd): whenever the kill switch is on OR the check
+    fails, log one line with the verdict, header prefix (or "missing"),
+    computed-digest prefix, and body length. With the kill switch on
+    this runs verification in shadow mode against REAL Meta traffic —
+    the "match=True" line on a live delivery is the proof required
+    before re-enabling enforcement. Digest prefixes are not secrets
+    (the signature rides the wire with every delivery); the app secret
+    itself is never logged.
     """
-    if _webhook_verify_disabled("INSTAGRAM"):
-        return True
-    if not INSTAGRAM_APP_SECRET or not sig_header:
-        return False
+    bypass = _webhook_verify_disabled("INSTAGRAM")
     try:
-        computed = "sha256=" + hmac.new(
-            INSTAGRAM_APP_SECRET.encode("utf-8"),
-            raw_body,
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(computed, sig_header.strip())
+        received = (sig_header or "").strip()
+        computed = ""
+        if INSTAGRAM_APP_SECRET:
+            computed = "sha256=" + hmac.new(
+                INSTAGRAM_APP_SECRET.encode("utf-8"),
+                raw_body,
+                hashlib.sha256,
+            ).hexdigest()
+        match = bool(computed) and bool(received) and hmac.compare_digest(
+            computed, received
+        )
+        if bypass or not match:
+            print(
+                f"[INSTAGRAM] SIG-DIAG {'(bypass)' if bypass else '(enforcing)'}: "
+                f"match={match} secret_set={bool(INSTAGRAM_APP_SECRET)} "
+                f"header={received[:23] + '…' if received else 'MISSING'} "
+                f"computed={computed[:23] + '…' if computed else 'n/a'} "
+                f"body_len={len(raw_body)}"
+            )
+        return True if bypass else match
     except Exception as e:
         print(f"[INSTAGRAM] Signature verify error: {type(e).__name__}: {e}")
-        return False
+        return True if bypass else False
 
 
 def _verify_telegram_secret(header_value: str | None) -> bool:
