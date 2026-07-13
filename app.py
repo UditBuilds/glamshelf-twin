@@ -1784,6 +1784,130 @@ def _was_shipping_sent(order_id: str, message_type: str) -> bool:
         return False
 
 
+# Shipping-send retry policy (security-review Issue 3). Previously every
+# shipping dispatch site marked the dedup key unconditionally, so one
+# transient WATI failure permanently suppressed that customer's update.
+# Now the key is written ONLY on confirmed success, with a bounded
+# Timer-based retry for transient failures. Attempt 1 is inline (inside
+# the webhook request); attempts 2 and 3 fire from daemon Timers after
+# the delays below. Pending Timers die on a Render restart — accepted:
+# the dedup key was never written, so any later webhook for the order
+# retries naturally (fails open to retry, never to permanent silence).
+# Rollback: SHIPPING_RETRY_DISABLED=1 restores the old send-once /
+# mark-always behavior without a redeploy.
+SHIPPING_SEND_MAX_ATTEMPTS = 3
+SHIPPING_SEND_RETRY_DELAYS = (60, 300)  # seconds before attempts 2 and 3
+
+
+def _shipping_retry_disabled() -> bool:
+    """Request-time kill switch, same pattern as the webhook-verify and
+    escalation-prefilter switches."""
+    value = (os.environ.get("SHIPPING_RETRY_DISABLED") or "").strip().lower()
+    if value in ("1", "true", "yes"):
+        print("[SHIPPING-RETRY] Disabled via kill switch — legacy mark-always behavior")
+        return True
+    return False
+
+
+def _send_shipping_with_retry(
+    wa_id: str,
+    message: str,
+    order_id: str,
+    message_type: str,
+    order_number: str,
+    attempt: int = 1,
+    also_mark: tuple = (),
+) -> bool:
+    """Send a shipping session message and mark the dedup key ONLY on
+    confirmed success.
+
+    Returns True when this attempt delivered (and marked), False when it
+    failed — in which case a retry Timer is already scheduled, or the
+    exhaustion alert has fired. `also_mark` lists extra dedup keys to
+    write alongside message_type on success (the "shipped" message embeds
+    the tracking line, so its success must also suppress the separate
+    tracking follow-up).
+
+    Never raises — Timer callbacks run on daemon threads where an
+    exception would only kill the retry chain silently.
+    """
+    try:
+        if _shipping_retry_disabled():
+            # Legacy behavior, verbatim: one send, mark regardless.
+            send_whatsapp_reply(wa_id, message)
+            _mark_shipping_sent(order_id, message_type, phone=wa_id, order_number=order_number)
+            for extra in also_mark:
+                _mark_shipping_sent(order_id, extra, phone=wa_id, order_number=order_number)
+            return True
+
+        # Re-check dedup on retries: a duplicate webhook may have raced a
+        # pending Timer and already delivered this update.
+        if attempt > 1 and _was_shipping_sent(order_id, message_type):
+            print(
+                f"[SHIPPING-RETRY] Order #{order_number} {message_type!r} already "
+                f"marked sent — skipping retry attempt {attempt}"
+            )
+            return True
+
+        sent, send_err = send_whatsapp_reply(wa_id, message)
+        if sent:
+            _mark_shipping_sent(order_id, message_type, phone=wa_id, order_number=order_number)
+            for extra in also_mark:
+                _mark_shipping_sent(order_id, extra, phone=wa_id, order_number=order_number)
+            if attempt > 1:
+                print(
+                    f"[SHIPPING-RETRY] Order #{order_number} {message_type!r} "
+                    f"delivered on retry attempt {attempt}"
+                )
+            return True
+
+        if attempt < SHIPPING_SEND_MAX_ATTEMPTS:
+            delay = SHIPPING_SEND_RETRY_DELAYS[attempt - 1]
+            print(
+                f"[SHIPPING-RETRY] Order #{order_number} {message_type!r} send failed "
+                f"(attempt {attempt}/{SHIPPING_SEND_MAX_ATTEMPTS}): {send_err} — "
+                f"retrying in {delay}s"
+            )
+            t = threading.Timer(
+                delay,
+                _send_shipping_with_retry,
+                args=(wa_id, message, order_id, message_type, order_number,
+                      attempt + 1, also_mark),
+            )
+            t.daemon = True
+            t.start()
+        else:
+            print(
+                f"[SHIPPING-RETRY] Order #{order_number} {message_type!r} send failed "
+                f"on final attempt {attempt}/{SHIPPING_SEND_MAX_ATTEMPTS}: {send_err} — "
+                f"giving up, alerting founder"
+            )
+            # Distinct exhaustion alert (the per-failure rate-limited alert
+            # already fired inside send_whatsapp_reply on every attempt).
+            # Dedup key stays unwritten so a manual resend or a later
+            # webhook can still deliver.
+            try:
+                _telegram_api("sendMessage", {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": (
+                        f"⚠️ Shipping update FAILED for order #{order_number}\n"
+                        f"Type: {message_type} → {wa_id}\n"
+                        f"{SHIPPING_SEND_MAX_ATTEMPTS} attempts exhausted. "
+                        f"Last error: {send_err}\n"
+                        f"Please send the update manually from WATI."
+                    ),
+                })
+            except Exception as tg_err:
+                print(f"[SHIPPING-RETRY] Exhaustion alert failed: {type(tg_err).__name__}: {tg_err}")
+        return False
+    except Exception as e:
+        print(
+            f"[SHIPPING-RETRY] Unexpected error for order #{order_number} "
+            f"{message_type!r} attempt {attempt}: {type(e).__name__}: {e}"
+        )
+        return False
+
+
 # Send-failure Telegram alerting. When an outbound customer send fails
 # (Instagram Graph API or WATI), Udit gets a Telegram alert so an outage
 # like an expired IG token is noticed in minutes, not hours (the July 8
@@ -5287,12 +5411,14 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
                 f"Track your order: https://shiprocket.in/tracking/{tracking_number}\n\n"
                 f"Feel free to reach out if you need anything!"
             )
-            sent, send_err = send_whatsapp_reply(wa_id, tracking_message)
-            _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
-            if sent:
+            # Dedup key is written inside the helper, ONLY on confirmed
+            # success — a transient WATI failure no longer suppresses the
+            # tracking link forever (Issue 3). Retries are scheduled in
+            # the background; failure details are logged by the helper.
+            if _send_shipping_with_retry(
+                wa_id, tracking_message, order_id, "tracking", order_number
+            ):
                 print(f"[SHIPPING] Sent tracking link for order #{order_number} to {wa_id}")
-            else:
-                print(f"[SHIPPING] Tracking link send FAILED for order #{order_number} to {wa_id}: {send_err}")
 
     # ----- STATUS MESSAGE -----
     if pre_shipment_silent:
@@ -5403,37 +5529,46 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
     else:
         return  # Unreachable, but defensive.
 
-    # Send the session message UNLESS the template path already sent it.
-    # send_whatsapp_reply handles WATI failures internally and never raises;
-    # it also pre-registers the outbound text in _bot_recent_replies so the
-    # subsequent WATI outbound webhook echo doesn't get mis-tagged as
-    # HUMAN_UDIT.
-    if not template_sent:
+    # Dispatch + dedup marking (Issue 3: mark ONLY on confirmed success).
+    #
+    # Template path: send_whatsapp_template already returned its own
+    # confirmation above, so a successful template marks immediately.
+    # Session path (fallback or non-shipped events) goes through the
+    # retry helper — the dedup key is written inside it on success, and
+    # transient failures get bounded background retries instead of
+    # permanent suppression. If the shipped message embeds the tracking
+    # line, the tracking dedup key rides along (also_mark) so a later
+    # fulfillments/update doesn't fire a redundant follow-up.
+    extra_marks = ("tracking",) if (event == "shipped" and tracking_number) else ()
+    if template_sent:
+        _mark_shipping_sent(order_id, event, phone=wa_id, order_number=order_number)
+        for extra in extra_marks:
+            _mark_shipping_sent(order_id, extra, phone=wa_id, order_number=order_number)
+        delivered_now = True
+    else:
         if message is None:
             return  # Defensive — should never happen given the branches above.
-        send_whatsapp_reply(wa_id, message)
+        delivered_now = _send_shipping_with_retry(
+            wa_id, message, order_id, event, order_number,
+            also_mark=extra_marks,
+        )
 
-    _mark_shipping_sent(order_id, event, phone=wa_id, order_number=order_number)
-
-    # If the shipped message embedded the tracking line, also mark the
-    # tracking dedup so a later fulfillments/update with the same
-    # tracking number doesn't fire a redundant "Here's your tracking
-    # link" follow-up. Only relevant for the "shipped" event — the
-    # out_for_delivery / delivered templates don't embed tracking.
-    if event == "shipped" and tracking_number:
-        _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
-
-    print(
-        f"[SHIPPING] Sent {event!r} update for order #{order_number} "
-        f"to {wa_id} (name={first_name or '(none)'})"
-    )
+    if delivered_now:
+        print(
+            f"[SHIPPING] Sent {event!r} update for order #{order_number} "
+            f"to {wa_id} (name={first_name or '(none)'})"
+        )
 
     # Post-delivery hook: when an order is marked delivered, schedule a
     # review-request WhatsApp for REVIEW_DELAY_SECONDS later. The
     # scheduler dedupes by order_id so retried "delivered" webhooks only
     # schedule once. Failure here never blocks the shipping confirmation
     # already sent above — _schedule_review_request swallows everything.
-    if event == "delivered":
+    # Gated on delivered_now: if the delivered message itself failed to
+    # send, asking for a review would be nonsense (review nudges are
+    # nice-to-have; skipping them on background-retry deliveries is the
+    # accepted tradeoff).
+    if event == "delivered" and delivered_now:
         try:
             _schedule_review_request(
                 order_id=order_id,
@@ -5608,7 +5743,17 @@ def _process_order_update(payload: dict) -> None:
         else:
             print(f"[ORDER-UPDATE] Template failed, falling back to session message")
 
-    if not template_sent:
+    # Same Issue 3 rule as _process_shipping_event: dedup keys are written
+    # ONLY on confirmed success. Template success marks immediately; the
+    # session fallback goes through the retry helper (which marks inside,
+    # schedules bounded retries on transient failure, and alerts on
+    # exhaustion). The tracking key rides along when tracking is embedded.
+    extra_marks = ("tracking",) if tracking_number else ()
+    if template_sent:
+        _mark_shipping_sent(order_id, "shipped", phone=wa_id, order_number=order_number)
+        for extra in extra_marks:
+            _mark_shipping_sent(order_id, extra, phone=wa_id, order_number=order_number)
+    else:
         lines = [
             f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
             f"has been shipped 🤍",
@@ -5620,14 +5765,10 @@ def _process_order_update(payload: dict) -> None:
             lines.append(f"Carrier: {tracking_company}")
         lines.append("")
         lines.append("Feel free to reach out if you need anything!")
-        send_whatsapp_reply(wa_id, "\n".join(lines))
-
-    _mark_shipping_sent(order_id, "shipped", phone=wa_id, order_number=order_number)
-    # Same convention as _process_shipping_event: if we embedded tracking
-    # in this shipped message, mark tracking dedup so a later
-    # fulfillments/update doesn't fire a redundant follow-up.
-    if tracking_number:
-        _mark_shipping_sent(order_id, "tracking", phone=wa_id, order_number=order_number)
+        _send_shipping_with_retry(
+            wa_id, "\n".join(lines), order_id, "shipped", order_number,
+            also_mark=extra_marks,
+        )
 
 
 @app.route("/shopify-order-update", methods=["POST"])
