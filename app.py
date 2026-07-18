@@ -1410,7 +1410,8 @@ def _load_wati_history(wa_id: str, max_turns: int = 30, max_age_days: int = 7) -
                       differs), so the raw DRAFT row can't be trusted as
                       "what the customer saw". Its delivery, when it happens,
                       is recorded separately as DRAFT_SENT.
-      - AUTO_FAILED / DRAFT_SEND_FAILED : the send was attempted but WATI
+      - AUTO_FAILED / DRAFT_SEND_FAILED / ESCALATE_HOLDING_FAILED : the
+                      send was attempted but WATI
                       did not confirm delivery — the customer never saw
                       this text, so replaying it as an assistant turn would
                       make the twin reference a reply that never arrived.
@@ -2144,7 +2145,8 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
               AND message_text != ''
               AND reply_text IS NOT NULL
               AND (source IS NULL
-                   OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG'))
+                   OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG',
+                                     'ESCALATE_HOLDING_FAILED_IG'))
               AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
             LIMIT 30
@@ -2334,8 +2336,15 @@ def send_telegram_notification(
     sender_info: str | None = None,
     channel: str = "WhatsApp",
     customer_id: str | None = None,
+    holding_reply_sent: bool = False,
 ) -> None:
     """Fire a Telegram message to the founder for DRAFT+APPROVE and ESCALATE.
+
+    `holding_reply_sent` (default False keeps every existing message
+    byte-identical): True means the fallback-escalation path already
+    delivered a stock holding reply to the customer, so the ESCALATE
+    wording must say so instead of the misleading "No reply sent /
+    Do NOT send" footer.
 
     AUTO classifications send nothing (the reply was safe to send as-is and
     Udit doesn't need to be paged about it).
@@ -2393,12 +2402,21 @@ def send_telegram_notification(
             f"→ Review and send manually from {approve_destination}."
         )
     elif classification == "ESCALATE":
+        if holding_reply_sent:
+            reply_label = "Holding reply SENT to the customer:"
+            escalate_action = (
+                "→ The drafted reply was unusable, so the stock holding "
+                "reply above was already sent. Take over the conversation "
+                "directly."
+            )
+        else:
+            reply_label = "Suggested holding reply:"
         text = (
             "🔴 ESCALATE — Take over directly\n\n"
             f"{sender_block}"
             "Customer said:\n"
             f'"{customer_message}"\n\n'
-            "Suggested holding reply:\n"
+            f"{reply_label}\n"
             f'"{reply}"\n\n'
             f"{escalate_action}"
         )
@@ -3986,6 +4004,20 @@ _ESCALATION_PREFILTER_PATTERNS = re.compile(
 )
 
 
+# Stock customer-facing holding reply used ONLY when an escalation verdict
+# exists but there's no usable LLM-drafted reply (JSON parse failure, empty
+# reply field, or the LLM call itself failing after a prefilter hit). The
+# rule (founder-decided, July 17 2026): an escalation verdict must survive
+# regardless of what happens downstream — the empty-reply gate must never
+# silently drop an ESCALATE. In that fallback case this text is actually
+# SENT to the customer (unlike a normal ESCALATE, where the drafted holding
+# reply is only *suggested* to the founder on Telegram and nothing is sent).
+ESCALATE_FALLBACK_HOLDING_REPLY = (
+    "I hear you, and I want this handled properly — I'm bringing it straight to "
+    "the GlamShelf team, who'll reach out to you personally within the next few hours."
+)
+
+
 def _escalation_prefilter_hit(message: str) -> str | None:
     """Return the matched high-risk phrase, or None.
 
@@ -4967,14 +4999,43 @@ def webhook(token=""):
         order_line = _lookup_recent_order(wa_id)
 
         # Run the twin.
-        classification, reply, _raw = draft_reply_logic(text_body, order_line, history=history)
+        try:
+            classification, reply, _raw = draft_reply_logic(text_body, order_line, history=history)
+        except Exception as e:
+            print(f"[WEBHOOK] Twin pipeline failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            # A pipeline crash must not swallow a deterministic escalation
+            # verdict (July 17 decision) — re-run the pure-text prefilters;
+            # a hit falls through to the fallback-escalation path below.
+            # Anything else re-raises into the outer catch-all so the
+            # existing ERROR logging + 200 response are unchanged.
+            if (
+                _escalation_prefilter_hit(text_body)
+                or _bulk_commit_prefilter_hit(text_body) is not None
+            ):
+                classification, reply = "ESCALATE", ""
+            else:
+                raise
 
+        # The empty-reply gate must never swallow an ESCALATE verdict
+        # (prefilter-forced or LLM-decided): substitute the stock holding
+        # reply and dispatch. Everything else with unusable output still
+        # drops silently, as before.
+        fallback_escalation = False
         if not classification or not reply:
-            print(
-                f"[WEBHOOK] Twin returned empty result "
-                f"(classification={classification!r}, reply_len={len(reply)}). Skipping dispatch."
-            )
-            return jsonify({"status": "ok"}), 200
+            if classification == "ESCALATE":
+                print(
+                    "[ESCALATE] Verdict with no usable reply — dispatching "
+                    "fallback holding reply instead of dropping"
+                )
+                reply = ESCALATE_FALLBACK_HOLDING_REPLY
+                fallback_escalation = True
+            else:
+                print(
+                    f"[WEBHOOK] Twin returned empty result "
+                    f"(classification={classification!r}, reply_len={len(reply)}). Skipping dispatch."
+                )
+                return jsonify({"status": "ok"}), 200
 
         sender_info = f"{sender_name} ({wa_id})" if sender_name else wa_id
 
@@ -5026,9 +5087,23 @@ def webhook(token=""):
                 status="DRAFT", reply_text=reply, latency_ms=elapsed_ms,
             )
         elif classification == "ESCALATE":
+            # Fallback path only (escalation verdict with unusable LLM
+            # output): the stock holding reply ships to the customer
+            # FIRST, so the thread never goes silent on a legal threat.
+            # Normal escalations still send nothing — the founder takes
+            # over directly.
+            holding_sent = False
+            holding_err = ""
+            if fallback_escalation:
+                holding_sent, holding_err = send_whatsapp_reply(wa_id, reply)
+                if holding_sent:
+                    print(f"[ESCALATE] Fallback holding reply sent to {wa_id}")
+                else:
+                    print(f"[ESCALATE] Fallback holding reply FAILED to {wa_id}: {holding_err}")
             send_telegram_notification(
                 classification, text_body, reply,
                 sender_info=sender_info, customer_id=wa_id,
+                holding_reply_sent=holding_sent,
             )
             print(f"[ESCALATE] Notified founder for {wa_id}")
             # Auto-pause this number for 4h so subsequent messages from
@@ -5046,10 +5121,19 @@ def webhook(token=""):
             # the 4h pause above is what keeps the twin quiet meanwhile.
             _reassign_to_bot(wa_id)
             elapsed_ms = int((time.time() - t_start) * 1000)
-            _log_message(
-                wa_id, sender_name, text_body,
-                status="ESCALATE", reply_text=reply, latency_ms=elapsed_ms,
-            )
+            if fallback_escalation and not holding_sent:
+                # Attempted-but-unconfirmed holding send: status outside
+                # _load_wati_history's delivered-only allowlist, error kept.
+                _log_message(
+                    wa_id, sender_name, text_body,
+                    status="ESCALATE_HOLDING_FAILED", reply_text=reply,
+                    latency_ms=elapsed_ms, error=holding_err,
+                )
+            else:
+                _log_message(
+                    wa_id, sender_name, text_body,
+                    status="ESCALATE", reply_text=reply, latency_ms=elapsed_ms,
+                )
         else:
             print(f"[WEBHOOK] Unknown classification {classification!r} — no dispatch")
 
@@ -6035,14 +6119,38 @@ def _process_instagram_event(event: dict) -> None:
         except Exception as e:
             print(f"[INSTAGRAM] Twin pipeline failed: {type(e).__name__}: {e}")
             traceback.print_exc()
-            return
+            # Even a pipeline crash must not swallow a deterministic
+            # escalation verdict (July 17 decision: the verdict survives
+            # regardless of what happens downstream). The prefilters are
+            # pure text checks, so re-run them here; a hit falls through
+            # to the fallback-escalation path below with an empty reply.
+            if (
+                _escalation_prefilter_hit(text)
+                or _bulk_commit_prefilter_hit(text) is not None
+            ):
+                classification, reply = "ESCALATE", ""
+            else:
+                return
 
+        # The empty-reply gate must never swallow an ESCALATE verdict
+        # (prefilter-forced or LLM-decided): substitute the stock holding
+        # reply and dispatch. Everything else with unusable output still
+        # drops silently, as before.
+        fallback_escalation = False
         if not classification or not reply:
-            print(
-                f"[INSTAGRAM] Twin returned empty result "
-                f"(classification={classification!r}, reply_len={len(reply)}); not sending"
-            )
-            return
+            if classification == "ESCALATE":
+                print(
+                    "[ESCALATE] Verdict with no usable reply — dispatching "
+                    "fallback holding reply instead of dropping"
+                )
+                reply = ESCALATE_FALLBACK_HOLDING_REPLY
+                fallback_escalation = True
+            else:
+                print(
+                    f"[INSTAGRAM] Twin returned empty result "
+                    f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                )
+                return
 
         ig_sender_info = f"Instagram DM — sender {sender_id}"
 
@@ -6102,17 +6210,30 @@ def _process_instagram_event(event: dict) -> None:
             print(f"[INSTAGRAM-DRAFT] Notified founder for {sender_id} (buttons={sent_with_buttons})")
 
         elif classification == "ESCALATE":
-            # No customer-facing reply — same as WhatsApp. The founder
-            # takes over directly; the notification carries the 🛑 Stop
-            # button (customer_id) and the 4h auto-pause keeps the twin
-            # quiet on this thread meanwhile. Wrapped in its own try so a
-            # Telegram outage doesn't take down the IG flow.
+            # Normal ESCALATE sends nothing to the customer — the founder
+            # takes over directly. The FALLBACK path (escalation verdict
+            # with unusable LLM output) is the one exception: the stock
+            # holding reply ships to the customer first, so a legal threat
+            # never gets silence just because the model's JSON broke.
+            # The notification carries the 🛑 Stop button (customer_id)
+            # and the 4h auto-pause keeps the twin quiet on this thread
+            # meanwhile. Wrapped in its own try so a Telegram outage
+            # doesn't take down the IG flow.
+            holding_sent = False
+            holding_err = ""
+            if fallback_escalation:
+                holding_sent, holding_err = _send_instagram_reply(sender_id, reply)
+                if holding_sent:
+                    print(f"[ESCALATE] Fallback holding reply sent to {sender_id}")
+                else:
+                    print(f"[ESCALATE] Fallback holding reply FAILED to {sender_id}: {holding_err}")
             try:
                 send_telegram_notification(
                     classification, text, reply,
                     sender_info=ig_sender_info,
                     channel="Instagram",
                     customer_id=sender_id,
+                    holding_reply_sent=holding_sent,
                 )
                 print(f"[INSTAGRAM-ESCALATE] Notified founder for {sender_id}")
             except Exception as tg_err:
@@ -6121,10 +6242,20 @@ def _process_instagram_event(event: dict) -> None:
                     f"{type(tg_err).__name__}: {tg_err}"
                 )
             _pause_number(sender_id)
-            # NULL reply keeps this row out of _load_instagram_history —
-            # the customer never received anything for this message.
-            _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
-            print(f"[ESCALATE] Auto-paused {sender_id} for 4h — no reply sent")
+            if fallback_escalation and holding_sent:
+                # Delivered text — belongs in conversation history, so it
+                # gets a source _load_instagram_history does NOT exclude.
+                _log_instagram(sender_id, text, reply, timestamp, source="ESCALATE_HOLDING_IG")
+            elif fallback_escalation:
+                # Attempted-but-unconfirmed send: keep the text for audit
+                # under a source the history loader excludes (the customer
+                # never saw it).
+                _log_instagram(sender_id, text, reply, timestamp, source="ESCALATE_HOLDING_FAILED_IG")
+            else:
+                # NULL reply keeps this row out of _load_instagram_history —
+                # the customer never received anything for this message.
+                _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
+            print(f"[ESCALATE] Auto-paused {sender_id} for 4h")
 
         else:
             print(f"[INSTAGRAM] Unknown classification {classification!r} — no dispatch")
