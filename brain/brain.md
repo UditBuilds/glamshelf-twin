@@ -453,7 +453,10 @@ Bridal/engagement-specific reply:
 > "Yes, our entire range is 100% cruelty-free and vegan — all synthetic fibers, no animal hair, no mink, and no testing 🤍"
 
 **GS1 vs GS2:**
-> "GS1 is soft, natural, and everyday — perfect for receptions, engagements, light bridal, and daily wear. GS2 is bolder, fuller, and bridal-ready — what MUAs typically choose for wedding-day and event makeup, with a slightly thicker band built for professional-grade hold and longer wear 🤍"
+
+**BAND THICKNESS — FACT (never contradict this):** GS2 uses a thicker band than GS1, built for stronger hold — ideal for bridal and event wear. GS1's band is thinner, for a lighter everyday feel. The two trays do NOT share the same band. Never tell a customer the bands are the same, identical, or that there is "no difference in thickness" between GS1 and GS2.
+
+> "GS1 is soft, natural, and everyday — perfect for receptions, engagements, light bridal, and daily wear. GS2 is bolder, fuller, and bridal-ready — what MUAs typically choose for wedding-day and event makeup, with a thicker band built for professional-grade hold and longer wear 🤍"
 
 **Heaviness concern:**
 > "Completely understand the concern. Ours are called Luxe Light for a reason — the bands are designed to feel weightless on the eye. GS1 is our lightest, most natural-feel option; GS2 has a slightly fuller band for hold and all-day wear, but it's still comfortable — the heaviness people dislike typically comes from cheap thick bands, not ours 🤍"
