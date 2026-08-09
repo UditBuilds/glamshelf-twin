@@ -132,7 +132,9 @@ THEN extract the relevant fields based on image_type:
 
 For order_screenshot: order_id, payment_status, amount, product, customer_name, date.
 For eye_photo: eye_shape (one of: "hooded", "monolid", "almond", "round", "downturned", or null if unclear).
-For product_photo / other: leave extraction fields null.
+For product_photo: product — the lash style / product name if you can identify it (ours or a
+competitor's), else null. Leave the order fields null.
+For other: leave extraction fields null.
 
 Respond ONLY in this JSON format (always include every key — use null when not applicable):
 {
@@ -146,7 +148,11 @@ Respond ONLY in this JSON format (always include every key — use null when not
   "confidence": "high" or "low"
 }
 
-Use confidence "high" only when you're genuinely sure about image_type AND have at least one useful extraction. If unsure or the image is too blurry/dark to read, return image_type as your best guess but set confidence to "low" and leave extraction fields null."""
+Confidence is about image_type, NOT about how much you managed to extract. Use "high" whenever you're
+genuinely sure what kind of image this is — a clear photo of lashes is high confidence even if you can't
+name the product, and a clear eye close-up is high confidence even if the eye shape is unreadable. Set
+"low" only when the image is too blurry/dark to make out or you genuinely can't tell which category it
+falls into; then return your best guess for image_type and leave extraction fields null."""
 
 # Deterministic reply used when vision can't make sense of the image
 # (low confidence, download failure, or no image URL in payload).
@@ -158,6 +164,80 @@ Use confidence "high" only when you're genuinely sure about image_type AND have 
 FALLBACK_VISION_REPLY = (
     "Thanks for sharing! Could you tell me a little more about what you're looking for? 🤍"
 )
+
+# Deterministic reply for a confidently-identified PRODUCT photo that we
+# can't name and that arrived with no caption. Before this branch existed,
+# such images fell into the generic "high confidence, no order_id" path and
+# were framed to the twin as "I just sent a screenshot of my order — no
+# specific details visible", which produced order-support replies to a
+# customer who was actually shopping (July 31 incident, wa_id …1290).
+# Acknowledges the photo instead of asking for one.
+PRODUCT_PHOTO_REPLY = (
+    "Got your photo! 🤍 Could you tell me which style you're after, or where you "
+    "spotted it, so I can help you order the right one?"
+)
+
+# ----- Short-lived vision context memory (cross-event bridge) -----
+#
+# WhatsApp customers routinely send a photo and THEN type what they want,
+# a few seconds later. WATI delivers those as two independent webhook
+# events, so the text event knows nothing about the image that preceded
+# it — that's how the July 31 thread ended with the twin asking a customer
+# to share a photo she had already sent 3 seconds earlier.
+#
+# _load_wati_history can't cover the gap: the image event's row is only
+# written AFTER its own reply is dispatched, so a follow-up arriving mid
+# vision+LLM round trip reads history that doesn't contain the image turn
+# yet. Hence this register — written at the end of every image event, read
+# by the next text event from the same wa_id inside the TTL.
+#
+# In memory on purpose: a DB column for this is deliberately deferred, and
+# the whole window is 90 seconds, so losing it on a restart costs at most
+# one turn of context. `gunicorn app:app` runs a single worker, so both
+# events land in this process.
+VISION_CONTEXT_TTL_SECONDS = 90
+_recent_vision_context: dict[str, tuple[float, str]] = {}
+
+
+def _remember_vision_context(wa_id: str, summary: str) -> None:
+    """Record what vision just saw for `wa_id`, for the next text event.
+
+    Overwrites any previous entry (the newest photo is the relevant one)
+    and opportunistically prunes expired entries so the dict stays bounded
+    without a cleanup job. Never raises.
+    """
+    if not wa_id or not summary:
+        return
+    now = time.time()
+    for stale in [
+        k for k, (ts, _) in _recent_vision_context.items()
+        if now - ts > VISION_CONTEXT_TTL_SECONDS
+    ]:
+        _recent_vision_context.pop(stale, None)
+    _recent_vision_context[wa_id] = (now, summary)
+    print(f"[VISION-CTX] Stored {VISION_CONTEXT_TTL_SECONDS}s context for {wa_id}: {summary!r}")
+
+
+def _recall_vision_context(wa_id: str) -> str:
+    """Return the vision summary for `wa_id` if one was stored within the
+    TTL, else "". Expired entries are dropped on read.
+
+    NOT consumed on read — a customer often sends two short texts after a
+    photo ("this one" / "how much?"), and both need the same context. The
+    TTL is what ends it.
+    """
+    if not wa_id:
+        return ""
+    entry = _recent_vision_context.get(wa_id)
+    if not entry:
+        return ""
+    ts, summary = entry
+    age = time.time() - ts
+    if age > VISION_CONTEXT_TTL_SECONDS:
+        _recent_vision_context.pop(wa_id, None)
+        return ""
+    print(f"[VISION-CTX] Recalled context for {wa_id} ({age:.1f}s old): {summary!r}")
+    return summary
 
 # Telegram notification config. Set both on Render → Environment.
 # No default for TELEGRAM_BOT_TOKEN — a previous default value was the live
@@ -4304,6 +4384,37 @@ def _extract_wati_image_url(data: dict) -> str:
     return found[0] if found else ""
 
 
+def _extract_wati_caption(data: dict) -> str:
+    """Return the caption a customer typed onto an image, or "".
+
+    WATI's documented messageReceived schema has NO dedicated caption
+    field: `text` is "the actual text content of the message" and `data`
+    is "additional data payload for non-text message types". So when a
+    caption does ride along with an image, it arrives in the top-level
+    `text` field the handler already parses — which is exactly why the
+    vision branch's `text_body = ...` assignments were destructive rather
+    than merely incomplete.
+
+    This function covers the remaining possibility: some WATI plans nest
+    media metadata under `data` / `media` / `image` (the same containers
+    _extract_wati_image_url probes for the URL), and a caption could sit
+    beside the URL there. Probed defensively, cheap, and returns "" when
+    absent — nothing downstream depends on finding one.
+    """
+    direct = data.get("caption")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    for key in ("data", "media", "image"):
+        sub = data.get(key)
+        if isinstance(sub, dict):
+            for inner in ("caption", "text", "body"):
+                val = sub.get(inner)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return ""
+
+
 def _extract_image_info(image_url: str) -> dict | None:
     """Download a WATI media image and extract order info via Claude Vision.
 
@@ -4885,15 +4996,29 @@ def webhook(token=""):
             return jsonify({"status": "human_handling"}), 200
 
         # ----- VISION BRANCH -----
-        # For image events: download + extract via Claude Vision. Three outcomes:
-        #   (a) high confidence + order_id found → synthesize a text query
-        #       (e.g. "My order ID is #1042") and fall through to the
-        #       normal text Claude pipeline below
-        #   (b) high confidence but no order_id → synthesize a context-rich
-        #       message ("I sent a screenshot — product: GS1, amount ₹849…")
-        #       and fall through to the normal pipeline
-        #   (c) low confidence / failure / no URL → send the deterministic
-        #       FALLBACK_VISION_REPLY directly via WATI and return
+        # For image events: download + extract via Claude Vision. Outcomes:
+        #   (a-eye)     high confidence eye photo → synthesize a lash
+        #               recommendation query and fall through
+        #   (a-order)   high confidence + order_id found → synthesize a text
+        #               query ("My order ID is #1042") and fall through
+        #   (a-product) high confidence product photo → fall through when we
+        #               can name the product or the customer captioned it,
+        #               otherwise send PRODUCT_PHOTO_REPLY and return
+        #   (b)         high confidence order screenshot with no order_id →
+        #               synthesize whatever context we have and fall through
+        #   (c)         low confidence / "other" / failure / no URL → send the
+        #               deterministic FALLBACK_VISION_REPLY directly and return,
+        #               unless the customer captioned the photo, in which case
+        #               their caption is answered by the normal pipeline
+        #
+        # Any caption the customer typed onto the image (WATI delivers it in
+        # the top-level `text` field) is APPENDED to the synthesized text on
+        # every fall-through path — the branches used to overwrite it.
+        #
+        # Every outcome ends by storing a short-lived vision summary for this
+        # wa_id (_remember_vision_context) so the customer's NEXT text event —
+        # typically "I want this one", seconds later, as its own webhook —
+        # is answered knowing a photo already arrived.
         if message_type == "image":
             # Diagnostic on every image event — lets the founder grep Render
             # logs to see what WATI's payload actually contains. Useful while
@@ -4918,6 +5043,19 @@ def webhook(token=""):
             image_type = ((extracted or {}).get("image_type") or "").lower() if extracted else ""
             eye_shape = (extracted or {}).get("eye_shape") if extracted else None
 
+            # Whatever the customer typed ON the image. text_body already
+            # holds the top-level `text` field — WATI's documented carrier
+            # for a media caption — and _extract_wati_caption covers the
+            # nested media containers as well. Captured BEFORE the branches
+            # below assign to text_body, and re-appended after, so a caption
+            # is never destroyed by the synthesized vision text.
+            caption_text = text_body or _extract_wati_caption(data)
+            if caption_text:
+                print(f"[VISION] Caption on image event: {caption_text[:200]!r}")
+
+            # Set by each branch, stored once at the end of the branch chain.
+            vision_summary = ""
+
             if extracted and confidence == "high" and image_type == "eye_photo":
                 # Path (a-eye): customer sent a close-up of their eye for a
                 # lash recommendation. Synthesize a query that triggers the
@@ -4929,11 +5067,19 @@ def webhook(token=""):
                         f"I just sent a close-up photo of my eye — my eye shape looks "
                         f"{eye_shape}. Can you recommend a lash for me?"
                     )
+                    vision_summary = (
+                        f"the customer sent a close-up photo of their eye "
+                        f"(eye shape looks {eye_shape})"
+                    )
                     print(f"[VISION] Eye photo confidence=high shape={eye_shape!r} — synthesized eye-shape recommendation query")
                 else:
                     text_body = (
                         "I just sent a close-up photo of my eye — my eye shape was unclear. "
                         "Can you recommend a lash for me?"
+                    )
+                    vision_summary = (
+                        "the customer sent a close-up photo of their eye "
+                        "(eye shape wasn't readable)"
                     )
                     print(f"[VISION] Eye photo confidence=high but shape unclear — synthesized generic recommendation query")
             elif extracted and confidence == "high" and order_id:
@@ -4946,11 +5092,61 @@ def webhook(token=""):
                 if name:
                     synth_parts.append(f"— name: {name}")
                 text_body = " ".join(synth_parts)
+                vision_summary = (
+                    f"the customer sent an order screenshot showing order #{order_id}"
+                )
                 print(f"[VISION] Extracted order_id={order_id} confidence=high — synthesized text: {text_body!r}")
-            elif extracted and confidence == "high":
-                # Path (b): high confidence, no order_id, not an eye photo —
-                # likely an order screenshot without a visible ID, or a
-                # product photo. Synthesize whatever context we have.
+            elif extracted and confidence == "high" and image_type == "product_photo":
+                # Path (a-product): the customer is SHOPPING, not chasing an
+                # order. Before this branch existed these images fell into
+                # path (b) and were framed to the twin as an order screenshot,
+                # which is what produced the July 31 mismatch.
+                product = extracted.get("product")
+                if product:
+                    vision_summary = (
+                        f"the customer sent a photo of lashes they're interested in "
+                        f"(looks like {product})"
+                    )
+                else:
+                    vision_summary = (
+                        "the customer sent a photo of lashes they're interested in "
+                        "(we couldn't identify which style)"
+                    )
+                if product or caption_text:
+                    # We have something to work with — let the brain answer
+                    # properly (product details, price, closest match).
+                    if product:
+                        text_body = (
+                            f"I just sent a photo of lashes I'm interested in — it looks "
+                            f"like {product}. Can you help me with this one?"
+                        )
+                    else:
+                        text_body = (
+                            "I just sent a photo of lashes I'm interested in. "
+                            "Can you help me with this one?"
+                        )
+                    print(f"[VISION] Product photo confidence=high product={product!r} — synthesized product query")
+                else:
+                    # Nothing identifiable and no caption: acknowledge the
+                    # photo and ask ONE useful question. Deliberately does not
+                    # ask them to send a photo — they just did.
+                    print("[VISION] Product photo confidence=high but unidentifiable and uncaptioned — sending acknowledgement reply")
+                    sent, send_err = send_whatsapp_reply(wa_id, PRODUCT_PHOTO_REPLY)
+                    elapsed_ms = int((time.time() - t_start) * 1000)
+                    _log_message(
+                        wa_id, sender_name, "[image: product photo]",
+                        status="AUTO" if sent else "AUTO_FAILED",
+                        reply_text=PRODUCT_PHOTO_REPLY,
+                        latency_ms=elapsed_ms,
+                        error=None if sent else send_err,
+                    )
+                    _remember_vision_context(wa_id, vision_summary)
+                    print("=" * 60 + "\n")
+                    return jsonify({"status": "ok"}), 200
+            elif extracted and confidence == "high" and image_type == "order_screenshot":
+                # Path (b): a genuine order screenshot with no readable order
+                # id. Synthesize whatever context we have. Product photos no
+                # longer reach here — they have their own branch above.
                 parts = []
                 if extracted.get("customer_name"):
                     parts.append(f"name: {extracted['customer_name']}")
@@ -4960,25 +5156,60 @@ def webhook(token=""):
                     parts.append(f"amount: ₹{extracted['amount']}")
                 if extracted.get("payment_status"):
                     parts.append(f"payment: {extracted['payment_status']}")
-                detail = "; ".join(parts) if parts else "no specific details visible"
+                detail = "; ".join(parts) if parts else "the order ID isn't visible in it"
                 text_body = f"I just sent a screenshot of my order — {detail}. Can you help me with this?"
-                print(f"[VISION] Extracted info confidence=high but no order_id (image_type={image_type!r}) — synthesized context")
+                vision_summary = f"the customer sent an order screenshot ({detail})"
+                print(f"[VISION] Order screenshot confidence=high but no order_id — synthesized context")
             else:
-                # Path (c): low confidence, unrecognized image type, or no URL.
+                # Path (c): low confidence, image_type "other", or no URL.
                 print(f"[VISION] Low confidence / unrecognized image (confidence={confidence!r} type={image_type!r}) — falling back to neutral reply")
-                # Same delivered-vs-failed split as the text AUTO branch —
-                # a fallback reply that never sent must not enter history.
-                sent, send_err = send_whatsapp_reply(wa_id, FALLBACK_VISION_REPLY)
-                elapsed_ms = int((time.time() - t_start) * 1000)
-                _log_message(
-                    wa_id, sender_name, "[image]",
-                    status="AUTO" if sent else "AUTO_FAILED",
-                    reply_text=FALLBACK_VISION_REPLY,
-                    latency_ms=elapsed_ms,
-                    error=None if sent else send_err,
+                vision_summary = "the customer sent a photo we couldn't read clearly"
+                if caption_text:
+                    # We couldn't read the photo, but the customer typed what
+                    # they wanted onto it. Answering their actual words beats
+                    # the canned "tell me a little more" — which reads as if
+                    # we ignored what they just said.
+                    text_body = "I just sent a photo — not sure how clear it came out."
+                    print("[VISION] Unreadable image but caption present — falling through to the twin with the caption")
+                else:
+                    # Same delivered-vs-failed split as the text AUTO branch —
+                    # a fallback reply that never sent must not enter history.
+                    sent, send_err = send_whatsapp_reply(wa_id, FALLBACK_VISION_REPLY)
+                    elapsed_ms = int((time.time() - t_start) * 1000)
+                    _log_message(
+                        wa_id, sender_name, "[image]",
+                        status="AUTO" if sent else "AUTO_FAILED",
+                        reply_text=FALLBACK_VISION_REPLY,
+                        latency_ms=elapsed_ms,
+                        error=None if sent else send_err,
+                    )
+                    # Even an unreadable photo is a photo — the follow-up text
+                    # must not be answered with "could you send a photo?".
+                    _remember_vision_context(wa_id, vision_summary)
+                    print("=" * 60 + "\n")
+                    return jsonify({"status": "ok"}), 200
+
+            # Caption restored. The branches above assign to text_body, so
+            # anything the customer typed onto the image would otherwise be
+            # discarded — append it instead, as their own words.
+            if caption_text:
+                text_body = f'{text_body} (They wrote with the photo: "{caption_text}")'
+                print(f"[VISION] Caption appended to synthesized text")
+
+            _remember_vision_context(wa_id, vision_summary)
+
+        elif message_type == "text":
+            # ----- VISION CONTEXT BRIDGE -----
+            # A photo seconds ago + "I want this one" now arrive as two
+            # separate webhook events. Carry the vision summary forward so
+            # the twin answers the photo it has already seen instead of
+            # asking for one (July 31, wa_id …1290).
+            prior_vision = _recall_vision_context(wa_id)
+            if prior_vision:
+                text_body = (
+                    f"[Context: moments ago {prior_vision}. They have already sent it — "
+                    f"do not ask them to share a photo.] {text_body}"
                 )
-                print("=" * 60 + "\n")
-                return jsonify({"status": "ok"}), 200
 
         print(f"[WEBHOOK] Processing text from {sender_name or wa_id}: {text_body[:200]}")
 
