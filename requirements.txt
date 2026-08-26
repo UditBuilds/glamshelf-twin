@@ -7,3 +7,4 @@ requests
 sqlite-vec
 numpy
 fastembed
+langgraph
