@@ -762,7 +762,7 @@ def _is_paused(wa_id: str) -> bool:
         return False
 
 
-def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> None:
+def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> bool:
     """Add `wa_id` (or Instagram sender_id — the register is just keyed by
     string) to the paused_senders table with a TTL. While paused, the
     inbound handlers short-circuit before any Claude call and the customer
@@ -777,10 +777,15 @@ def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> None:
     Idempotent: extending the pause window (re-pausing an already-paused
     number) just resets the expiry. Caller should log the auto-pause
     with their own channel-specific prefix so the founder can grep.
-    DB failures are logged and swallowed — same convention as _log_message.
+
+    Unlike the audit-log writes (_log_message et al.), this one is NOT
+    fail-soft: it returns True iff the pause row is confirmed present in
+    paused_senders. False means the gate may miss — callers must log loudly.
+    (_is_paused stays fail-open by design; an unconfirmed write is then the
+    only way a customer keeps getting auto-replies after an escalation.)
     """
     if not wa_id:
-        return
+        return False
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -788,9 +793,17 @@ def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> None:
             (wa_id, time.time() + ttl_seconds),
         )
         conn.commit()
+        hit = conn.execute(
+            "SELECT 1 FROM paused_senders WHERE sender_id = ?", (wa_id,)
+        ).fetchone()
         conn.close()
+        if hit is None:
+            print(f"[PAUSE] WRITE UNCONFIRMED for {wa_id} — pause gate may miss")
+            return False
+        return True
     except Exception as e:
-        print(f"[PAUSE] _pause_number DB write failed for {wa_id}: {type(e).__name__}: {e}")
+        print(f"[PAUSE] WRITE FAILED for {wa_id}: {type(e).__name__}: {e} — pause gate may miss")
+        return False
 
 
 def _unpause_number(wa_id: str) -> bool:
@@ -5344,8 +5357,10 @@ def webhook(token=""):
             # before (this uses the same paused_senders register), and
             # the HUMAN_UDIT safety net is a separate, additive check
             # that also short-circuits inbound when Udit replies via WATI.
-            _pause_number(wa_id)
-            print(f"[ESCALATE] Auto-paused {wa_id} for 4h after holding reply sent")
+            if _pause_number(wa_id):
+                print(f"[ESCALATE] Auto-paused {wa_id} for 4h after holding reply sent")
+            else:
+                print(f"[ESCALATE] PAUSE UNCONFIRMED for {wa_id} — founder must handle manually")
             # Udit is about to take this conversation over by hand in WATI,
             # which will reassign the ticket to him and kill automation. Pin
             # it to the Bot now so the webhook stays alive for this customer;
@@ -6472,7 +6487,7 @@ def _process_instagram_event(event: dict) -> None:
                     f"[INSTAGRAM-TG] Notification failed: "
                     f"{type(tg_err).__name__}: {tg_err}"
                 )
-            _pause_number(sender_id)
+            pause_confirmed = _pause_number(sender_id)
             if fallback_escalation and holding_sent:
                 # Delivered text — belongs in conversation history, so it
                 # gets a source _load_instagram_history does NOT exclude.
@@ -6486,7 +6501,10 @@ def _process_instagram_event(event: dict) -> None:
                 # NULL reply keeps this row out of _load_instagram_history —
                 # the customer never received anything for this message.
                 _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
-            print(f"[ESCALATE] Auto-paused {sender_id} for 4h")
+            if pause_confirmed:
+                print(f"[ESCALATE] Auto-paused {sender_id} for 4h")
+            else:
+                print(f"[ESCALATE] PAUSE UNCONFIRMED for {sender_id} — founder must handle manually")
 
         else:
             print(f"[INSTAGRAM] Unknown classification {classification!r} — no dispatch")
