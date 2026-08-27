@@ -237,12 +237,24 @@ class GraphParityTestCase(unittest.TestCase):
 
     # ---- degenerate LLM output ----
 
-    def test_unparseable_llm_output_drops_silently(self):
-        old = self._run("old", llm_response="sorry, I can't produce JSON today")
-        self.assertEqual(len(named(old, "ask_claude")), 1)
-        self.assertEqual([c for c in effects(old) if c[0] != "ask_claude"], [])
+    def test_unparseable_llm_output_retries_then_escalates(self):
+        """Used to drop silently — this test asserted that, because that was
+        the behaviour. An unparseable 200 left an ordinary customer with no
+        reply at all, no fallback and no page to the founder.
 
-        new = self._run("new", llm_response="sorry, I can't produce JSON today")
+        Now the call is retried once, and if the retry is also unusable the
+        thread escalates: the stock holding reply ships to the customer and
+        the founder is notified. Both implementations must agree.
+        """
+        garbage = "sorry, I can't produce JSON today"
+        old = self._run("old", llm_response=garbage)
+        self.assertEqual(len(named(old, "ask_claude")), 2, "original call + one retry")
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.ESCALATE_FALLBACK_HOLDING_REPLY))
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ESCALATE")
+
+        new = self._run("new", llm_response=garbage)
         self._assert_parity(old, new)
 
     def test_prefilter_escalation_survives_unparseable_llm_output(self):

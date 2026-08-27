@@ -4105,6 +4105,27 @@ _ESCALATION_PREFILTER_PATTERNS = re.compile(
 # silently drop an ESCALATE. In that fallback case this text is actually
 # SENT to the customer (unlike a normal ESCALATE, where the drafted holding
 # reply is only *suggested* to the founder on Telegram and nothing is sent).
+def _parse_twin_reply(raw: str) -> tuple[str, str]:
+    """Pull (classification, reply) out of the model's JSON response.
+
+    Returns ("", "") when the body isn't valid JSON — callers treat that as
+    unusable output. Shared by draft_reply_logic and graph.py's generate
+    node so the two parse identically.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        print("[TWIN] Claude's response wasn't valid JSON — leaving classification/reply empty")
+        return "", ""
+    if not isinstance(parsed, dict):
+        print(f"[TWIN] Claude returned JSON but not an object ({type(parsed).__name__}) — unusable")
+        return "", ""
+    return (
+        (parsed.get("classification") or "").strip(),
+        (parsed.get("reply") or "").strip(),
+    )
+
+
 ESCALATE_FALLBACK_HOLDING_REPLY = (
     "I hear you, and I want this handled properly — I'm bringing it straight to "
     "the GlamShelf team, who'll reach out to you personally within the next few hours."
@@ -4210,15 +4231,41 @@ def draft_reply_logic(
     bulk_commit_qty = _bulk_commit_prefilter_hit(message)
 
     raw = ask_claude(brain, message, order_context, history=history, source=source)
+    classification, reply = _parse_twin_reply(raw)
 
-    classification = ""
-    reply = ""
-    try:
-        parsed = json.loads(raw)
-        classification = (parsed.get("classification") or "").strip()
-        reply = (parsed.get("reply") or "").strip()
-    except json.JSONDecodeError:
-        print("[TWIN] Claude's response wasn't valid JSON — leaving classification/reply empty")
+    # A 200 whose body doesn't parse used to end here with ("", ""), which
+    # both webhooks then dropped silently — the customer got nothing at all
+    # unless the classification happened to already be ESCALATE. Retry once
+    # (the OpenAI SDK retries transport failures for us, but not this), and
+    # if the model is still producing garbage, escalate.
+    if not classification and not reply:
+        print("[TWIN] Unusable model output — retrying the call once before falling back")
+        try:
+            retry_raw = ask_claude(
+                brain, message, order_context, history=history, source=source
+            )
+        except Exception as exc:  # noqa: BLE001 - the fallback below is the whole point
+            print(f"[TWIN] Retry call failed: {type(exc).__name__}: {exc}")
+            retry_raw = ""
+        if retry_raw:
+            raw = retry_raw
+            classification, reply = _parse_twin_reply(raw)
+
+        if not classification and not reply:
+            # Deliberately ESCALATE with an EMPTY reply. The webhook gate is
+            # `if not classification or not reply:` and only inside it does
+            # the ESCALATE arm set fallback_escalation=True — which is the
+            # flag both handlers check before sending the holding reply to
+            # the customer. Filling `reply` in here would make the gate fall
+            # through to a NORMAL escalation, and a normal escalation sends
+            # the customer nothing. Empty is what routes this into the
+            # existing fallback path.
+            print(
+                "[TWIN] Retry also unusable — escalating so the founder is "
+                "notified and the customer gets the holding reply"
+            )
+            classification = "ESCALATE"
+            reply = ""
 
 
     # Upgrade-only override: a matched high-risk phrase forces ESCALATE
