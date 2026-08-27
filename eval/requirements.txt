@@ -1,0 +1,12 @@
+# Eval harness only — NOT installed on Render.
+# The production app's dependencies live in the root requirements.txt;
+# nothing in app.py imports anything from this file.
+#
+#   venv\Scripts\python.exe -m pip install -r eval/requirements.txt
+
+fastapi>=0.115
+uvicorn>=0.30
+openpyxl>=3.1          # one-time xlsx -> eval_set.json conversion
+groq>=0.11             # judge backend: "groq"
+                       # judge backend: "ollama" uses plain HTTP via requests
+# langgraph and requests are already pinned in the root requirements.txt
