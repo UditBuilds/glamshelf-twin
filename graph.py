@@ -199,14 +199,39 @@ def generate(state: TwinState) -> TwinState:
             "reply": "",
         }
 
-    classification = ""
-    reply = ""
-    try:
-        parsed = json.loads(raw)
-        classification = (parsed.get("classification") or "").strip()
-        reply = (parsed.get("reply") or "").strip()
-    except json.JSONDecodeError:
-        print("[TWIN] Claude's response wasn't valid JSON — leaving classification/reply empty")
+    classification, reply = app._parse_twin_reply(raw)
+
+    # Same retry-then-escalate as draft_reply_logic. Kept in step with it
+    # deliberately: test_graph_parity asserts the two paths agree, and an
+    # unparseable 200 must not drop a customer silently on either.
+    if not classification and not reply:
+        print("[TWIN] Unusable model output — retrying the call once before falling back")
+        try:
+            retry_raw = app.ask_claude(
+                state["system_prompt"],
+                state["text"],
+                state.get("order_context", ""),
+                history=state.get("history"),
+                source="Instagram DM",
+            )
+        except Exception as exc:  # noqa: BLE001 - the fallback below is the whole point
+            print(f"[TWIN] Retry call failed: {type(exc).__name__}: {exc}")
+            retry_raw = ""
+        if retry_raw:
+            raw = retry_raw
+            classification, reply = app._parse_twin_reply(raw)
+
+        if not classification and not reply:
+            # ESCALATE with an EMPTY reply on purpose — triage's
+            # `if not classification or not reply:` gate is what sets
+            # fallback_escalation=True, and that flag is what actually
+            # ships the holding reply to the customer.
+            print(
+                "[TWIN] Retry also unusable — escalating so the founder is "
+                "notified and the customer gets the holding reply"
+            )
+            classification = "ESCALATE"
+            reply = ""
 
     return {"raw_response": raw, "llm_classification": classification, "reply": reply}
 
