@@ -100,37 +100,17 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 JUDGE_SYSTEM = (
-    "You grade a customer-support assistant for an Indian D2C false-eyelash "
-    "brand. You compare a CANDIDATE answer against an IDEAL answer written by "
-    "the brand founder, which is the ground truth.\n\n"
-    "Grade on substance, not style. Wording, length, greetings, emoji and "
-    "tone differences do NOT matter. What matters:\n"
-    "  - Does the candidate state the same facts as the ideal (prices, sizes, "
-    "timelines, policies, product names)?\n"
-    "  - Does it contradict the ideal, or invent facts the ideal does not "
-    "support?\n"
-    "  - Does it actually address what the customer asked?\n\n"
-    "Verdicts:\n"
-    "  Pass    - substantively matches the ideal; contradicts nothing and "
-    "leaves out nothing the ideal supplies.\n"
-    "  Partial - on-topic and contradicts nothing, but is vague or hedges "
-    "where the ideal commits.\n"
-    "  Fail    - contradicts the ideal, invents facts, does not answer, or "
-    "omits a concrete element the ideal supplies.\n\n"
-    "CONTRADICTION RULE: if the candidate states a concrete fact that "
-    "disagrees with the ideal - a different price, free-shipping threshold, "
-    "delivery timeline, policy, quantity or product name - that is Fail, not "
-    "Partial, even when the rest of the answer is good. A customer acting on "
-    "a wrong number has been misinformed.\n\n"
-    "COMPLETENESS RULE: the ideal defines what the reply must contain. If the "
-    "candidate leaves out a concrete element the ideal supplies - a price, a "
-    "free-shipping threshold, a delivery timeline, a required follow-up "
-    "question, a hand-off to a human, or a stated product characteristic - "
-    "that is Fail, not Partial. A support reply that omits the needed fact "
-    "has not done its job. Reserve Partial for answers that are merely vague, "
-    "never for ones missing a specific element the ideal provides.\n\n"
+    "You are a strict but fair quality judge for a customer support agent's "
+    "replies. Given a customer question, the ideal answer, and the agent's "
+    "candidate answer, judge on two separate dimensions: (1) factual "
+    "correctness — does the candidate answer contradict the ideal answer's "
+    "facts (wrong price, wrong product, wrong policy, wrong process)? (2) "
+    "completeness — does the ideal answer contain a required element (a "
+    "specific link, a specific caveat, a specific routing) that the "
+    "candidate answer omits? A reply that's factually accurate but missing a "
+    "required element is not a full Pass.\n\n"
     "Reply with JSON only, of the form "
-    "{\"verdict\": \"Pass|Partial|Fail\", \"reason\": \"one short sentence\"}"
+    "{\"verdict\": \"Pass|Fail\", \"reason\": \"one short sentence\"}"
 )
 
 
@@ -323,7 +303,7 @@ def load_rows(category: str | None = None,
     return rows
 
 
-def run_eval(judge: str = "ollama", category: str | None = None,
+def run_eval(judge: str = "groq", category: str | None = None,
              mode: str = "fresh", limit: int | None = None,
              ideal_source: str | None = None) -> dict:
     if judge not in JUDGES:
