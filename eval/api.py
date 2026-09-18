@@ -30,8 +30,8 @@ api = FastAPI(
 
 
 class RunRequest(BaseModel):
-    judge: Literal["ollama", "groq"] = Field(
-        "groq", description="Judge backend. ollama = local and free; groq = the official scored run."
+    judge: Literal["local_lora", "ollama", "groq"] = Field(
+        "local_lora", description="Judge backend. ollama = local and free; groq = the official scored run."
     )
     category: Optional[str] = Field(
         None, description="Optional exact category filter, e.g. 'Refund'. Case-insensitive."
