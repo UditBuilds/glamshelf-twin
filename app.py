@@ -4166,6 +4166,50 @@ def _bulk_commit_prefilter_hit(message: str) -> int | None:
     return qty if action == ACTION_ESCALATE else None
 
 
+
+# ---------------------------------------------------------------------------
+# Online Local LoRA Safety Guardrail
+# ---------------------------------------------------------------------------
+def _get_policy_reference_anchor(message: str) -> str:
+    """Return a canonical ground-truth policy anchor based on customer intent."""
+    msg = message.lower()
+    if any(k in msg for k in ["price", "cost", "rate", "how much", "charges"]):
+        return "Single pairs: Clean Girl ₹249, Kawaii ₹299. Duos: ₹499. Trio: ₹699. Trays (GS1, GS2, GS3, 10 pairs): ₹849 each. Free shipping on orders above ₹799."
+    if any(k in msg for k in ["gs1", "gs2", "gs3", "band", "difference", "thicker", "thin"]):
+        return "GS1 has a thin, flexible band for soft, natural everyday wear. GS2 has a slightly thicker band designed for bolder, bridal-ready hold. GS3 is a half lash for subtle corner lift."
+    if any(k in msg for k in ["ship", "delivery", "track", "courier", "days"]):
+        return "Orders dispatch within 2-5 business days, with delivery taking 7-10 business days across India. Free shipping applies above ₹799."
+    if any(k in msg for k in ["return", "exchange", "refund"]):
+        return "14-day return window on unused products in original packaging. Contact glamshelfstore@gmail.com. Customer covers return shipping unless damaged or incorrect."
+    if any(k in msg for k in ["vegan", "mink", "animal", "cruelty"]):
+        return "All our lashes are 100% vegan, synthetic, and cruelty-free. We never use real animal or mink hair."
+    if any(k in msg for k in ["bulk", "wholesale", "quantity"]):
+        return "Bulk wholesale tier begins at 20+ trays at ₹749 per tray. Orders above ₹1,500 escalate for founder confirmation."
+    return "All GlamShelf products are 100% vegan synthetic lashes with 5-7 wears (up to 10 with care). Trays are ₹849, singles ₹249-₹299, free shipping above ₹799."
+
+
+def _apply_online_guardrail(message: str, candidate_reply: str, current_classification: str) -> str:
+    """Evaluate AUTO drafts against local LoRA judge; escalate to DRAFT+APPROVE on Fail."""
+    import os
+    if (os.environ.get("LOCAL_GUARDRAIL_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+        return current_classification
+
+    try:
+        from eval.harness import _judge_local_lora
+        anchor = _get_policy_reference_anchor(message)
+        verdict, reason = _judge_local_lora(question=message, candidate=candidate_reply, ideal=anchor)
+        
+        if verdict == "Fail":
+            print(f"[GUARDRAIL] Intercepted AUTO draft -> Escalating to DRAFT+APPROVE ({reason})")
+            return "DRAFT+APPROVE"
+        else:
+            print(f"[GUARDRAIL] Local judge verified AUTO draft: {verdict} ({reason})")
+            return current_classification
+    except Exception as exc:
+        print(f"[GUARDRAIL] Warning: local judge guardrail check failed ({type(exc).__name__}: {exc}) — failing open")
+        return current_classification
+
+
 def draft_reply_logic(
     message: str,
     order_context: str = "",
@@ -4284,6 +4328,10 @@ def draft_reply_logic(
             f"(Rule 3b-i / Hard Money Threshold, resolve_pricing_action)"
         )
         classification = "ESCALATE"
+
+    # Online LoRA Safety Guardrail: Upgrade AUTO -> DRAFT+APPROVE if judge fails
+    if classification == "AUTO" and reply:
+        classification = _apply_online_guardrail(message, reply, classification)
 
     return classification, reply, raw
 
