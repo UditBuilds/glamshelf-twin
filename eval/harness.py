@@ -16,7 +16,10 @@ NOTHING HERE CAN SEND A CUSTOMER MESSAGE. Two independent reasons:
   2. _install_outbound_guard() below replaces every outbound function in
      app with one that raises. If a future refactor ever moves a send
      into the generate path, this run fails loudly instead of messaging
-     a real customer.
+     a real customer. Installed lazily by run_eval() — NEVER at import
+     time (see run_eval for why: a Sep 2026 incident where importing
+     this module alone, from app.py's live reply path, permanently
+     broke production sends for the life of the process).
 
 Importing app also runs module-level side effects (app.py:2396-2398:
 _restore_db_from_github, _init_db, _start_backup_loop), so the env guard
@@ -87,9 +90,6 @@ def _install_outbound_guard() -> None:
     for name in ("_log_message", "_log_instagram"):
         if hasattr(app, name):
             setattr(app, name, lambda *_a, **_k: None)
-
-
-_install_outbound_guard()
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +306,12 @@ def load_rows(category: str | None = None,
 def run_eval(judge: str = "groq", category: str | None = None,
              mode: str = "fresh", limit: int | None = None,
              ideal_source: str | None = None) -> dict:
+    # Installed here, not at module import time: importing this module
+    # (e.g. transitively, from anything that isn't actually starting an
+    # eval run) must never touch app's send functions. See the Sep 2026
+    # incident note in the module docstring above.
+    _install_outbound_guard()
+
     if judge not in JUDGES:
         raise ValueError(f"unknown judge {judge!r}; expected one of {sorted(JUDGES)}")
 
