@@ -49,8 +49,6 @@ os.environ["GITHUB_REPO"] = ""
 os.environ.setdefault("SECRET_KEY", "eval")
 os.environ.setdefault("APP_PASSWORD", "eval")
 os.environ.setdefault("DASHBOARD_KEY", "eval")
-os.environ.setdefault("DEEPSEEK_API_KEY", "eval-mock-key")
-os.environ.setdefault("OPENAI_API_KEY", "eval-mock-key")
 
 import requests  # noqa: E402
 from langgraph.graph import END, START, StateGraph  # noqa: E402
@@ -199,78 +197,7 @@ def _judge_groq(question: str, candidate: str, ideal: str) -> tuple[str, str]:
     raise RuntimeError("unreachable")
 
 
-_LOCAL_LORA_SINGLETON = None
-
-def _get_local_lora_judge():
-    global _LOCAL_LORA_SINGLETON
-    if _LOCAL_LORA_SINGLETON is not None:
-        return _LOCAL_LORA_SINGLETON
-
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import PeftModel
-    from pathlib import Path
-
-    model_id = "Qwen/Qwen2.5-7B-Instruct"
-    adapter_path = Path(__file__).resolve().parent.parent.parent / "judge_lora_adapter"
-    if not adapter_path.exists():
-        adapter_path = Path("judge_lora_adapter").resolve()
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-    )
-    tok = AutoTokenizer.from_pretrained(model_id)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
-        device_map="cuda",
-        attn_implementation="sdpa",
-    )
-    model = PeftModel.from_pretrained(base_model, str(adapter_path))
-    model.eval()
-
-    pass_id = tok("Pass", add_special_tokens=False)["input_ids"][0]
-    fail_id = tok("Fail", add_special_tokens=False)["input_ids"][0]
-
-    _LOCAL_LORA_SINGLETON = (model, tok, pass_id, fail_id)
-    return _LOCAL_LORA_SINGLETON
-
-
-def _judge_local_lora(question: str, candidate: str, ideal: str) -> tuple[str, str]:
-    import torch
-    model, tok, pass_id, fail_id = _get_local_lora_judge()
-    system_prompt = (
-        "You are a strict but fair quality judge for a customer support agent's replies. "
-        "Given a customer question, the ideal answer, and the agent's actual answer, "
-        "decide if the actual answer would be acceptable to send to the customer. "
-        "Respond with exactly one word: Pass or Fail."
-    )
-    user_prompt = (
-        f"Question: {question}\n\n"
-        f"Ideal answer: {ideal}\n\n"
-        f"Actual answer: {candidate}\n\n"
-        f"Verdict:"
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    prompt_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    input_ids = torch.tensor([tok(prompt_text, add_special_tokens=False)["input_ids"]]).to("cuda")
-
-    with torch.no_grad():
-        logits = model(input_ids).logits[0, -1, :]
-
-    p_pass = torch.softmax(torch.tensor([logits[pass_id].item(), logits[fail_id].item()]), dim=0)[0].item()
-    verdict = "Pass" if p_pass >= 0.50 else "Fail"
-    reason = f"Local LoRA judge: P(Pass) = {p_pass:.3f}"
-    return verdict, reason
-
-
 JUDGES: dict[str, Callable[[str, str, str], tuple[str, str]]] = {
-    "local_lora": _judge_local_lora,
     "ollama": _judge_ollama,
     "groq": _judge_groq,
 }
@@ -420,7 +347,7 @@ def run_eval(judge: str = "groq", category: str | None = None,
 
     return {
         "judge": judge,
-        "judge_model": "judge_lora_adapter (Qwen2.5-7B-NF4)" if judge == "local_lora" else (OLLAMA_MODEL if judge == "ollama" else GROQ_MODEL),
+        "judge_model": OLLAMA_MODEL if judge == "ollama" else GROQ_MODEL,
         "mode": mode,
         "category": category,
         "ideal_source": ideal_source,
