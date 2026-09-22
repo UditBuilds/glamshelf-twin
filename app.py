@@ -102,7 +102,7 @@ APP_PASSWORD = _require_env("APP_PASSWORD")
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")  # configurable
+DEEPSEEK_MODEL = "deepseek-chat"        # all text replies
 CLAUDE_MODEL = "claude-sonnet-4-6"      # vision only (image extraction)
 MAX_TOKENS = 2048
 
@@ -2412,7 +2412,7 @@ else:
 # Both keys must be set on Render / in .env (no usable default).
 deepseek_client = OpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+    base_url="https://api.deepseek.com",
 )
 claude_client = Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
@@ -4173,16 +4173,7 @@ def _bulk_commit_prefilter_hit(message: str) -> int | None:
 def _get_policy_reference_anchor(message: str) -> str:
     """Return a canonical ground-truth policy anchor based on customer intent."""
     msg = message.lower()
-    has_price = any(k in msg for k in ["price", "cost", "rate", "how much", "charges"])
-    has_tray = any(k in msg for k in ["tray", "gs1", "gs2", "gs3", "half lash", "half lashes"])
-    has_single = any(k in msg for k in ["single", "clean girl", "kawaii", "duo", "trio"])
-
-    # Scoped pricing anchors to match customer inquiry granularity
-    if has_price and has_tray and not has_single:
-        return "Trays (GS1, GS2, GS3, 10 pairs): ₹849 each. Free shipping on orders above ₹799."
-    if has_price and has_single and not has_tray:
-        return "Single pairs: Clean Girl ₹249, Kawaii ₹299. Duos: ₹499. Trio: ₹699. Free shipping on orders above ₹799."
-    if has_price:
+    if any(k in msg for k in ["price", "cost", "rate", "how much", "charges"]):
         return "Single pairs: Clean Girl ₹249, Kawaii ₹299. Duos: ₹499. Trio: ₹699. Trays (GS1, GS2, GS3, 10 pairs): ₹849 each. Free shipping on orders above ₹799."
     if any(k in msg for k in ["gs1", "gs2", "gs3", "band", "difference", "thicker", "thin"]):
         return "GS1 has a thin, flexible band for soft, natural everyday wear. GS2 has a slightly thicker band designed for bolder, bridal-ready hold. GS3 is a half lash for subtle corner lift."
