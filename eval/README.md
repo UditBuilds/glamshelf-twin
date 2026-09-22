@@ -205,7 +205,11 @@ The harness must never message a real customer. Two independent guarantees:
    `_send_instagram_reply`, `send_telegram_notification`, `send_draft_for_approval`,
    `_reassign_to_bot` and `_send_review_request` with functions that **raise**. If a future
    refactor moves a send into the generate path, the run aborts loudly instead of messaging
-   someone.
+   someone. It's installed by `run_eval()` when a run actually starts — **never** at module
+   import time. Anything outside this package (e.g. app.py) that imports from `eval.*` would
+   otherwise get these raisers patched into `app` permanently just by importing, whether or
+   not it ever runs an eval — which is exactly what broke production sends in Sep 2026.
+   Production code must never import from `eval.*` for this reason.
 
 `harness.py` also blanks `GITHUB_TOKEN` / `GITHUB_REPO` and points `DB_PATH` at a temp file
 *before* importing `app`, because importing `app` runs `_restore_db_from_github()` and starts
