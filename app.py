@@ -2532,7 +2532,8 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
               AND (source IS NULL
                    OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG',
                                      'ESCALATE_HOLDING_FAILED_IG',
-                                     'PIPELINE_HOLDING_FAILED_IG'))
+                                     'PIPELINE_HOLDING_FAILED_IG',
+                                     'PHOTO_IG_FAILED'))
               AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
             LIMIT 30
@@ -6719,6 +6720,108 @@ def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> N
     )
 
 
+# Instagram photos (audit T1-9). The vision pipeline is WhatsApp-only, so on
+# Instagram Twin can't see a photo at all — it used to drop them silently.
+# Now a photo gets this honest reply and the founder a Telegram notice to
+# look at it in the DM. At most once per sender per
+# INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS: customers often send several photos
+# in a row, and one reply per burst reads better than the same line three
+# times. Extra photos in the window are logged, not answered.
+INSTAGRAM_PHOTO_REPLY = (
+    "I can't view photos here yet — tell me your eye shape or the occasion "
+    "and I'll suggest the right pair!"
+)
+INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS = 10 * 60
+
+
+def _ig_has_photo(message: dict) -> bool:
+    """True if an Instagram message carries an image attachment. Stickers
+    also arrive as image attachments, but with a sticker_id — not a photo."""
+    for att in message.get("attachments") or []:
+        if not isinstance(att, dict) or att.get("type") != "image":
+            continue
+        payload = att.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("sticker_id"):
+            continue
+        return True
+    return False
+
+
+def _ig_event_kind(event: dict) -> str:
+    """Short description of a non-text Instagram event, for the log line
+    that replaced the old silent skip."""
+    message = event.get("message") or {}
+    if message:
+        types = [
+            str(att.get("type") or "?")
+            for att in (message.get("attachments") or [])
+            if isinstance(att, dict)
+        ]
+        if types:
+            return "attachments=" + ",".join(types)
+        if message.get("is_deleted"):
+            return "message deleted"
+        if message.get("is_unsupported"):
+            return "unsupported message"
+        return "message without text"
+    for key in ("reaction", "read", "postback", "referral", "message_edit"):
+        if key in event:
+            return key
+    return "unknown event (keys: " + ", ".join(sorted(event.keys())[:8]) + ")"
+
+
+def _ig_photo_replied_recently(sender_id: str) -> bool:
+    """Has this sender already had the photo reply inside the window? Read
+    from instagram_logs, so it survives restarts. Fails open (False)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM instagram_logs "
+                "WHERE sender_id = ? AND source = 'PHOTO_IG' "
+                "AND logged_at >= datetime('now', ?) LIMIT 1",
+                (sender_id, f"-{INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS} seconds"),
+            ).fetchone()
+        finally:
+            conn.close()
+        return hit is not None
+    except Exception as e:
+        print(f"[INSTAGRAM] Photo-reply window check failed for {sender_id}: {type(e).__name__}: {e}")
+        return False
+
+
+def _handle_instagram_photo(sender_id: str, timestamp: str) -> None:
+    """Honest reply to an Instagram photo, plus a founder notice.
+
+    Logged with message_text "[sent a photo]", so the next turn's history
+    shows the model a photo arrived and what we said — it won't ask the
+    customer to send one. A failed reply is logged under PHOTO_IG_FAILED
+    (history-excluded) and the next photo tries again."""
+    if _ig_photo_replied_recently(sender_id):
+        print(f"[INSTAGRAM] Another photo from {sender_id} inside the reply window — logged, not answered")
+        _log_instagram(sender_id, "[sent a photo]", None, timestamp, source="PHOTO_IG_REPEAT")
+        return
+    sent, send_err = _send_instagram_reply(sender_id, INSTAGRAM_PHOTO_REPLY)
+    _log_instagram(
+        sender_id, "[sent a photo]", INSTAGRAM_PHOTO_REPLY, timestamp,
+        source="PHOTO_IG" if sent else "PHOTO_IG_FAILED",
+    )
+    if not sent:
+        print(f"[INSTAGRAM] Photo reply to {sender_id} FAILED: {send_err}")
+    if not TELEGRAM_CHAT_ID:
+        print("[INSTAGRAM] Photo notice skipped: TELEGRAM_CHAT_ID not set")
+        return
+    _telegram_api("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": (
+            f"📷 Instagram photo from sender {sender_id}\n"
+            f"Twin can't view photos, so it asked them for their eye shape "
+            f"or the occasion{'' if sent else ' — but that reply FAILED to send'}.\n"
+            f"Open the DM to see the photo."
+        ),
+    })
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -6774,8 +6877,16 @@ def _process_instagram_event(event: dict) -> None:
         if message.get("is_echo"):
             return
 
-        if not text:
-            # Non-text event (image, sticker, reaction, etc.) — silent skip.
+        # A photo gets an honest canned reply (audit T1-9) once it has
+        # passed the same dedup / pause / takeover gates as text, below.
+        # Every other non-text event (reaction, sticker, share, reel, read
+        # receipt...) is still ignored — but logged, not dropped silently.
+        is_photo = not text and _ig_has_photo(message)
+        if not text and not is_photo:
+            print(
+                f"[INSTAGRAM] Ignored non-text event from "
+                f"{sender_id or '(no sender)'}: {_ig_event_kind(event)}"
+            )
             return
 
         if not sender_id:
@@ -6785,7 +6896,7 @@ def _process_instagram_event(event: dict) -> None:
         msg_id = (message.get("mid") or "").strip()
         timestamp = str(event.get("timestamp") or "")
 
-        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200]}")
+        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200] if text else '[photo]'}")
 
         # Reuse the same dedup set the WATI webhook uses — sender ID + mid
         # collisions across channels would be astronomically improbable.
@@ -6812,6 +6923,12 @@ def _process_instagram_event(event: dict) -> None:
         # silently. Mirrors the WATI _udit_replied_recently safety net.
         if _udit_replied_recently_ig(sender_id):
             print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
+            return
+
+        if is_photo:
+            # No model call for a photo, so no rate-limit budget either;
+            # _handle_instagram_photo answers at most once per burst.
+            _handle_instagram_photo(sender_id, timestamp)
             return
 
         # LLM rate limits (audit T1-3) — after the takeover gates, so a
