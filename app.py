@@ -2013,17 +2013,31 @@ SEND_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
 _send_failure_last_alert: dict[str, float] = {}
 
 
-def _alert_send_failure(channel: str, error: str, customer_id: str) -> None:
-    """Telegram-alert Udit that a customer reply failed to send.
+def _alert_send_failure(
+    channel: str,
+    error: str,
+    customer_id: str,
+    *,
+    kind: str = "send",
+    holding_sent: bool | None = None,
+) -> None:
+    """Telegram-alert Udit that a customer reply failed.
+
+    kind="send" (default, wording unchanged): the outbound send itself
+    failed. kind="pipeline": no reply could be produced — DeepSeek error or
+    timeout, unusable model output, or a webhook handler error.
+    `holding_sent` then says what the customer did get: the holding line
+    (True), nothing (False) or unknown (None), so the alert never claims
+    more than we know.
 
     Reuses the same bot/chat as the draft-approval flow via _telegram_api.
     Never raises — alerting is a side effect and must not break the
     webhook 200 response, same contract as every other Telegram call.
     """
-    key = f"{channel}|{error[:120]}"
+    key = f"{channel}|{error[:120]}" if kind == "send" else f"{kind}|{channel}|{error[:120]}"
     now = time.time()
     if now - _send_failure_last_alert.get(key, 0.0) < SEND_FAILURE_ALERT_COOLDOWN_SECONDS:
-        print(f"[ALERT] Suppressed repeat send-failure alert ({channel}): {error[:80]}")
+        print(f"[ALERT] Suppressed repeat {kind}-failure alert ({channel}): {error[:80]}")
         return
     # Stamp before sending so a Telegram hiccup can't turn into an
     # alert-per-message storm during an outage.
@@ -2032,12 +2046,27 @@ def _alert_send_failure(channel: str, error: str, customer_id: str) -> None:
     if not TELEGRAM_CHAT_ID:
         print("[ALERT] Skipped: TELEGRAM_CHAT_ID not set")
         return
-    text = (
-        f"⚠️ {channel} send FAILED\n"
-        f"Customer {customer_id} did not get a reply.\n"
-        f"Error: {error[:300]}\n\n"
-        f"(Repeats of this error muted for 30 min)"
-    )
+    if kind == "pipeline":
+        if holding_sent is True:
+            outcome = "got only the holding line — reply to them by hand."
+        elif holding_sent is False:
+            outcome = "got NO reply — reply to them by hand."
+        else:
+            outcome = "may not have got a reply — check the chat."
+        text = (
+            f"⚠️ {channel} reply pipeline FAILED\n"
+            f"Customer {customer_id} {outcome}\n"
+            f"Error: {error[:300]}\n\n"
+            f"(Repeats of this error muted for 30 min; customers it hits "
+            f"meanwhile are still logged)"
+        )
+    else:
+        text = (
+            f"⚠️ {channel} send FAILED\n"
+            f"Customer {customer_id} did not get a reply.\n"
+            f"Error: {error[:300]}\n\n"
+            f"(Repeats of this error muted for 30 min)"
+        )
     try:
         _telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text})
     except Exception as e:
@@ -2239,7 +2268,8 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
               AND reply_text IS NOT NULL
               AND (source IS NULL
                    OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG',
-                                     'ESCALATE_HOLDING_FAILED_IG'))
+                                     'ESCALATE_HOLDING_FAILED_IG',
+                                     'PIPELINE_HOLDING_FAILED_IG'))
               AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
             LIMIT 30
@@ -2410,9 +2440,22 @@ else:
 #   - claude_client: VISION ONLY (order screenshots + eye selfies) — DeepSeek's
 #     deepseek-chat is text-only, so image extraction stays on Claude's API.
 # Both keys must be set on Render / in .env (no usable default).
+#
+# DeepSeek call budget (audit T1-8). The SDK default is a 600s timeout with
+# 2 retries — far past gunicorn's worker timeout (Procfile: --timeout 60).
+# A slow call got the worker killed mid-request: no reply, no alert, and
+# Meta's retry of that message was dropped by the mid dedup. 20s per
+# attempt plus one retry fails fast enough for the webhook's own failure
+# handling (holding line + Telegram alert) to run. httpx applies the
+# timeout per network operation (connect, each read), not as one
+# wall-clock cap on the whole call.
+DEEPSEEK_TIMEOUT_SECONDS = 20
+DEEPSEEK_MAX_RETRIES = 1
 deepseek_client = OpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
     base_url="https://api.deepseek.com",
+    timeout=DEEPSEEK_TIMEOUT_SECONDS,
+    max_retries=DEEPSEEK_MAX_RETRIES,
 )
 claude_client = Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
@@ -4131,6 +4174,16 @@ ESCALATE_FALLBACK_HOLDING_REPLY = (
     "the GlamShelf team, who'll reach out to you personally within the next few hours."
 )
 
+# brain.md's Default Handoff Line (INTERNAL NOTES), sent verbatim when the
+# reply pipeline itself fails on Instagram — DeepSeek down or timing out,
+# brain.md unreadable, unusable model output — so the customer is never
+# left in silence while the founder is alerted (audit T1-8). Keep in sync
+# with brain.md.
+BRAIN_HOLDING_LINE = (
+    "Understood — Team The Glam Shelf will personally look into this and get "
+    "back to you within a few hours 🤍"
+)
+
 
 def _escalation_prefilter_hit(message: str) -> str | None:
     """Return the matched high-risk phrase, or None.
@@ -5484,6 +5537,14 @@ def webhook(token=""):
             )
         except Exception:
             pass
+        # Same founder alert as the Instagram pipeline-failure path (audit
+        # T1-8). Every send in this handler swallows its own errors, so an
+        # exception reaching here means no reply went out.
+        _alert_send_failure(
+            "WhatsApp", f"{type(e).__name__}: {e}",
+            locals().get("wa_id", "") or "(unknown)",
+            kind="pipeline", holding_sent=False,
+        )
         print("=" * 60 + "\n")
         return jsonify({"status": "ok"}), 200
 
@@ -6334,6 +6395,33 @@ def instagram_webhook():
         return jsonify({"status": "ok"}), 200
 
 
+def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) -> bool:
+    """The reply pipeline failed for this Instagram DM — DeepSeek error or
+    timeout, brain.md unreadable, unusable model output — with no
+    escalation signal to fall back on (audit T1-8). Never leave the
+    customer in silence: send the brain's holding line, log what they
+    actually received, and alert the founder (rate-limited). Returns
+    whether the holding line was delivered.
+
+    Shared with graph.py's dispatch_failure node so the two stay in parity.
+    Not a pause: the next message goes through the pipeline normally.
+    """
+    sent, send_err = _send_instagram_reply(sender_id, BRAIN_HOLDING_LINE)
+    # Delivered holding line is history-visible (the customer saw it, so
+    # the next turn knows a follow-up was promised); a failed one is
+    # logged under a source _load_instagram_history excludes.
+    _log_instagram(
+        sender_id, text, BRAIN_HOLDING_LINE, timestamp,
+        source="PIPELINE_HOLDING_IG" if sent else "PIPELINE_HOLDING_FAILED_IG",
+    )
+    if sent:
+        print(f"[INSTAGRAM] Pipeline failed for {sender_id} — holding line sent ({error[:120]})")
+    else:
+        print(f"[INSTAGRAM] Pipeline failed for {sender_id} — holding line FAILED too: {send_err}")
+    _alert_send_failure("Instagram", error, sender_id, kind="pipeline", holding_sent=sent)
+    return sent
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -6455,6 +6543,9 @@ def _process_instagram_event(event: dict) -> None:
             ):
                 classification, reply = "ESCALATE", ""
             else:
+                # No escalation signal: used to return silently — the
+                # customer got nothing and nobody was told (audit T1-8).
+                _ig_pipeline_failure(sender_id, text, timestamp, f"{type(e).__name__}: {e}")
                 return
 
         # The empty-reply gate must never swallow an ESCALATE verdict
@@ -6470,10 +6561,19 @@ def _process_instagram_event(event: dict) -> None:
                 )
                 reply = ESCALATE_FALLBACK_HOLDING_REPLY
                 fallback_escalation = True
-            else:
+            elif classification in ("AUTO", "DRAFT+APPROVE"):
+                # A deliberately empty reply — e.g. brain.md's "stay silent
+                # after a holding message" rule. Nothing to send.
                 print(
                     f"[INSTAGRAM] Twin returned empty result "
                     f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                )
+                return
+            else:
+                print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
+                _ig_pipeline_failure(
+                    sender_id, text, timestamp,
+                    f"unusable model output (classification={classification!r})",
                 )
                 return
 
@@ -6586,10 +6686,21 @@ def _process_instagram_event(event: dict) -> None:
                 print(f"[ESCALATE] PAUSE UNCONFIRMED for {sender_id} — founder must handle manually")
 
         else:
-            print(f"[INSTAGRAM] Unknown classification {classification!r} — no dispatch")
+            print(f"[INSTAGRAM] Unknown classification {classification!r}")
+            _ig_pipeline_failure(
+                sender_id, text, timestamp,
+                f"unusable model output (classification={classification!r})",
+            )
     except Exception as e:
         print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
+        # Not the reply pipeline: a reply may or may not have gone out
+        # before this, so alert only — never risk a duplicate message.
+        _alert_send_failure(
+            "Instagram", f"{type(e).__name__}: {e}",
+            locals().get("sender_id") or "(unknown)",
+            kind="pipeline", holding_sent=None,
+        )
 
 
 @app.route("/dashboard-data", methods=["GET"])

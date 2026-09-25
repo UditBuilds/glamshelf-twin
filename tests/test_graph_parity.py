@@ -10,7 +10,7 @@ first, so a test can't pass because both sides are wrong the same way.
 Recorded effects: ask_claude (LLM call incl. the fully assembled system
 prompt), _send_instagram_reply, send_draft_for_approval,
 send_telegram_notification, _pause_number, _log_instagram,
-_persist_seen_id.
+_persist_seen_id, _alert_send_failure.
 
 The escalation prefilters (_escalation_prefilter_hit,
 _bulk_commit_prefilter_hit) are deliberately NOT stubbed — they are pure
@@ -68,6 +68,7 @@ EFFECT_FNS = {
     "_pause_number",
     "_log_instagram",
     "_persist_seen_id",
+    "_alert_send_failure",
 }
 
 
@@ -130,6 +131,7 @@ class GraphParityTestCase(unittest.TestCase):
             patch.object(glam, "send_telegram_notification", recorder("send_telegram_notification")),
             patch.object(glam, "_pause_number", recorder("_pause_number")),
             patch.object(glam, "_log_instagram", recorder("_log_instagram")),
+            patch.object(glam, "_alert_send_failure", recorder("_alert_send_failure")),
         ]
         with ExitStack() as stack:
             for p in patches:
@@ -307,19 +309,70 @@ class GraphParityTestCase(unittest.TestCase):
         )
         self._assert_parity(old, new)
 
-    def test_llm_exception_without_prefilter_still_drops(self):
-        # No deterministic escalation signal + pipeline crash → nothing
-        # dispatched, exactly as before the fix.
+    def test_llm_exception_without_prefilter_sends_holding_line_and_alerts(self):
+        # Used to drop silently: no reply, no page (audit T1-8). Now the
+        # customer gets brain.md's holding line and the founder a
+        # rate-limited pipeline alert. Not an escalation: no pause.
         old = self._run(
             "old", llm_response=None,
             llm_exception=RuntimeError("DeepSeek unavailable"),
         )
-        self.assertEqual([c for c in effects(old) if c[0] != "ask_claude"], [])
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
+        (log,) = named(old, "_log_instagram")
+        self.assertEqual(log[1], (SENDER, MSG, glam.BRAIN_HOLDING_LINE, str(TIMESTAMP)))
+        self.assertEqual(log[2], {"source": "PIPELINE_HOLDING_IG"})
+        (alert,) = named(old, "_alert_send_failure")
+        self.assertEqual(alert[1], ("Instagram", "RuntimeError: DeepSeek unavailable", SENDER))
+        self.assertEqual(alert[2], {"kind": "pipeline", "holding_sent": True})
+        self.assertEqual(named(old, "send_telegram_notification"), [])
+        self.assertEqual(named(old, "_pause_number"), [])
 
         new = self._run(
             "new", llm_response=None,
             llm_exception=RuntimeError("DeepSeek unavailable"),
         )
+        self._assert_parity(old, new)
+
+    def test_holding_line_send_failure_logged_distinctly(self):
+        old = self._run(
+            "old", llm_response=None, send_ok=False,
+            llm_exception=RuntimeError("DeepSeek unavailable"),
+        )
+        (log,) = named(old, "_log_instagram")
+        self.assertEqual(log[2], {"source": "PIPELINE_HOLDING_FAILED_IG"})
+        (alert,) = named(old, "_alert_send_failure")
+        self.assertEqual(alert[2], {"kind": "pipeline", "holding_sent": False})
+
+        new = self._run(
+            "new", llm_response=None, send_ok=False,
+            llm_exception=RuntimeError("DeepSeek unavailable"),
+        )
+        self._assert_parity(old, new)
+
+    def test_unknown_classification_sends_holding_line_and_alerts(self):
+        # Used to drop silently with a log line only.
+        maybe = json.dumps({"classification": "MAYBE", "reply": "hmm"})
+        old = self._run("old", llm_response=maybe)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
+        (alert,) = named(old, "_alert_send_failure")
+        self.assertEqual(
+            alert[1], ("Instagram", "unusable model output (classification='MAYBE')", SENDER)
+        )
+
+        new = self._run("new", llm_response=maybe)
+        self._assert_parity(old, new)
+
+    def test_deliberately_empty_auto_reply_stays_silent(self):
+        # brain.md's "stay silent after a holding message" rule returns
+        # AUTO with reply "" — that is NOT a failure: nothing is sent and
+        # nobody is paged.
+        silent = json.dumps({"classification": "AUTO", "reply": ""})
+        old = self._run("old", llm_response=silent)
+        self.assertEqual([c for c in effects(old) if c[0] != "ask_claude"], [])
+
+        new = self._run("new", llm_response=silent)
         self._assert_parity(old, new)
 
     def test_fallback_holding_send_failure_still_pages(self):
