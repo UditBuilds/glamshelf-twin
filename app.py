@@ -3054,8 +3054,8 @@ def _edit_timeout_check(draft_id: str) -> None:
 def normalize_wa(number: str) -> str:
     """Reduce a phone number to comparable digits.
 
-    Strips non-digit characters and any leading zeros, so "+91 92174 70151",
-    "0919217470151", and "919217470151" all compare equal. Used for safe
+    Strips non-digit characters and any leading zeros, so "+91 98765 43210",
+    "0919876543210", and "919876543210" all compare equal. Used for safe
     cross-format equality checks against BUSINESS_NUMBER / OWNER_NUMBER.
     """
     return "".join(c for c in (number or "") if c.isdigit()).lstrip("0")
@@ -3712,8 +3712,8 @@ def _rag_load_model() -> None:
     print("[RAG] fastembed model unavailable after retry — retrieval disabled, brain-only behavior")
 
 
-# Last sqlite-vec load failure, kept for /healthz so the real reason is
-# visible from the public probe without log-diving. None = loading works
+# Last sqlite-vec load failure, kept for the keyed /healthz view
+# (X-Dashboard-Key) so the real reason is visible without log-diving. None = loading works
 # (or hasn't been attempted yet). Logged once, not per connection —
 # _rag_db() runs on every retrieval and would spam the Render log stream.
 _rag_vec_load_error: str | None = None
@@ -4694,33 +4694,64 @@ def _healthz_sqlite_vec_status() -> dict:
         return {"loaded": False, "error": f"probe failed: {type(e).__name__}: {e}"}
 
 
+def _dashboard_key_header_ok() -> bool:
+    """True iff the request carries an X-Dashboard-Key header matching
+    DASHBOARD_KEY.
+
+    Header only, never a ?key= URL param — a URL value lands in access
+    logs, browser history and Referer headers. Compared as bytes:
+    hmac.compare_digest raises TypeError on non-ASCII str input, which a
+    client-supplied header can contain."""
+    provided = request.headers.get("X-Dashboard-Key") or ""
+    if not provided:
+        return False
+    return hmac.compare_digest(
+        provided.encode("utf-8"), DASHBOARD_KEY.encode("utf-8")
+    )
+
+
 @app.route("/healthz")
 def healthz():
     """Liveness probe. Render can ping this to confirm the deploy works.
-    Reports whether brain.md is present so a misconfigured deploy is obvious.
-    Intentionally NOT behind login_required — Render needs to hit it without auth."""
-    db_status = "ok"
+    Intentionally NOT behind login_required — Render needs to hit it without auth.
+
+    The public answer is deliberately minimal: {"status": "ok"}, or HTTP
+    503 {"status": "error"} when the DB can't be read — no error text,
+    counts or phone numbers. The service URL is published in this public
+    repo, and the old public response handed anyone the owner's personal
+    number (audit T1-7).
+
+    The full diagnostics below are returned only when the request carries
+    an X-Dashboard-Key header matching DASHBOARD_KEY."""
+    db_error = None
     total_logged = 0
     total_orders = 0
     total_instagram = 0
     try:
         conn = sqlite3.connect(DB_PATH)
-        total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
-        total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-        total_instagram = conn.execute("SELECT COUNT(*) FROM instagram_logs").fetchone()[0]
-        conn.close()
+        try:
+            total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
+            total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+            total_instagram = conn.execute("SELECT COUNT(*) FROM instagram_logs").fetchone()[0]
+        finally:
+            conn.close()
     except Exception as e:
-        db_status = f"error: {type(e).__name__}: {e}"
+        db_error = f"{type(e).__name__}: {e}"
+
+    status = "error" if db_error else "ok"
+    http_status = 503 if db_error else 200
+    if not _dashboard_key_header_ok():
+        return jsonify({"status": status}), http_status
 
     return jsonify({
-        "status": "ok",
+        "status": status,
         "brain_present": BRAIN_FILE.exists(),
         "brain_path": str(BRAIN_FILE),
         "model": DEEPSEEK_MODEL,
         "vision_model": CLAUDE_MODEL,
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
         "claude_vision_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
-        "db": db_status,
+        "db": f"error: {db_error}" if db_error else "ok",
         # Live sqlite-vec probe: loads the extension on a fresh connection
         # right now, so this reflects the current runtime, not a cached
         # boot-time result. error carries the classified failure reason
@@ -4730,13 +4761,14 @@ def healthz():
         "total_orders": total_orders,
         "total_instagram": total_instagram,
         "seen_ids_cached": len(_seen_ids),
-        # Normalized protected numbers — diagnostic so misconfigured env vars
-        # are obvious from the public health probe. Phone numbers, not secrets.
+        # Normalized protected numbers — diagnostic so misconfigured env
+        # vars are obvious. Keyed view only: OWNER_NUMBER is the founder's
+        # personal number.
         "protected_numbers": [
             normalize_wa(BUSINESS_NUMBER),
             normalize_wa(OWNER_NUMBER),
         ],
-    })
+    }), http_status
 
 
 @app.route("/inventory-debug")
