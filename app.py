@@ -2477,13 +2477,18 @@ def _udit_replied_recently_ig(sender_id: str, window_seconds: int = HUMAN_HANDLI
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
+        # A RESUME_IG marker (Udit's "▶️ Resume bot" / "#resume <id>" from
+        # Telegram) cancels every earlier manual reply: only human rows
+        # written AFTER the latest resume still hold the bot back.
         cur.execute(
             "SELECT 1 FROM instagram_logs "
             "WHERE sender_id = ? "
             "AND source = 'HUMAN_UDIT_INSTAGRAM' "
             "AND logged_at >= datetime('now', ?) "
+            "AND id > COALESCE((SELECT MAX(id) FROM instagram_logs "
+            "                   WHERE sender_id = ? AND source = 'RESUME_IG'), 0) "
             "LIMIT 1",
-            (sender_id, f"-{int(window_seconds)} seconds"),
+            (sender_id, f"-{int(window_seconds)} seconds", sender_id),
         )
         hit = cur.fetchone() is not None
         conn.close()
@@ -2491,6 +2496,23 @@ def _udit_replied_recently_ig(sender_id: str, window_seconds: int = HUMAN_HANDLI
     except Exception as e:
         print(f"[HUMAN_HANDLING_IG] DB check failed for {sender_id}: {type(e).__name__}: {e}")
         return False
+
+
+def _resume_sender(sender_id: str) -> bool:
+    """Lift a pause early from Telegram (▶️ Resume bot, or "#resume <id>").
+
+    Clears the paused_senders row AND writes a RESUME_IG marker, so the
+    Instagram human-handling net (_udit_replied_recently_ig, which reads
+    HUMAN_UDIT_INSTAGRAM rows from the last 4h) stops holding the bot back
+    too — otherwise one manual reply from Udit would keep the bot silent
+    for the rest of the window despite the resume. The marker row has an
+    empty message_text, so conversation history never sees it. Returns
+    True if a pause was actually cleared.
+    """
+    was_paused = _unpause_number(sender_id)
+    _log_instagram(sender_id, "", None, "", source="RESUME_IG")
+    print(f"[RESUME] Bot resumed for {sender_id} from Telegram (pause cleared: {was_paused})")
+    return was_paused
 
 
 def _load_instagram_history(sender_id: str) -> list[dict]:
@@ -2533,7 +2555,8 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
                    OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG',
                                      'ESCALATE_HOLDING_FAILED_IG',
                                      'PIPELINE_HOLDING_FAILED_IG',
-                                     'PHOTO_IG_FAILED'))
+                                     'PHOTO_IG_FAILED',
+                                     'LEAD_FAILED_IG'))
               AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
             LIMIT 30
@@ -2737,8 +2760,20 @@ def send_telegram_notification(
     channel: str = "WhatsApp",
     customer_id: str | None = None,
     holding_reply_sent: bool = False,
+    customer_line: str | None = None,
 ) -> None:
-    """Fire a Telegram message to the founder for DRAFT+APPROVE and ESCALATE.
+    """Fire a Telegram message to the founder for DRAFT+APPROVE, ESCALATE
+    and LEAD.
+
+    `customer_line` (Instagram escalations, audit T1-5): the IG handler now
+    decides and sends the customer-facing text itself (holding line, safety
+    line, or deliberate silence for legal/press), and passes one line
+    saying exactly what happened. When set, the ESCALATE message shows that
+    line, Twin's own draft as "not sent", and a ▶️ Resume bot button next
+    to 🛑 Stop. None keeps every existing message byte-identical.
+
+    "LEAD" (Instagram): someone testing Twin or asking about the AI
+    service — no pause, just a heads-up with what Twin replied.
 
     `holding_reply_sent` (default False keeps every existing message
     byte-identical): True means the fallback-escalation path already
@@ -2801,6 +2836,32 @@ def send_telegram_notification(
             f'"{reply}"\n\n'
             f"→ Review and send manually from {approve_destination}."
         )
+    elif classification == "ESCALATE" and customer_line is not None:
+        draft_block = f'Twin\'s draft (not sent):\n"{reply}"\n\n' if reply else ""
+        resume_hint = (
+            f' — tap ▶️ Resume bot or send "#resume {customer_id}" here to lift it early.'
+            if customer_id else "."
+        )
+        text = (
+            "🔴 ESCALATE — Take over directly\n\n"
+            f"{sender_block}"
+            "Customer said:\n"
+            f'"{customer_message}"\n\n'
+            f"{customer_line}\n\n"
+            f"{draft_block}"
+            f"→ Take over in {approve_destination}. Twin is paused for this "
+            f"customer for 4h{resume_hint}"
+        )
+    elif classification == "LEAD":
+        text = (
+            "🟢 LEAD — someone is testing Twin or asking about the AI assistant\n\n"
+            f"{sender_block}"
+            "They said:\n"
+            f'"{customer_message}"\n\n'
+            "Twin replied:\n"
+            f'"{reply}"\n\n'
+            "→ Message them personally. Twin keeps answering them meanwhile (no pause)."
+        )
     elif classification == "ESCALATE":
         if holding_reply_sent:
             reply_label = "Holding reply SENT to the customer:"
@@ -2837,14 +2898,20 @@ def send_telegram_notification(
     # callback_data fits well under Telegram's 64-byte limit:
     # "action:pause_escalate|id:<id>" ≈ 30-52 bytes.
     if classification == "ESCALATE" and customer_id:
-        payload["reply_markup"] = {
-            "inline_keyboard": [[
-                {
-                    "text": "🛑 Stop bot for this customer",
-                    "callback_data": f"action:pause_escalate|id:{customer_id}",
-                }
-            ]]
-        }
+        buttons = [
+            {
+                "text": "🛑 Stop bot for this customer",
+                "callback_data": f"action:pause_escalate|id:{customer_id}",
+            }
+        ]
+        if customer_line is not None:
+            # Instagram escalations auto-pause for 4h; this lifts it early
+            # ("action:resume|id:<17-digit id>" ≈ 34 bytes, under the 64 cap).
+            buttons.append({
+                "text": "▶️ Resume bot",
+                "callback_data": f"action:resume|id:{customer_id}",
+            })
+        payload["reply_markup"] = {"inline_keyboard": [buttons]}
 
     try:
         response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
@@ -3096,6 +3163,33 @@ def _handle_telegram_callback(cb: dict) -> None:
         print(f"[ESCALATE-PAUSE] Udit tapped Stop bot — paused {customer_id} for 4h")
         return
 
+    # "▶️ Resume bot" on an Instagram escalation — lift the 4h pause early.
+    # Same stateless shape as pause_escalate: `id` is the customer id.
+    if action == "resume":
+        customer_id = parsed.get("id") or ""
+        if not customer_id:
+            _telegram_api("answerCallbackQuery", {
+                "callback_query_id": callback_id, "text": "No customer id"
+            })
+            return
+        _resume_sender(customer_id)
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "▶️ Bot resumed for this customer",
+        })
+        original_text = (msg.get("text") or "")
+        _telegram_api("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+        _telegram_api("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": (original_text + "\n\n▶️ Bot resumed — Twin answers this customer again")[:4096],
+        })
+        return
+
     # Atomic take — _draft_take removes-and-returns inside a BEGIN
     # IMMEDIATE transaction, so two rapid taps racing into this function
     # only one gets the draft; the other gets None and falls through to
@@ -3249,6 +3343,28 @@ def _handle_telegram_message(msg: dict) -> None:
         return
     if not _is_authorized_telegram_chat(chat_id):
         return  # silently drop anything from unauthorized chats
+
+    # "#resume <customer id>" lifts a pause early — the same keyword as the
+    # WhatsApp #resume directive, typed here instead. Handled BEFORE the edit
+    # flow so a command can never go to a customer as an edited reply.
+    if re.match(r"^[#/]resume\b", text, re.IGNORECASE):
+        m = re.match(r"^[#/]resume\s+(\S+)\s*$", text, re.IGNORECASE)
+        if not m:
+            _telegram_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Usage: #resume <customer id> — the id is in the escalation message.",
+            })
+            return
+        customer_id = m.group(1)
+        was_paused = _resume_sender(customer_id)
+        _telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                f"▶️ Bot resumed for {customer_id}"
+                + ("" if was_paused else " (it wasn't paused, but any human-takeover hold is cleared too)")
+            ),
+        })
+        return
 
     # Find oldest awaiting-edit draft from this chat. If somehow there are
     # multiple, the oldest is the most likely one Udit meant — but in
@@ -4448,6 +4564,127 @@ BRAIN_HOLDING_LINE = (
     "back to you within a few hours 🤍"
 )
 
+# Instagram escalations no longer mean silence (audit T1-5). What the
+# customer gets is decided in _ig_escalation_reply:
+#   - legal threat or press/media: nothing (founder decision), or, when the
+#     message also reports a reaction, ALLERGY_SAFETY_TEXT alone;
+#   - an allergic reaction / symptoms: ALLERGY_HOLDING_REPLY — brain.md's
+#     allergy holding reply: the safety advice plus a holding line;
+#   - anything else, including unusable model output: BRAIN_HOLDING_LINE.
+# (WhatsApp is unchanged: ESCALATE_FALLBACK_HOLDING_REPLY on fallback only.)
+ALLERGY_SAFETY_TEXT = (
+    "I'm really sorry to hear this. Please stop using the product immediately "
+    "and consult a doctor."
+)
+ALLERGY_HOLDING_REPLY = (
+    ALLERGY_SAFETY_TEXT
+    + " Team The Glam Shelf will personally look into this and get back to you shortly 🤍"
+)
+
+# Someone testing Twin, a brand owner, or anyone asking about the AI service
+# (audit T1-5): a friendly line, a Telegram LEAD notice and NO pause. Sent
+# verbatim when the model didn't write a reply of its own. Mirrors brain.md
+# RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS ASSISTANT.
+LEAD_REPLY = "Thanks for checking it out! Udit will message you personally 🤍"
+
+# The optional "tag" field of the model's JSON (see build_user_message and
+# brain.md's Output Contract). Anything else parses as "".
+TWIN_TAGS = ("LEAD", "SAFETY", "LEGAL", "PRESS")
+
+# Which prefilter phrases are legal threats — the escalations that stay
+# SILENT on Instagram. Social-media threats and "refund karo" still get
+# the holding line.
+_LEGAL_PREFILTER_PHRASES = ("lawyer", "consumer court", "legal notice", "police")
+
+# Deterministic backstops for a missing tag. Consulted only for a message
+# that is ALREADY escalating, so they can never cause an escalation. They
+# avoid bare words that collide with lash talk: "press" (press-on lashes),
+# "media" (social media), "reaction" (a reaction to the look).
+_PRESS_RE = re.compile(
+    r"\b(journalist|reporter|newspaper|magazine|editor at"
+    r"|news (channel|portal|outlet|story)|media (house|outlet|enquiry|inquiry)"
+    r"|press (enquiry|inquiry|release|coverage))\b",
+    re.IGNORECASE,
+)
+_SAFETY_RE = re.compile(
+    r"\b(allerg\w*|rash(es)?|swell(ing|ed)?|swollen|itch(ing|y)?|irritat\w*"
+    r"|redness|infect\w*|burning|khujli|jalan|sujan|daane)\b",
+    re.IGNORECASE,
+)
+# Testers / brand owners whose reply came back without the LEAD tag. Only
+# ever adds a LEAD notice to an AUTO reply — it can't turn an escalation
+# into a lead.
+_LEAD_RE = re.compile(
+    r"\budit\b.{0,40}\b(test\w*|tr(y|ying|ied|ies)|check\w*)"
+    r"|\b(test\w*|tr(y|ying|ied|ies)|check\w*)\b.{0,40}\b(ai|bot|chat ?bot|assistant|twin|automation)\b"
+    r"|\b(ai|chat ?bot|assistant|automation)\b.{0,40}\bfor (my|our) (brand|business|store|company)\b"
+    r"|\bbrand owner\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_twin_tag(raw: str) -> str:
+    """The model's optional "tag", upper-cased; "" when absent, unknown or
+    the body isn't a JSON object. Never raises."""
+    try:
+        parsed = json.loads(raw or "")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    tag = str(parsed.get("tag") or "").strip().upper()
+    return tag if tag in TWIN_TAGS else ""
+
+
+def _legal_threat_hit(message: str) -> bool:
+    """Does the escalation prefilter see a LEGAL phrase anywhere in the
+    message (not just its first match)? Honors ESCALATION_PREFILTER_DISABLED."""
+    if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+        return False
+    return any(
+        " ".join(m.group(0).lower().split()) in _LEGAL_PREFILTER_PHRASES
+        for m in _ESCALATION_PREFILTER_PATTERNS.finditer(message or "")
+    )
+
+
+def _ig_escalation_reply(message: str, tag: str) -> tuple[str, str]:
+    """What an Instagram escalation sends the customer: (kind, text), where
+    text "" means deliberate silence. The model's tag decides; the
+    deterministic backstops catch an untagged legal threat, press enquiry
+    or health report:
+      legal / press            -> silence (founder decision)
+      legal / press + symptoms -> ALLERGY_SAFETY_TEXT only, no promise
+      symptoms                 -> ALLERGY_HOLDING_REPLY
+      anything else            -> BRAIN_HOLDING_LINE
+    """
+    legal = tag == "LEGAL" or _legal_threat_hit(message)
+    press = not legal and (tag == "PRESS" or bool(_PRESS_RE.search(message or "")))
+    safety = tag == "SAFETY" or bool(_SAFETY_RE.search(message or ""))
+    if legal or press:
+        kind = "legal" if legal else "press"
+        return (f"{kind}+safety", ALLERGY_SAFETY_TEXT) if safety else (kind, "")
+    if safety:
+        return "safety", ALLERGY_HOLDING_REPLY
+    return "other", BRAIN_HOLDING_LINE
+
+
+def _ig_is_lead(message: str, classification: str, reply: str, tag: str) -> bool:
+    """Does this Instagram message take the LEAD path (friendly reply, LEAD
+    notice, no pause)? Only when nothing more serious is going on: no
+    prefilter escalation (legal phrase, bulk commit) and no legal / press /
+    health signal. The model's LEAD tag may turn its own ESCALATE into a
+    lead — the tester who "asked for the founder by name" — but the regex
+    backstop only ever adds the notice to an AUTO reply."""
+    if classification not in ("AUTO", "ESCALATE"):
+        return False
+    if _escalation_prefilter_hit(message) or _bulk_commit_prefilter_hit(message) is not None:
+        return False
+    if _ig_escalation_reply(message, tag)[0] != "other":
+        return False
+    if tag == "LEAD":
+        return True
+    return classification == "AUTO" and bool(reply) and bool(_LEAD_RE.search(message or ""))
+
 
 def _escalation_prefilter_hit(message: str) -> str | None:
     """Return the matched high-risk phrase, or None.
@@ -4695,7 +4932,9 @@ def build_user_message(
         "No prose, greeting, or commentary before or after the JSON. Your response "
         "MUST start with the character { and MUST end with the character }.\n"
         "Use this exact shape:\n"
-        '{ "classification": "AUTO" | "DRAFT+APPROVE" | "ESCALATE", "reply": "..." }'
+        '{ "classification": "AUTO" | "DRAFT+APPROVE" | "ESCALATE", "reply": "...", '
+        '"tag": "" | "LEAD" | "SAFETY" | "LEGAL" | "PRESS" }\n'
+        'Leave "tag" as "" unless one of the tag rules in the Output Contract (Section 1) applies.'
     )
 
 
@@ -6706,6 +6945,107 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
+def _ig_escalate(
+    sender_id: str,
+    text: str,
+    timestamp: str,
+    draft_reply: str,
+    tag: str,
+    fallback: bool,
+) -> dict:
+    """Instagram ESCALATE — no longer silence by default (audit T1-5).
+
+    Sends what _ig_escalation_reply decides (holding line, safety line, or
+    nothing for legal threats and press), pages the founder with exactly
+    what the customer got, auto-pauses the thread for 4h (lift it early
+    with ▶️ Resume bot or "#resume <id>" in Telegram) and logs what was
+    delivered. `draft_reply` is the model's own draft — shown to the
+    founder, never sent. `fallback` means the model output was unusable;
+    it no longer changes what the customer gets.
+
+    Shared with graph.py's dispatch_escalate so the two stay in parity.
+    """
+    kind, customer_text = _ig_escalation_reply(text, tag)
+    sent, send_err = False, ""
+    if customer_text:
+        sent, send_err = _send_instagram_reply(sender_id, customer_text)
+        if sent:
+            print(f"[ESCALATE] {kind} escalation — sent to {sender_id}: {customer_text[:60]!r}")
+        else:
+            print(f"[ESCALATE] {kind} escalation — send FAILED to {sender_id}: {send_err}")
+    else:
+        print(f"[ESCALATE] {kind} escalation — deliberately silent for {sender_id}")
+
+    if not customer_text:
+        customer_line = f"Nothing sent to the customer — {kind} escalations get no automated reply."
+    elif sent:
+        customer_line = f'Sent to the customer:\n"{customer_text}"'
+    else:
+        customer_line = f'⚠️ Tried to send this, but it FAILED ({send_err}):\n"{customer_text}"'
+    if fallback:
+        customer_line += "\n(Twin's own reply was unusable.)"
+    try:
+        send_telegram_notification(
+            "ESCALATE", text, draft_reply,
+            sender_info=f"Instagram DM — sender {sender_id}",
+            channel="Instagram",
+            customer_id=sender_id,
+            holding_reply_sent=sent,
+            customer_line=customer_line,
+        )
+        print(f"[INSTAGRAM-ESCALATE] Notified founder for {sender_id}")
+    except Exception as tg_err:
+        print(f"[INSTAGRAM-TG] Notification failed: {type(tg_err).__name__}: {tg_err}")
+
+    pause_confirmed = _pause_number(sender_id)
+    if customer_text and sent:
+        # Delivered — belongs in conversation history.
+        _log_instagram(sender_id, text, customer_text, timestamp, source="ESCALATE_HOLDING_IG")
+    elif customer_text:
+        # Attempted but unconfirmed: kept for audit, excluded from history.
+        _log_instagram(sender_id, text, customer_text, timestamp, source="ESCALATE_HOLDING_FAILED_IG")
+    else:
+        # Deliberate silence: NULL reply keeps the row out of history.
+        _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
+    if pause_confirmed:
+        print(f"[ESCALATE] Auto-paused {sender_id} for 4h")
+    else:
+        print(f"[ESCALATE] PAUSE UNCONFIRMED for {sender_id} — founder must handle manually")
+    return {"channel": "telegram_escalate", "paused": True, "holding_reply_sent": sent, "kind": kind}
+
+
+def _ig_lead(sender_id: str, text: str, timestamp: str, reply: str) -> bool:
+    """LEAD path (audit T1-5): someone testing Twin, a brand owner, or
+    anyone asking about the AI service. Sends the model's reply when it
+    wrote one (brain.md tells it to use the LEAD line, after a short answer
+    if they also asked something), else LEAD_REPLY verbatim; pages the
+    founder with a LEAD notice; and does NOT pause — the tester keeps
+    chatting with Twin like a customer would.
+
+    Shared with graph.py's dispatch_lead so the two stay in parity."""
+    customer_text = reply or LEAD_REPLY
+    sent, send_err = _send_instagram_reply(sender_id, customer_text)
+    _log_instagram(
+        sender_id, text, customer_text, timestamp,
+        source="LEAD_IG" if sent else "LEAD_FAILED_IG",
+    )
+    shown = customer_text if sent else f"(send FAILED: {send_err}) {customer_text}"
+    try:
+        send_telegram_notification(
+            "LEAD", text, shown,
+            sender_info=f"Instagram DM — sender {sender_id}",
+            channel="Instagram",
+            customer_id=sender_id,
+        )
+    except Exception as tg_err:
+        print(f"[INSTAGRAM-TG] LEAD notice failed: {type(tg_err).__name__}: {tg_err}")
+    print(
+        f"[INSTAGRAM-LEAD] {'Replied to' if sent else 'Reply FAILED for'} {sender_id}; "
+        f"founder notified, no pause"
+    )
+    return sent
+
+
 def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> None:
     """Instagram side of a refused admission (audit T1-3): the notice (at
     most once per window) via _handle_llm_limit, plus a log row so the
@@ -6946,6 +7286,7 @@ def _process_instagram_event(event: dict) -> None:
         # Multi-turn context, IG-side only.
         history = _load_instagram_history(sender_id)
 
+        _raw = ""
         try:
             classification, reply, _raw = draft_reply_logic(
                 text, order_line, history=history, source="Instagram DM"
@@ -6969,18 +7310,22 @@ def _process_instagram_event(event: dict) -> None:
                 _ig_pipeline_failure(sender_id, text, timestamp, f"{type(e).__name__}: {e}")
                 return
 
+        # Testers, brand owners and people asking about the AI service get
+        # a friendly reply, a LEAD notice and no 4h lockout (audit T1-5) —
+        # unless something more serious (legal, press, health, a
+        # prefilter hit) is going on; see _ig_is_lead.
+        tag = _parse_twin_tag(_raw)
+        if _ig_is_lead(text, classification, reply, tag):
+            _ig_lead(sender_id, text, timestamp, reply if classification == "AUTO" else "")
+            return
+
         # The empty-reply gate must never swallow an ESCALATE verdict
-        # (prefilter-forced or LLM-decided): substitute the stock holding
-        # reply and dispatch. Everything else with unusable output still
-        # drops silently, as before.
+        # (prefilter-forced or LLM-decided): it escalates like any other,
+        # and _ig_escalate decides what the customer gets.
         fallback_escalation = False
         if not classification or not reply:
             if classification == "ESCALATE":
-                print(
-                    "[ESCALATE] Verdict with no usable reply — dispatching "
-                    "fallback holding reply instead of dropping"
-                )
-                reply = ESCALATE_FALLBACK_HOLDING_REPLY
+                print("[ESCALATE] Verdict with no usable reply — escalating instead of dropping")
                 fallback_escalation = True
             elif classification in ("AUTO", "DRAFT+APPROVE"):
                 # A deliberately empty reply — e.g. brain.md's "stay silent
@@ -7000,10 +7345,10 @@ def _process_instagram_event(event: dict) -> None:
 
         ig_sender_info = f"Instagram DM — sender {sender_id}"
 
-        # Classification gate — mirrors the WATI /webhook branch. Only
-        # AUTO ships a customer-facing reply immediately; DRAFT+APPROVE
-        # waits for a Telegram button tap; ESCALATE sends nothing and
-        # hands the thread to the founder.
+        # Classification gate. AUTO ships the reply immediately;
+        # DRAFT+APPROVE waits for a Telegram button tap; ESCALATE pages the
+        # founder, pauses the thread and — unlike WhatsApp — sends the
+        # customer a holding line unless it's a legal threat or press.
         if classification == "AUTO":
             # Only claim success when the Graph API actually accepted the
             # send — a 400 (e.g. expired token) used to still log
@@ -7056,55 +7401,10 @@ def _process_instagram_event(event: dict) -> None:
             print(f"[INSTAGRAM-DRAFT] Notified founder for {sender_id} (buttons={sent_with_buttons})")
 
         elif classification == "ESCALATE":
-            # Normal ESCALATE sends nothing to the customer — the founder
-            # takes over directly. The FALLBACK path (escalation verdict
-            # with unusable LLM output) is the one exception: the stock
-            # holding reply ships to the customer first, so a legal threat
-            # never gets silence just because the model's JSON broke.
-            # The notification carries the 🛑 Stop button (customer_id)
-            # and the 4h auto-pause keeps the twin quiet on this thread
-            # meanwhile. Wrapped in its own try so a Telegram outage
-            # doesn't take down the IG flow.
-            holding_sent = False
-            holding_err = ""
-            if fallback_escalation:
-                holding_sent, holding_err = _send_instagram_reply(sender_id, reply)
-                if holding_sent:
-                    print(f"[ESCALATE] Fallback holding reply sent to {sender_id}")
-                else:
-                    print(f"[ESCALATE] Fallback holding reply FAILED to {sender_id}: {holding_err}")
-            try:
-                send_telegram_notification(
-                    classification, text, reply,
-                    sender_info=ig_sender_info,
-                    channel="Instagram",
-                    customer_id=sender_id,
-                    holding_reply_sent=holding_sent,
-                )
-                print(f"[INSTAGRAM-ESCALATE] Notified founder for {sender_id}")
-            except Exception as tg_err:
-                print(
-                    f"[INSTAGRAM-TG] Notification failed: "
-                    f"{type(tg_err).__name__}: {tg_err}"
-                )
-            pause_confirmed = _pause_number(sender_id)
-            if fallback_escalation and holding_sent:
-                # Delivered text — belongs in conversation history, so it
-                # gets a source _load_instagram_history does NOT exclude.
-                _log_instagram(sender_id, text, reply, timestamp, source="ESCALATE_HOLDING_IG")
-            elif fallback_escalation:
-                # Attempted-but-unconfirmed send: keep the text for audit
-                # under a source the history loader excludes (the customer
-                # never saw it).
-                _log_instagram(sender_id, text, reply, timestamp, source="ESCALATE_HOLDING_FAILED_IG")
-            else:
-                # NULL reply keeps this row out of _load_instagram_history —
-                # the customer never received anything for this message.
-                _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
-            if pause_confirmed:
-                print(f"[ESCALATE] Auto-paused {sender_id} for 4h")
-            else:
-                print(f"[ESCALATE] PAUSE UNCONFIRMED for {sender_id} — founder must handle manually")
+            # Holding line / safety line / deliberate silence (legal,
+            # press), founder page with a ▶️ Resume button, 4h pause, log —
+            # all in _ig_escalate, shared with graph.py.
+            _ig_escalate(sender_id, text, timestamp, reply, tag, fallback_escalation)
 
         else:
             print(f"[INSTAGRAM] Unknown classification {classification!r}")

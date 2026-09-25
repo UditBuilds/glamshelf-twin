@@ -12,7 +12,9 @@ Every incoming message on WhatsApp or Instagram is classified into one of three 
 
 **DRAFT+APPROVE** — The twin drafts a reply but isn't confident enough to send alone. The founder gets it on Telegram with one-tap buttons: ✅ Send, ✏️ Edit, or ⛔ Skip. The customer waits; nothing ships until the founder acts.
 
-**ESCALATE** — Situations that need human judgment: refund disputes, damage claims, angry customers, legal threats, bulk negotiations. The twin sends a holding reply ("I'm looping in the founder — they'll get back to you shortly"), notifies the founder on Telegram, and pauses itself for that customer for 4 hours to avoid duplicate messages.
+**ESCALATE** — Situations that need human judgment: refund disputes, damage claims, angry customers, legal threats, bulk negotiations. The founder is paged on Telegram and the twin pauses itself for that customer for 4 hours (lift it early from Telegram with ▶️ Resume bot or `#resume <id>`). On Instagram the customer gets a standard holding line — or, for an allergic reaction, advice to stop using the product and see a doctor — except legal threats and press enquiries, which get no automated reply. On WhatsApp a normal escalation sends nothing; a stock holding reply goes out only when the model's output was unusable.
+
+People testing the assistant, or asking about it, get a friendly one-liner and the founder a LEAD notice on Telegram — no pause.
 
 ---
 
