@@ -2862,6 +2862,28 @@ def send_telegram_notification(
             f'"{reply}"\n\n'
             "→ Message them personally. Twin keeps answering them meanwhile (no pause)."
         )
+    elif classification in ("ORDER", "RESTOCK"):
+        # Instagram heads-up for an AUTO reply Twin can't fully back up
+        # (audit T1-6): it can't see orders, and there's no waitlist.
+        headline, action = {
+            "ORDER": (
+                "📦 ORDER question — Twin can't see orders or tracking",
+                f"→ Reply with the real status from {approve_destination}.",
+            ),
+            "RESTOCK": (
+                "🔔 RESTOCK request — there's no waitlist",
+                f"→ Twin pointed them to @glamshelfstore. Reach out from {approve_destination} if you want to.",
+            ),
+        }[classification]
+        text = (
+            f"{headline}\n\n"
+            f"{sender_block}"
+            "They said:\n"
+            f'"{customer_message}"\n\n'
+            "Twin replied:\n"
+            f'"{reply}"\n\n'
+            f"{action}"
+        )
     elif classification == "ESCALATE":
         if holding_reply_sent:
             reply_label = "Holding reply SENT to the customer:"
@@ -4559,10 +4581,7 @@ ESCALATE_FALLBACK_HOLDING_REPLY = (
 # brain.md unreadable, unusable model output — so the customer is never
 # left in silence while the founder is alerted (audit T1-8). Keep in sync
 # with brain.md.
-BRAIN_HOLDING_LINE = (
-    "Understood — Team The Glam Shelf will personally look into this and get "
-    "back to you within a few hours 🤍"
-)
+BRAIN_HOLDING_LINE = "I've passed this to the team — they'll reply to you here 🤍"
 
 # Instagram escalations no longer mean silence (audit T1-5). What the
 # customer gets is decided in _ig_escalation_reply:
@@ -4589,7 +4608,7 @@ LEAD_REPLY = "Thanks for checking it out! Udit will message you personally 🤍"
 
 # The optional "tag" field of the model's JSON (see build_user_message and
 # brain.md's Output Contract). Anything else parses as "".
-TWIN_TAGS = ("LEAD", "SAFETY", "LEGAL", "PRESS")
+TWIN_TAGS = ("LEAD", "SAFETY", "LEGAL", "PRESS", "ORDER", "RESTOCK")
 
 # Which prefilter phrases are legal threats — the escalations that stay
 # SILENT on Instagram. Social-media threats and "refund karo" still get
@@ -4619,6 +4638,26 @@ _LEAD_RE = re.compile(
     r"|\b(test\w*|tr(y|ying|ied|ies)|check\w*)\b.{0,40}\b(ai|bot|chat ?bot|assistant|twin|automation)\b"
     r"|\b(ai|chat ?bot|assistant|automation)\b.{0,40}\bfor (my|our) (brand|business|store|company)\b"
     r"|\bbrand owner\b",
+    re.IGNORECASE,
+)
+
+
+# Order / restock questions on an AUTO reply the model didn't tag (audit
+# T1-6). They only ever add a founder heads-up, so a false positive costs
+# one extra Telegram message.
+_ORDER_RE = re.compile(
+    r"#\s?\d{3,6}\b"
+    r"|\border\s*(id|no|number|status)\b"
+    r"|\b(my|mera|meri) (order|parcel|package)\b"
+    r"|\btrack(ing)?\b|\bcourier\b"
+    r"|\b(kab|kb) (aayega|ayega|aaega|milega)\b"
+    r"|\bnot (yet )?(delivered|received|arrived)\b"
+    r"|\bnahi (aaya|aya|mila)\b",
+    re.IGNORECASE,
+)
+_RESTOCK_RE = re.compile(
+    r"\brestock\w*|\bback in stock\b|\bnotify me\b|\bwait ?list\b"
+    r"|\bwhen will .{0,30}\b(be )?(back|available|in stock)\b",
     re.IGNORECASE,
 )
 
@@ -4933,7 +4972,7 @@ def build_user_message(
         "MUST start with the character { and MUST end with the character }.\n"
         "Use this exact shape:\n"
         '{ "classification": "AUTO" | "DRAFT+APPROVE" | "ESCALATE", "reply": "...", '
-        '"tag": "" | "LEAD" | "SAFETY" | "LEGAL" | "PRESS" }\n'
+        '"tag": "" | "LEAD" | "SAFETY" | "LEGAL" | "PRESS" | "ORDER" | "RESTOCK" }\n'
         'Leave "tag" as "" unless one of the tag rules in the Output Contract (Section 1) applies.'
     )
 
@@ -7046,6 +7085,39 @@ def _ig_lead(sender_id: str, text: str, timestamp: str, reply: str) -> bool:
     return sent
 
 
+def _ig_fyi_topic(message: str, tag: str) -> str:
+    """"ORDER" / "RESTOCK" when an AUTO Instagram reply needs a founder
+    heads-up, else "". The model's tag decides; narrow regex backstops catch
+    an untagged order-number / tracking question or a "notify me" request.
+    Only ever adds a Telegram notice — never changes the customer reply."""
+    if tag in ("ORDER", "RESTOCK"):
+        return tag
+    if _ORDER_RE.search(message or ""):
+        return "ORDER"
+    if _RESTOCK_RE.search(message or ""):
+        return "RESTOCK"
+    return ""
+
+
+def _ig_send_fyi(sender_id: str, text: str, reply: str, topic: str, sent: bool) -> None:
+    """Heads-up to the founder about an Instagram question Twin can't fully
+    answer (audit T1-6): an order / tracking / delivery question (Twin
+    can't see orders) or a restock request (there's no waitlist). This is
+    what makes "I've passed this to the team" true on an AUTO reply — the
+    reply still goes out immediately, nobody waits for an approval.
+
+    Shared with graph.py's dispatch_auto so the two stay in parity."""
+    try:
+        send_telegram_notification(
+            topic, text, reply if sent else f"(send FAILED) {reply}",
+            sender_info=f"Instagram DM — sender {sender_id}",
+            channel="Instagram",
+            customer_id=sender_id,
+        )
+    except Exception as tg_err:
+        print(f"[INSTAGRAM-TG] {topic} notice failed: {type(tg_err).__name__}: {tg_err}")
+
+
 def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> None:
     """Instagram side of a refused admission (audit T1-3): the notice (at
     most once per window) via _handle_llm_limit, plus a log row so the
@@ -7366,6 +7438,12 @@ def _process_instagram_event(event: dict) -> None:
                     sender_id, text, reply, timestamp, source="AUTO_FAILED_IG"
                 )
                 print(f"[INSTAGRAM-AUTO] Send FAILED to {sender_id}: {send_err}")
+            # Order / restock questions Twin can't fully answer: heads-up
+            # to the founder — what makes "I've passed this to the team"
+            # true on an AUTO reply (audit T1-6).
+            topic = _ig_fyi_topic(text, tag)
+            if topic:
+                _ig_send_fyi(sender_id, text, reply, topic, sent)
 
         elif classification == "DRAFT+APPROVE":
             # Same buttoned approval flow WhatsApp uses, keyed on the IG

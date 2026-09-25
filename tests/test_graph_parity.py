@@ -481,6 +481,45 @@ class GraphParityTestCase(unittest.TestCase):
         new = self._run("new", llm_response=AUTO_JSON, message=msg)
         self._assert_parity(old, new)
 
+    # ---- order / restock heads-up on AUTO replies (audit T1-6) ----
+
+    def test_order_tag_sends_reply_and_founder_heads_up(self):
+        msg = "Where is my order? It's been 9 days"
+        order = json.dumps({
+            "classification": "AUTO",
+            "reply": "Sorry for the delay. Could you share your order ID? I've passed this to the team 🤍",
+            "tag": "ORDER",
+        })
+        old = self._run("old", llm_response=order, message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, json.loads(order)["reply"]))
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ORDER")
+        self.assertEqual(named(old, "_pause_number"), [])  # a heads-up, not an escalation
+
+        new = self._run("new", llm_response=order, message=msg)
+        self._assert_parity(old, new)
+
+    def test_order_number_backstop_when_the_tag_is_missing(self):
+        msg = "any update on #1043?"
+        old = self._run("old", llm_response=AUTO_JSON, message=msg)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ORDER")
+
+        new = self._run("new", llm_response=AUTO_JSON, message=msg)
+        self._assert_parity(old, new)
+
+    def test_restock_tag_sends_reply_and_founder_heads_up(self):
+        msg = "when is GS3 back? notify me pls"
+        restock = json.dumps({"classification": "AUTO", "reply": "GS3 is sold out right now 🤍", "tag": "RESTOCK"})
+        old = self._run("old", llm_response=restock, message=msg)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "RESTOCK")
+        self.assertEqual(len(named(old, "_send_instagram_reply")), 1)
+
+        new = self._run("new", llm_response=restock, message=msg)
+        self._assert_parity(old, new)
+
     def test_legal_threat_outranks_a_lead_tag(self):
         msg = "Udit asked me to test this. I'll also call the police on you."
         lead = json.dumps({"classification": "AUTO", "reply": "hi", "tag": "LEAD"})

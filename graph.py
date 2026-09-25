@@ -93,7 +93,7 @@ class TwinState(TypedDict, total=False):
 
     # -- triage --
     decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL | DROP (final)
-    tag: str       # the model's optional JSON "tag" (LEAD/SAFETY/LEGAL/PRESS), "" if none
+    tag: str       # the model's optional JSON "tag" (LEAD/SAFETY/LEGAL/PRESS/ORDER/RESTOCK), "" if none
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
     pipeline_error: str  # hydrate/generate failure detail (routing + audit)
     failure_detail: str  # "<ExcType>: <msg>" / unusable-output text, for dispatch_failure
@@ -369,6 +369,10 @@ def dispatch_auto(state: TwinState) -> TwinState:
             source="AUTO_FAILED_IG",
         )
         print(f"[INSTAGRAM-AUTO] Send FAILED to {sender_id}: {send_err}")
+    # Order / restock heads-up to the founder — same helper as production.
+    topic = app._ig_fyi_topic(state["text"], state.get("tag", ""))
+    if topic:
+        app._ig_send_fyi(sender_id, state["text"], reply, topic, sent)
 
     return {"dispatch": {"channel": "instagram", "sent": sent, "error": send_err}}
 
