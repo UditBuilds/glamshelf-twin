@@ -113,7 +113,8 @@ def intake(state: TwinState) -> TwinState:
 
     Gate order is load-bearing and copied exactly: dedup FIRST (a duplicate
     delivery must not re-run the pause/human checks or reload context),
-    then the in-memory pause gate, then the DB-backed human-handling net.
+    then the in-memory pause gate, then the DB-backed human-handling net,
+    then the LLM rate limit (so paused/human-handled senders never use budget).
     """
     sender_id = state["sender_id"]
     msg_id = state.get("msg_id", "")
@@ -132,6 +133,12 @@ def intake(state: TwinState) -> TwinState:
     if app._udit_replied_recently_ig(sender_id):
         print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
         return {"drop_reason": "human_handling"}
+
+    # LLM rate limits (audit T1-3) — same gate and helper as production.
+    limit = app._llm_admission("Instagram", sender_id)
+    if limit:
+        app._ig_rate_limited(sender_id, state["text"], state.get("timestamp", ""), limit)
+        return {"drop_reason": f"rate_limited:{limit}"}
 
     return {
         "order_context": app._lookup_recent_order(sender_id),

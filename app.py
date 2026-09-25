@@ -104,7 +104,15 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
 DEEPSEEK_MODEL = "deepseek-chat"        # all text replies
 CLAUDE_MODEL = "claude-sonnet-4-6"      # vision only (image extraction)
-MAX_TOKENS = 2048
+# Reply output budget (audit T1-3), sized from real replies: the longest of
+# the 73 labelled Twin answers in eval/data/eval_set.json is 494 chars
+# (544 bytes once wrapped in the {"classification", "reply"} JSON) and the
+# longest brain.md reply template is 353 bytes. That's ~140 tokens at a
+# typical ~4 bytes/token and under 280 even at a pessimistic 2, so 400
+# never cuts off a real reply. If one ever hits the cap, ask_claude logs
+# it; the truncated JSON fails to parse and the retry-then-escalate path
+# takes over.
+MAX_TOKENS = 400
 
 # ----- Vision (image understanding) config -----
 #
@@ -825,6 +833,230 @@ def _unpause_number(wa_id: str) -> bool:
         return False
 
 
+# ----- LLM rate limits (audit T1-3) -----
+#
+# Every customer message that reaches the reply model costs a DeepSeek
+# call (two when the first answer doesn't parse), each carrying the whole
+# ~80 KB brain. With no ceiling, one sender — or a script — could run up
+# the bill, drain the prepaid balance (after which every reply fails) and
+# queue everyone else's DMs behind theirs on the single gunicorn worker.
+#
+#   - per sender: RATE_LIMIT_WINDOW_MAX per rolling 10 minutes and
+#     RATE_LIMIT_DAILY_MAX per IST calendar day
+#   - all senders: LLM_DAILY_CAP per IST calendar day (env var, read per
+#     call like the kill switches; default 500)
+#
+# Counted per customer message admitted to the reply pipeline, in the
+# llm_usage table: written BEFORE the model call, in the same SQLite file
+# as everything else, so the counts survive restarts. The existing log
+# tables can't be counted cleanly: messages that end without a reply row
+# (model errors, deliberately empty replies) would never count, while rows
+# that aren't model calls (draft approvals, human-takeover markers,
+# dedup/pause skips) would.
+#
+# Over a limit: RATE_LIMIT_NOTICE once per sender per window, then silence;
+# one Telegram alert per sender per IST day, and one per IST day for the
+# global cap. Kill switch: LLM_RATE_LIMIT_DISABLED=1.
+RATE_LIMIT_WINDOW_SECONDS = 10 * 60
+RATE_LIMIT_WINDOW_MAX = 8
+RATE_LIMIT_DAILY_MAX = 40
+LLM_DAILY_CAP_DEFAULT = 500
+RATE_LIMIT_RETENTION_SECONDS = 2 * 24 * 60 * 60
+RATE_LIMIT_NOTICE = "Thanks! The team will reply to you here shortly."
+LIMIT_SENDER_WINDOW = "sender_10min"
+LIMIT_SENDER_DAY = "sender_day"
+LIMIT_GLOBAL_DAY = "global_day"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_day_start(now: float) -> float:
+    """Unix time of the IST midnight that began `now`'s calendar day — the
+    same day boundary the dashboard uses."""
+    return (
+        datetime.fromtimestamp(now, IST)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+
+
+def _llm_rate_limit_disabled() -> bool:
+    """Request-time kill switch, same pattern as the webhook-verify and
+    escalation-prefilter switches."""
+    value = (os.environ.get("LLM_RATE_LIMIT_DISABLED") or "").strip().lower()
+    if value in ("1", "true", "yes"):
+        print("[RATE-LIMIT] Disabled via kill switch")
+        return True
+    return False
+
+
+def _llm_daily_cap() -> int:
+    """LLM_DAILY_CAP from the environment, read per call so a Render env
+    change applies on the next restart. A missing, non-numeric or
+    non-positive value falls back to LLM_DAILY_CAP_DEFAULT."""
+    raw = (os.environ.get("LLM_DAILY_CAP") or "").strip()
+    if not raw:
+        return LLM_DAILY_CAP_DEFAULT
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        print(f"[RATE-LIMIT] Ignoring invalid LLM_DAILY_CAP={raw!r}; using {LLM_DAILY_CAP_DEFAULT}")
+        return LLM_DAILY_CAP_DEFAULT
+    return cap
+
+
+def _llm_admission(channel: str, sender_id: str, now: float | None = None) -> str | None:
+    """Admit one customer message to the reply pipeline, or refuse it.
+
+    Returns None when the message may go to the model — after recording it
+    in llm_usage, before the model call — or the LIMIT_* that refused it,
+    checked in order: sender 10-minute window, sender day, global day.
+    Refused messages are not recorded, so they don't extend the limit.
+
+    Fails OPEN (returns None) on any DB error, same convention as the
+    pause gate: a DB hiccup must not silence every customer.
+    """
+    if _llm_rate_limit_disabled():
+        return None
+    now = time.time() if now is None else now
+    day_start = _ist_day_start(now)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            # Opportunistic prune keeps both tables bounded — no cleanup job.
+            cutoff = now - RATE_LIMIT_RETENTION_SECONDS
+            conn.execute("DELETE FROM llm_usage WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM rate_limit_events WHERE ts < ?", (cutoff,))
+
+            def count(sql: str, params: tuple) -> int:
+                return conn.execute(sql, params).fetchone()[0]
+
+            limit = None
+            if count(
+                "SELECT COUNT(*) FROM llm_usage WHERE sender_id = ? AND ts >= ?",
+                (sender_id, now - RATE_LIMIT_WINDOW_SECONDS),
+            ) >= RATE_LIMIT_WINDOW_MAX:
+                limit = LIMIT_SENDER_WINDOW
+            elif count(
+                "SELECT COUNT(*) FROM llm_usage WHERE sender_id = ? AND ts >= ?",
+                (sender_id, day_start),
+            ) >= RATE_LIMIT_DAILY_MAX:
+                limit = LIMIT_SENDER_DAY
+            elif count(
+                "SELECT COUNT(*) FROM llm_usage WHERE ts >= ?", (day_start,)
+            ) >= _llm_daily_cap():
+                limit = LIMIT_GLOBAL_DAY
+            else:
+                conn.execute(
+                    "INSERT INTO llm_usage (ts, channel, sender_id) VALUES (?, ?, ?)",
+                    (now, channel, sender_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[RATE-LIMIT] Admission check failed for {sender_id} — allowing: {type(e).__name__}: {e}")
+        return None
+    if limit:
+        print(f"[RATE-LIMIT] Refused {channel} message from {sender_id}: {limit}")
+    return limit
+
+
+def _handle_llm_limit(
+    channel: str,
+    sender_id: str,
+    limit: str,
+    text: str,
+    send_fn,
+    now: float | None = None,
+) -> bool:
+    """React to a refused admission: at most one RATE_LIMIT_NOTICE per
+    sender per window (the rolling 10 minutes for the window limit, the IST
+    day for the daily limits), then silence; one Telegram alert per sender
+    per IST day for the sender limits, one per IST day for the global cap.
+
+    `send_fn` is the channel's sender (_send_instagram_reply or
+    send_whatsapp_reply). Events are stamped BEFORE sending, so a flaky
+    Graph API or Telegram can't turn into a notice per message. Returns
+    True iff the notice was delivered now. Never raises.
+    """
+    now = time.time() if now is None else now
+    day_start = _ist_day_start(now)
+    notice_kind = f"notice:{limit}"
+    notice_since = now - RATE_LIMIT_WINDOW_SECONDS if limit == LIMIT_SENDER_WINDOW else day_start
+    alert_kind, alert_subject = (
+        ("alert:global", "*") if limit == LIMIT_GLOBAL_DAY else ("alert:sender", sender_id)
+    )
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            def seen(kind: str, subject: str, since: float) -> bool:
+                return conn.execute(
+                    "SELECT 1 FROM rate_limit_events "
+                    "WHERE kind = ? AND sender_id = ? AND ts >= ? LIMIT 1",
+                    (kind, subject, since),
+                ).fetchone() is not None
+
+            notice_due = not seen(notice_kind, sender_id, notice_since)
+            alert_due = not seen(alert_kind, alert_subject, day_start)
+            for due, kind, subject in (
+                (notice_due, notice_kind, sender_id),
+                (alert_due, alert_kind, alert_subject),
+            ):
+                if due:
+                    conn.execute(
+                        "INSERT INTO rate_limit_events (ts, kind, channel, sender_id) "
+                        "VALUES (?, ?, ?, ?)",
+                        (now, kind, channel, subject),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[RATE-LIMIT] Bookkeeping failed for {sender_id} — staying quiet: {type(e).__name__}: {e}")
+        return False
+
+    sent = False
+    if notice_due:
+        sent, send_err = send_fn(sender_id, RATE_LIMIT_NOTICE)
+        if not sent:
+            print(f"[RATE-LIMIT] Notice to {sender_id} failed: {send_err}")
+    if alert_due:
+        _rate_limit_alert(channel, sender_id, limit, text)
+    return sent
+
+
+def _rate_limit_alert(channel: str, sender_id: str, limit: str, text: str) -> None:
+    """One Telegram message for a limit trip. Never raises (_telegram_api
+    swallows every failure)."""
+    if not TELEGRAM_CHAT_ID:
+        print("[RATE-LIMIT] Alert skipped: TELEGRAM_CHAT_ID not set")
+        return
+    if limit == LIMIT_GLOBAL_DAY:
+        body = (
+            f"🚦 Daily LLM cap reached — {_llm_daily_cap()} replies today (LLM_DAILY_CAP).\n"
+            f"Until IST midnight, new messages get only \"{RATE_LIMIT_NOTICE}\" "
+            f"(once per sender), then silence.\n"
+            f"Raise LLM_DAILY_CAP on Render to lift it.\n\n"
+            f"(One alert per day.)"
+        )
+    else:
+        what = (
+            f"{RATE_LIMIT_WINDOW_MAX} messages in 10 minutes"
+            if limit == LIMIT_SENDER_WINDOW
+            else f"{RATE_LIMIT_DAILY_MAX} messages today"
+        )
+        body = (
+            f"🚦 Rate limit hit — {channel} sender {sender_id}: {what}.\n"
+            f"They get \"{RATE_LIMIT_NOTICE}\" once per window; further messages "
+            f"are logged, not answered, until the limit resets.\n"
+            f"Latest message: \"{text[:200]}\"\n\n"
+            f"(One alert per sender per day.)"
+        )
+    _telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": body})
+
+
 def _record_bot_outbound(reply_text: str, wati_response_data: dict | None = None) -> None:
     """Register a bot-sent reply so the subsequent WATI outbound webhook
     event for the same message is identified as bot-originated (not Udit's).
@@ -1433,6 +1665,37 @@ def _init_db() -> None:
                 created_at REAL NOT NULL
             )
             """
+        )
+
+        # LLM rate limiting (audit T1-3) — see _llm_admission. One row per
+        # customer message admitted to the reply pipeline, written before
+        # the model call; plus the over-limit notices/alerts already sent,
+        # so each goes out once per window. Both pruned after 2 days.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                channel TEXT NOT NULL,
+                sender_id TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_sender_ts ON llm_usage(sender_id, ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rate_limit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                kind TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                sender_id TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_limit_events ON rate_limit_events(kind, sender_id, ts)"
         )
 
         conn.commit()
@@ -4690,7 +4953,13 @@ def ask_claude(
         messages=all_messages,
     )
 
-    raw = (message.choices[0].message.content or "").strip()
+    choice = message.choices[0]
+    raw = (choice.message.content or "").strip()
+    if getattr(choice, "finish_reason", None) == "length":
+        print(
+            f"[LLM] WARNING: reply hit max_tokens={MAX_TOKENS} and was cut off — "
+            "the JSON won't parse, so the retry/escalation path takes over"
+        )
 
     usage = message.usage
     print(
@@ -5139,6 +5408,20 @@ def webhook(token=""):
             )
             _pause_number(wa_id)
             return jsonify({"status": "human_handling"}), 200
+
+        # LLM rate limits (audit T1-3). Checked before the vision branch:
+        # an image costs a Claude vision call on top of the DeepSeek reply.
+        limit = _llm_admission("WhatsApp", wa_id)
+        if limit:
+            sent = _handle_llm_limit(
+                "WhatsApp", wa_id, limit, text_body or "[image]", send_whatsapp_reply
+            )
+            _log_message(
+                wa_id, sender_name, text_body or "[image]",
+                status="RATE_LIMITED",
+                reply_text=RATE_LIMIT_NOTICE if sent else None,
+            )
+            return jsonify({"status": "ok"}), 200
 
         # ----- VISION BRANCH -----
         # For image events: download + extract via Claude Vision. Outcomes:
@@ -6422,6 +6705,20 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
+def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> None:
+    """Instagram side of a refused admission (audit T1-3): the notice (at
+    most once per window) via _handle_llm_limit, plus a log row so the
+    message isn't lost — with the notice as reply_text when it was
+    delivered (history-visible), NULL otherwise (history-excluded).
+
+    Shared with graph.py's intake so the two stay in parity."""
+    sent = _handle_llm_limit("Instagram", sender_id, limit, text, _send_instagram_reply)
+    _log_instagram(
+        sender_id, text, RATE_LIMIT_NOTICE if sent else None, timestamp,
+        source="RATE_LIMITED_IG",
+    )
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -6515,6 +6812,13 @@ def _process_instagram_event(event: dict) -> None:
         # silently. Mirrors the WATI _udit_replied_recently safety net.
         if _udit_replied_recently_ig(sender_id):
             print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
+            return
+
+        # LLM rate limits (audit T1-3) — after the takeover gates, so a
+        # paused or human-handled sender never uses budget or gets a notice.
+        limit = _llm_admission("Instagram", sender_id)
+        if limit:
+            _ig_rate_limited(sender_id, text, timestamp, limit)
             return
 
         # Best-effort order context. Sender IDs are 17-digit FB IDs and

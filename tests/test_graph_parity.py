@@ -69,6 +69,7 @@ EFFECT_FNS = {
     "_log_instagram",
     "_persist_seen_id",
     "_alert_send_failure",
+    "_ig_rate_limited",
 }
 
 
@@ -99,6 +100,7 @@ class GraphParityTestCase(unittest.TestCase):
         paused=False,
         udit_recent=False,
         llm_exception=None,
+        limited=None,
     ):
         """Run one implementation ("old" or "new") fully stubbed; return
         the recorded call list of (fn_name, args, kwargs) tuples.
@@ -118,6 +120,10 @@ class GraphParityTestCase(unittest.TestCase):
         patches = [
             patch.object(glam, "_is_paused", recorder("_is_paused", paused)),
             patch.object(glam, "_udit_replied_recently_ig", recorder("_udit_replied_recently_ig", udit_recent)),
+            # Rate limiter stubbed: None = admitted (its own tests live in
+            # test_rate_limit.py); `limited` simulates a refusal.
+            patch.object(glam, "_llm_admission", recorder("_llm_admission", limited)),
+            patch.object(glam, "_ig_rate_limited", recorder("_ig_rate_limited")),
             patch.object(glam, "_persist_seen_id", recorder("_persist_seen_id")),
             patch.object(glam, "_lookup_recent_order", recorder("_lookup_recent_order", ORDER_LINE)),
             patch.object(glam, "_load_instagram_history", recorder("_load_instagram_history", list(HISTORY))),
@@ -399,6 +405,15 @@ class GraphParityTestCase(unittest.TestCase):
         self.assertEqual(effects(old), [])
 
         new = self._run("new", llm_response=AUTO_JSON, paused=True)
+        self._assert_parity(old, new)
+
+    def test_rate_limited_sender_short_circuits_before_llm(self):
+        old = self._run("old", llm_response=AUTO_JSON, limited=glam.LIMIT_SENDER_WINDOW)
+        self.assertEqual(named(old, "ask_claude"), [])
+        (rl,) = named(old, "_ig_rate_limited")
+        self.assertEqual(rl[1], (SENDER, MSG, str(TIMESTAMP), glam.LIMIT_SENDER_WINDOW))
+
+        new = self._run("new", llm_response=AUTO_JSON, limited=glam.LIMIT_SENDER_WINDOW)
         self._assert_parity(old, new)
 
     def test_human_handling_window_short_circuits_before_llm(self):
