@@ -104,7 +104,15 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
 DEEPSEEK_MODEL = "deepseek-chat"        # all text replies
 CLAUDE_MODEL = "claude-sonnet-4-6"      # vision only (image extraction)
-MAX_TOKENS = 2048
+# Reply output budget (audit T1-3), sized from real replies: the longest of
+# the 73 labelled Twin answers in eval/data/eval_set.json is 494 chars
+# (544 bytes once wrapped in the {"classification", "reply"} JSON) and the
+# longest brain.md reply template is 353 bytes. That's ~140 tokens at a
+# typical ~4 bytes/token and under 280 even at a pessimistic 2, so 400
+# never cuts off a real reply. If one ever hits the cap, ask_claude logs
+# it; the truncated JSON fails to parse and the retry-then-escalate path
+# takes over.
+MAX_TOKENS = 400
 
 # ----- Vision (image understanding) config -----
 #
@@ -825,6 +833,230 @@ def _unpause_number(wa_id: str) -> bool:
         return False
 
 
+# ----- LLM rate limits (audit T1-3) -----
+#
+# Every customer message that reaches the reply model costs a DeepSeek
+# call (two when the first answer doesn't parse), each carrying the whole
+# ~80 KB brain. With no ceiling, one sender — or a script — could run up
+# the bill, drain the prepaid balance (after which every reply fails) and
+# queue everyone else's DMs behind theirs on the single gunicorn worker.
+#
+#   - per sender: RATE_LIMIT_WINDOW_MAX per rolling 10 minutes and
+#     RATE_LIMIT_DAILY_MAX per IST calendar day
+#   - all senders: LLM_DAILY_CAP per IST calendar day (env var, read per
+#     call like the kill switches; default 500)
+#
+# Counted per customer message admitted to the reply pipeline, in the
+# llm_usage table: written BEFORE the model call, in the same SQLite file
+# as everything else, so the counts survive restarts. The existing log
+# tables can't be counted cleanly: messages that end without a reply row
+# (model errors, deliberately empty replies) would never count, while rows
+# that aren't model calls (draft approvals, human-takeover markers,
+# dedup/pause skips) would.
+#
+# Over a limit: RATE_LIMIT_NOTICE once per sender per window, then silence;
+# one Telegram alert per sender per IST day, and one per IST day for the
+# global cap. Kill switch: LLM_RATE_LIMIT_DISABLED=1.
+RATE_LIMIT_WINDOW_SECONDS = 10 * 60
+RATE_LIMIT_WINDOW_MAX = 8
+RATE_LIMIT_DAILY_MAX = 40
+LLM_DAILY_CAP_DEFAULT = 500
+RATE_LIMIT_RETENTION_SECONDS = 2 * 24 * 60 * 60
+RATE_LIMIT_NOTICE = "Thanks! The team will reply to you here shortly."
+LIMIT_SENDER_WINDOW = "sender_10min"
+LIMIT_SENDER_DAY = "sender_day"
+LIMIT_GLOBAL_DAY = "global_day"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_day_start(now: float) -> float:
+    """Unix time of the IST midnight that began `now`'s calendar day — the
+    same day boundary the dashboard uses."""
+    return (
+        datetime.fromtimestamp(now, IST)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+
+
+def _llm_rate_limit_disabled() -> bool:
+    """Request-time kill switch, same pattern as the webhook-verify and
+    escalation-prefilter switches."""
+    value = (os.environ.get("LLM_RATE_LIMIT_DISABLED") or "").strip().lower()
+    if value in ("1", "true", "yes"):
+        print("[RATE-LIMIT] Disabled via kill switch")
+        return True
+    return False
+
+
+def _llm_daily_cap() -> int:
+    """LLM_DAILY_CAP from the environment, read per call so a Render env
+    change applies on the next restart. A missing, non-numeric or
+    non-positive value falls back to LLM_DAILY_CAP_DEFAULT."""
+    raw = (os.environ.get("LLM_DAILY_CAP") or "").strip()
+    if not raw:
+        return LLM_DAILY_CAP_DEFAULT
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        print(f"[RATE-LIMIT] Ignoring invalid LLM_DAILY_CAP={raw!r}; using {LLM_DAILY_CAP_DEFAULT}")
+        return LLM_DAILY_CAP_DEFAULT
+    return cap
+
+
+def _llm_admission(channel: str, sender_id: str, now: float | None = None) -> str | None:
+    """Admit one customer message to the reply pipeline, or refuse it.
+
+    Returns None when the message may go to the model — after recording it
+    in llm_usage, before the model call — or the LIMIT_* that refused it,
+    checked in order: sender 10-minute window, sender day, global day.
+    Refused messages are not recorded, so they don't extend the limit.
+
+    Fails OPEN (returns None) on any DB error, same convention as the
+    pause gate: a DB hiccup must not silence every customer.
+    """
+    if _llm_rate_limit_disabled():
+        return None
+    now = time.time() if now is None else now
+    day_start = _ist_day_start(now)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            # Opportunistic prune keeps both tables bounded — no cleanup job.
+            cutoff = now - RATE_LIMIT_RETENTION_SECONDS
+            conn.execute("DELETE FROM llm_usage WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM rate_limit_events WHERE ts < ?", (cutoff,))
+
+            def count(sql: str, params: tuple) -> int:
+                return conn.execute(sql, params).fetchone()[0]
+
+            limit = None
+            if count(
+                "SELECT COUNT(*) FROM llm_usage WHERE sender_id = ? AND ts >= ?",
+                (sender_id, now - RATE_LIMIT_WINDOW_SECONDS),
+            ) >= RATE_LIMIT_WINDOW_MAX:
+                limit = LIMIT_SENDER_WINDOW
+            elif count(
+                "SELECT COUNT(*) FROM llm_usage WHERE sender_id = ? AND ts >= ?",
+                (sender_id, day_start),
+            ) >= RATE_LIMIT_DAILY_MAX:
+                limit = LIMIT_SENDER_DAY
+            elif count(
+                "SELECT COUNT(*) FROM llm_usage WHERE ts >= ?", (day_start,)
+            ) >= _llm_daily_cap():
+                limit = LIMIT_GLOBAL_DAY
+            else:
+                conn.execute(
+                    "INSERT INTO llm_usage (ts, channel, sender_id) VALUES (?, ?, ?)",
+                    (now, channel, sender_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[RATE-LIMIT] Admission check failed for {sender_id} — allowing: {type(e).__name__}: {e}")
+        return None
+    if limit:
+        print(f"[RATE-LIMIT] Refused {channel} message from {sender_id}: {limit}")
+    return limit
+
+
+def _handle_llm_limit(
+    channel: str,
+    sender_id: str,
+    limit: str,
+    text: str,
+    send_fn,
+    now: float | None = None,
+) -> bool:
+    """React to a refused admission: at most one RATE_LIMIT_NOTICE per
+    sender per window (the rolling 10 minutes for the window limit, the IST
+    day for the daily limits), then silence; one Telegram alert per sender
+    per IST day for the sender limits, one per IST day for the global cap.
+
+    `send_fn` is the channel's sender (_send_instagram_reply or
+    send_whatsapp_reply). Events are stamped BEFORE sending, so a flaky
+    Graph API or Telegram can't turn into a notice per message. Returns
+    True iff the notice was delivered now. Never raises.
+    """
+    now = time.time() if now is None else now
+    day_start = _ist_day_start(now)
+    notice_kind = f"notice:{limit}"
+    notice_since = now - RATE_LIMIT_WINDOW_SECONDS if limit == LIMIT_SENDER_WINDOW else day_start
+    alert_kind, alert_subject = (
+        ("alert:global", "*") if limit == LIMIT_GLOBAL_DAY else ("alert:sender", sender_id)
+    )
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            def seen(kind: str, subject: str, since: float) -> bool:
+                return conn.execute(
+                    "SELECT 1 FROM rate_limit_events "
+                    "WHERE kind = ? AND sender_id = ? AND ts >= ? LIMIT 1",
+                    (kind, subject, since),
+                ).fetchone() is not None
+
+            notice_due = not seen(notice_kind, sender_id, notice_since)
+            alert_due = not seen(alert_kind, alert_subject, day_start)
+            for due, kind, subject in (
+                (notice_due, notice_kind, sender_id),
+                (alert_due, alert_kind, alert_subject),
+            ):
+                if due:
+                    conn.execute(
+                        "INSERT INTO rate_limit_events (ts, kind, channel, sender_id) "
+                        "VALUES (?, ?, ?, ?)",
+                        (now, kind, channel, subject),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[RATE-LIMIT] Bookkeeping failed for {sender_id} — staying quiet: {type(e).__name__}: {e}")
+        return False
+
+    sent = False
+    if notice_due:
+        sent, send_err = send_fn(sender_id, RATE_LIMIT_NOTICE)
+        if not sent:
+            print(f"[RATE-LIMIT] Notice to {sender_id} failed: {send_err}")
+    if alert_due:
+        _rate_limit_alert(channel, sender_id, limit, text)
+    return sent
+
+
+def _rate_limit_alert(channel: str, sender_id: str, limit: str, text: str) -> None:
+    """One Telegram message for a limit trip. Never raises (_telegram_api
+    swallows every failure)."""
+    if not TELEGRAM_CHAT_ID:
+        print("[RATE-LIMIT] Alert skipped: TELEGRAM_CHAT_ID not set")
+        return
+    if limit == LIMIT_GLOBAL_DAY:
+        body = (
+            f"🚦 Daily LLM cap reached — {_llm_daily_cap()} replies today (LLM_DAILY_CAP).\n"
+            f"Until IST midnight, new messages get only \"{RATE_LIMIT_NOTICE}\" "
+            f"(once per sender), then silence.\n"
+            f"Raise LLM_DAILY_CAP on Render to lift it.\n\n"
+            f"(One alert per day.)"
+        )
+    else:
+        what = (
+            f"{RATE_LIMIT_WINDOW_MAX} messages in 10 minutes"
+            if limit == LIMIT_SENDER_WINDOW
+            else f"{RATE_LIMIT_DAILY_MAX} messages today"
+        )
+        body = (
+            f"🚦 Rate limit hit — {channel} sender {sender_id}: {what}.\n"
+            f"They get \"{RATE_LIMIT_NOTICE}\" once per window; further messages "
+            f"are logged, not answered, until the limit resets.\n"
+            f"Latest message: \"{text[:200]}\"\n\n"
+            f"(One alert per sender per day.)"
+        )
+    _telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": body})
+
+
 def _record_bot_outbound(reply_text: str, wati_response_data: dict | None = None) -> None:
     """Register a bot-sent reply so the subsequent WATI outbound webhook
     event for the same message is identified as bot-originated (not Udit's).
@@ -1435,6 +1667,37 @@ def _init_db() -> None:
             """
         )
 
+        # LLM rate limiting (audit T1-3) — see _llm_admission. One row per
+        # customer message admitted to the reply pipeline, written before
+        # the model call; plus the over-limit notices/alerts already sent,
+        # so each goes out once per window. Both pruned after 2 days.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                channel TEXT NOT NULL,
+                sender_id TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_sender_ts ON llm_usage(sender_id, ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rate_limit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                kind TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                sender_id TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_limit_events ON rate_limit_events(kind, sender_id, ts)"
+        )
+
         conn.commit()
         conn.close()
         print(f"[DB] Initialized {DB_PATH}")
@@ -2013,17 +2276,31 @@ SEND_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
 _send_failure_last_alert: dict[str, float] = {}
 
 
-def _alert_send_failure(channel: str, error: str, customer_id: str) -> None:
-    """Telegram-alert Udit that a customer reply failed to send.
+def _alert_send_failure(
+    channel: str,
+    error: str,
+    customer_id: str,
+    *,
+    kind: str = "send",
+    holding_sent: bool | None = None,
+) -> None:
+    """Telegram-alert Udit that a customer reply failed.
+
+    kind="send" (default, wording unchanged): the outbound send itself
+    failed. kind="pipeline": no reply could be produced — DeepSeek error or
+    timeout, unusable model output, or a webhook handler error.
+    `holding_sent` then says what the customer did get: the holding line
+    (True), nothing (False) or unknown (None), so the alert never claims
+    more than we know.
 
     Reuses the same bot/chat as the draft-approval flow via _telegram_api.
     Never raises — alerting is a side effect and must not break the
     webhook 200 response, same contract as every other Telegram call.
     """
-    key = f"{channel}|{error[:120]}"
+    key = f"{channel}|{error[:120]}" if kind == "send" else f"{kind}|{channel}|{error[:120]}"
     now = time.time()
     if now - _send_failure_last_alert.get(key, 0.0) < SEND_FAILURE_ALERT_COOLDOWN_SECONDS:
-        print(f"[ALERT] Suppressed repeat send-failure alert ({channel}): {error[:80]}")
+        print(f"[ALERT] Suppressed repeat {kind}-failure alert ({channel}): {error[:80]}")
         return
     # Stamp before sending so a Telegram hiccup can't turn into an
     # alert-per-message storm during an outage.
@@ -2032,12 +2309,27 @@ def _alert_send_failure(channel: str, error: str, customer_id: str) -> None:
     if not TELEGRAM_CHAT_ID:
         print("[ALERT] Skipped: TELEGRAM_CHAT_ID not set")
         return
-    text = (
-        f"⚠️ {channel} send FAILED\n"
-        f"Customer {customer_id} did not get a reply.\n"
-        f"Error: {error[:300]}\n\n"
-        f"(Repeats of this error muted for 30 min)"
-    )
+    if kind == "pipeline":
+        if holding_sent is True:
+            outcome = "got only the holding line — reply to them by hand."
+        elif holding_sent is False:
+            outcome = "got NO reply — reply to them by hand."
+        else:
+            outcome = "may not have got a reply — check the chat."
+        text = (
+            f"⚠️ {channel} reply pipeline FAILED\n"
+            f"Customer {customer_id} {outcome}\n"
+            f"Error: {error[:300]}\n\n"
+            f"(Repeats of this error muted for 30 min; customers it hits "
+            f"meanwhile are still logged)"
+        )
+    else:
+        text = (
+            f"⚠️ {channel} send FAILED\n"
+            f"Customer {customer_id} did not get a reply.\n"
+            f"Error: {error[:300]}\n\n"
+            f"(Repeats of this error muted for 30 min)"
+        )
     try:
         _telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text})
     except Exception as e:
@@ -2239,7 +2531,9 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
               AND reply_text IS NOT NULL
               AND (source IS NULL
                    OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG',
-                                     'ESCALATE_HOLDING_FAILED_IG'))
+                                     'ESCALATE_HOLDING_FAILED_IG',
+                                     'PIPELINE_HOLDING_FAILED_IG',
+                                     'PHOTO_IG_FAILED'))
               AND logged_at >= datetime('now', '-7 days')
             ORDER BY logged_at DESC
             LIMIT 30
@@ -2410,9 +2704,22 @@ else:
 #   - claude_client: VISION ONLY (order screenshots + eye selfies) — DeepSeek's
 #     deepseek-chat is text-only, so image extraction stays on Claude's API.
 # Both keys must be set on Render / in .env (no usable default).
+#
+# DeepSeek call budget (audit T1-8). The SDK default is a 600s timeout with
+# 2 retries — far past gunicorn's worker timeout (Procfile: --timeout 60).
+# A slow call got the worker killed mid-request: no reply, no alert, and
+# Meta's retry of that message was dropped by the mid dedup. 20s per
+# attempt plus one retry fails fast enough for the webhook's own failure
+# handling (holding line + Telegram alert) to run. httpx applies the
+# timeout per network operation (connect, each read), not as one
+# wall-clock cap on the whole call.
+DEEPSEEK_TIMEOUT_SECONDS = 20
+DEEPSEEK_MAX_RETRIES = 1
 deepseek_client = OpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
     base_url="https://api.deepseek.com",
+    timeout=DEEPSEEK_TIMEOUT_SECONDS,
+    max_retries=DEEPSEEK_MAX_RETRIES,
 )
 claude_client = Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
@@ -3054,8 +3361,8 @@ def _edit_timeout_check(draft_id: str) -> None:
 def normalize_wa(number: str) -> str:
     """Reduce a phone number to comparable digits.
 
-    Strips non-digit characters and any leading zeros, so "+91 92174 70151",
-    "0919217470151", and "919217470151" all compare equal. Used for safe
+    Strips non-digit characters and any leading zeros, so "+91 98765 43210",
+    "0919876543210", and "919876543210" all compare equal. Used for safe
     cross-format equality checks against BUSINESS_NUMBER / OWNER_NUMBER.
     """
     return "".join(c for c in (number or "") if c.isdigit()).lstrip("0")
@@ -3712,8 +4019,8 @@ def _rag_load_model() -> None:
     print("[RAG] fastembed model unavailable after retry — retrieval disabled, brain-only behavior")
 
 
-# Last sqlite-vec load failure, kept for /healthz so the real reason is
-# visible from the public probe without log-diving. None = loading works
+# Last sqlite-vec load failure, kept for the keyed /healthz view
+# (X-Dashboard-Key) so the real reason is visible without log-diving. None = loading works
 # (or hasn't been attempted yet). Logged once, not per connection —
 # _rag_db() runs on every retrieval and would spam the Render log stream.
 _rag_vec_load_error: str | None = None
@@ -4129,6 +4436,16 @@ def _parse_twin_reply(raw: str) -> tuple[str, str]:
 ESCALATE_FALLBACK_HOLDING_REPLY = (
     "I hear you, and I want this handled properly — I'm bringing it straight to "
     "the GlamShelf team, who'll reach out to you personally within the next few hours."
+)
+
+# brain.md's Default Handoff Line (INTERNAL NOTES), sent verbatim when the
+# reply pipeline itself fails on Instagram — DeepSeek down or timing out,
+# brain.md unreadable, unusable model output — so the customer is never
+# left in silence while the founder is alerted (audit T1-8). Keep in sync
+# with brain.md.
+BRAIN_HOLDING_LINE = (
+    "Understood — Team The Glam Shelf will personally look into this and get "
+    "back to you within a few hours 🤍"
 )
 
 
@@ -4637,7 +4954,13 @@ def ask_claude(
         messages=all_messages,
     )
 
-    raw = (message.choices[0].message.content or "").strip()
+    choice = message.choices[0]
+    raw = (choice.message.content or "").strip()
+    if getattr(choice, "finish_reason", None) == "length":
+        print(
+            f"[LLM] WARNING: reply hit max_tokens={MAX_TOKENS} and was cut off — "
+            "the JSON won't parse, so the retry/escalation path takes over"
+        )
 
     usage = message.usage
     print(
@@ -4694,33 +5017,64 @@ def _healthz_sqlite_vec_status() -> dict:
         return {"loaded": False, "error": f"probe failed: {type(e).__name__}: {e}"}
 
 
+def _dashboard_key_header_ok() -> bool:
+    """True iff the request carries an X-Dashboard-Key header matching
+    DASHBOARD_KEY.
+
+    Header only, never a ?key= URL param — a URL value lands in access
+    logs, browser history and Referer headers. Compared as bytes:
+    hmac.compare_digest raises TypeError on non-ASCII str input, which a
+    client-supplied header can contain."""
+    provided = request.headers.get("X-Dashboard-Key") or ""
+    if not provided:
+        return False
+    return hmac.compare_digest(
+        provided.encode("utf-8"), DASHBOARD_KEY.encode("utf-8")
+    )
+
+
 @app.route("/healthz")
 def healthz():
     """Liveness probe. Render can ping this to confirm the deploy works.
-    Reports whether brain.md is present so a misconfigured deploy is obvious.
-    Intentionally NOT behind login_required — Render needs to hit it without auth."""
-    db_status = "ok"
+    Intentionally NOT behind login_required — Render needs to hit it without auth.
+
+    The public answer is deliberately minimal: {"status": "ok"}, or HTTP
+    503 {"status": "error"} when the DB can't be read — no error text,
+    counts or phone numbers. The service URL is published in this public
+    repo, and the old public response handed anyone the owner's personal
+    number (audit T1-7).
+
+    The full diagnostics below are returned only when the request carries
+    an X-Dashboard-Key header matching DASHBOARD_KEY."""
+    db_error = None
     total_logged = 0
     total_orders = 0
     total_instagram = 0
     try:
         conn = sqlite3.connect(DB_PATH)
-        total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
-        total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-        total_instagram = conn.execute("SELECT COUNT(*) FROM instagram_logs").fetchone()[0]
-        conn.close()
+        try:
+            total_logged = conn.execute("SELECT COUNT(*) FROM message_logs").fetchone()[0]
+            total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+            total_instagram = conn.execute("SELECT COUNT(*) FROM instagram_logs").fetchone()[0]
+        finally:
+            conn.close()
     except Exception as e:
-        db_status = f"error: {type(e).__name__}: {e}"
+        db_error = f"{type(e).__name__}: {e}"
+
+    status = "error" if db_error else "ok"
+    http_status = 503 if db_error else 200
+    if not _dashboard_key_header_ok():
+        return jsonify({"status": status}), http_status
 
     return jsonify({
-        "status": "ok",
+        "status": status,
         "brain_present": BRAIN_FILE.exists(),
         "brain_path": str(BRAIN_FILE),
         "model": DEEPSEEK_MODEL,
         "vision_model": CLAUDE_MODEL,
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
         "claude_vision_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
-        "db": db_status,
+        "db": f"error: {db_error}" if db_error else "ok",
         # Live sqlite-vec probe: loads the extension on a fresh connection
         # right now, so this reflects the current runtime, not a cached
         # boot-time result. error carries the classified failure reason
@@ -4730,13 +5084,14 @@ def healthz():
         "total_orders": total_orders,
         "total_instagram": total_instagram,
         "seen_ids_cached": len(_seen_ids),
-        # Normalized protected numbers — diagnostic so misconfigured env vars
-        # are obvious from the public health probe. Phone numbers, not secrets.
+        # Normalized protected numbers — diagnostic so misconfigured env
+        # vars are obvious. Keyed view only: OWNER_NUMBER is the founder's
+        # personal number.
         "protected_numbers": [
             normalize_wa(BUSINESS_NUMBER),
             normalize_wa(OWNER_NUMBER),
         ],
-    })
+    }), http_status
 
 
 @app.route("/inventory-debug")
@@ -5054,6 +5409,20 @@ def webhook(token=""):
             )
             _pause_number(wa_id)
             return jsonify({"status": "human_handling"}), 200
+
+        # LLM rate limits (audit T1-3). Checked before the vision branch:
+        # an image costs a Claude vision call on top of the DeepSeek reply.
+        limit = _llm_admission("WhatsApp", wa_id)
+        if limit:
+            sent = _handle_llm_limit(
+                "WhatsApp", wa_id, limit, text_body or "[image]", send_whatsapp_reply
+            )
+            _log_message(
+                wa_id, sender_name, text_body or "[image]",
+                status="RATE_LIMITED",
+                reply_text=RATE_LIMIT_NOTICE if sent else None,
+            )
+            return jsonify({"status": "ok"}), 200
 
         # ----- VISION BRANCH -----
         # For image events: download + extract via Claude Vision. Outcomes:
@@ -5452,6 +5821,14 @@ def webhook(token=""):
             )
         except Exception:
             pass
+        # Same founder alert as the Instagram pipeline-failure path (audit
+        # T1-8). Every send in this handler swallows its own errors, so an
+        # exception reaching here means no reply went out.
+        _alert_send_failure(
+            "WhatsApp", f"{type(e).__name__}: {e}",
+            locals().get("wa_id", "") or "(unknown)",
+            kind="pipeline", holding_sent=False,
+        )
         print("=" * 60 + "\n")
         return jsonify({"status": "ok"}), 200
 
@@ -6302,6 +6679,149 @@ def instagram_webhook():
         return jsonify({"status": "ok"}), 200
 
 
+def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) -> bool:
+    """The reply pipeline failed for this Instagram DM — DeepSeek error or
+    timeout, brain.md unreadable, unusable model output — with no
+    escalation signal to fall back on (audit T1-8). Never leave the
+    customer in silence: send the brain's holding line, log what they
+    actually received, and alert the founder (rate-limited). Returns
+    whether the holding line was delivered.
+
+    Shared with graph.py's dispatch_failure node so the two stay in parity.
+    Not a pause: the next message goes through the pipeline normally.
+    """
+    sent, send_err = _send_instagram_reply(sender_id, BRAIN_HOLDING_LINE)
+    # Delivered holding line is history-visible (the customer saw it, so
+    # the next turn knows a follow-up was promised); a failed one is
+    # logged under a source _load_instagram_history excludes.
+    _log_instagram(
+        sender_id, text, BRAIN_HOLDING_LINE, timestamp,
+        source="PIPELINE_HOLDING_IG" if sent else "PIPELINE_HOLDING_FAILED_IG",
+    )
+    if sent:
+        print(f"[INSTAGRAM] Pipeline failed for {sender_id} — holding line sent ({error[:120]})")
+    else:
+        print(f"[INSTAGRAM] Pipeline failed for {sender_id} — holding line FAILED too: {send_err}")
+    _alert_send_failure("Instagram", error, sender_id, kind="pipeline", holding_sent=sent)
+    return sent
+
+
+def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> None:
+    """Instagram side of a refused admission (audit T1-3): the notice (at
+    most once per window) via _handle_llm_limit, plus a log row so the
+    message isn't lost — with the notice as reply_text when it was
+    delivered (history-visible), NULL otherwise (history-excluded).
+
+    Shared with graph.py's intake so the two stay in parity."""
+    sent = _handle_llm_limit("Instagram", sender_id, limit, text, _send_instagram_reply)
+    _log_instagram(
+        sender_id, text, RATE_LIMIT_NOTICE if sent else None, timestamp,
+        source="RATE_LIMITED_IG",
+    )
+
+
+# Instagram photos (audit T1-9). The vision pipeline is WhatsApp-only, so on
+# Instagram Twin can't see a photo at all — it used to drop them silently.
+# Now a photo gets this honest reply and the founder a Telegram notice to
+# look at it in the DM. At most once per sender per
+# INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS: customers often send several photos
+# in a row, and one reply per burst reads better than the same line three
+# times. Extra photos in the window are logged, not answered.
+INSTAGRAM_PHOTO_REPLY = (
+    "I can't view photos here yet — tell me your eye shape or the occasion "
+    "and I'll suggest the right pair!"
+)
+INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS = 10 * 60
+
+
+def _ig_has_photo(message: dict) -> bool:
+    """True if an Instagram message carries an image attachment. Stickers
+    also arrive as image attachments, but with a sticker_id — not a photo."""
+    for att in message.get("attachments") or []:
+        if not isinstance(att, dict) or att.get("type") != "image":
+            continue
+        payload = att.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("sticker_id"):
+            continue
+        return True
+    return False
+
+
+def _ig_event_kind(event: dict) -> str:
+    """Short description of a non-text Instagram event, for the log line
+    that replaced the old silent skip."""
+    message = event.get("message") or {}
+    if message:
+        types = [
+            str(att.get("type") or "?")
+            for att in (message.get("attachments") or [])
+            if isinstance(att, dict)
+        ]
+        if types:
+            return "attachments=" + ",".join(types)
+        if message.get("is_deleted"):
+            return "message deleted"
+        if message.get("is_unsupported"):
+            return "unsupported message"
+        return "message without text"
+    for key in ("reaction", "read", "postback", "referral", "message_edit"):
+        if key in event:
+            return key
+    return "unknown event (keys: " + ", ".join(sorted(event.keys())[:8]) + ")"
+
+
+def _ig_photo_replied_recently(sender_id: str) -> bool:
+    """Has this sender already had the photo reply inside the window? Read
+    from instagram_logs, so it survives restarts. Fails open (False)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM instagram_logs "
+                "WHERE sender_id = ? AND source = 'PHOTO_IG' "
+                "AND logged_at >= datetime('now', ?) LIMIT 1",
+                (sender_id, f"-{INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS} seconds"),
+            ).fetchone()
+        finally:
+            conn.close()
+        return hit is not None
+    except Exception as e:
+        print(f"[INSTAGRAM] Photo-reply window check failed for {sender_id}: {type(e).__name__}: {e}")
+        return False
+
+
+def _handle_instagram_photo(sender_id: str, timestamp: str) -> None:
+    """Honest reply to an Instagram photo, plus a founder notice.
+
+    Logged with message_text "[sent a photo]", so the next turn's history
+    shows the model a photo arrived and what we said — it won't ask the
+    customer to send one. A failed reply is logged under PHOTO_IG_FAILED
+    (history-excluded) and the next photo tries again."""
+    if _ig_photo_replied_recently(sender_id):
+        print(f"[INSTAGRAM] Another photo from {sender_id} inside the reply window — logged, not answered")
+        _log_instagram(sender_id, "[sent a photo]", None, timestamp, source="PHOTO_IG_REPEAT")
+        return
+    sent, send_err = _send_instagram_reply(sender_id, INSTAGRAM_PHOTO_REPLY)
+    _log_instagram(
+        sender_id, "[sent a photo]", INSTAGRAM_PHOTO_REPLY, timestamp,
+        source="PHOTO_IG" if sent else "PHOTO_IG_FAILED",
+    )
+    if not sent:
+        print(f"[INSTAGRAM] Photo reply to {sender_id} FAILED: {send_err}")
+    if not TELEGRAM_CHAT_ID:
+        print("[INSTAGRAM] Photo notice skipped: TELEGRAM_CHAT_ID not set")
+        return
+    _telegram_api("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": (
+            f"📷 Instagram photo from sender {sender_id}\n"
+            f"Twin can't view photos, so it asked them for their eye shape "
+            f"or the occasion{'' if sent else ' — but that reply FAILED to send'}.\n"
+            f"Open the DM to see the photo."
+        ),
+    })
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -6357,8 +6877,16 @@ def _process_instagram_event(event: dict) -> None:
         if message.get("is_echo"):
             return
 
-        if not text:
-            # Non-text event (image, sticker, reaction, etc.) — silent skip.
+        # A photo gets an honest canned reply (audit T1-9) once it has
+        # passed the same dedup / pause / takeover gates as text, below.
+        # Every other non-text event (reaction, sticker, share, reel, read
+        # receipt...) is still ignored — but logged, not dropped silently.
+        is_photo = not text and _ig_has_photo(message)
+        if not text and not is_photo:
+            print(
+                f"[INSTAGRAM] Ignored non-text event from "
+                f"{sender_id or '(no sender)'}: {_ig_event_kind(event)}"
+            )
             return
 
         if not sender_id:
@@ -6368,7 +6896,7 @@ def _process_instagram_event(event: dict) -> None:
         msg_id = (message.get("mid") or "").strip()
         timestamp = str(event.get("timestamp") or "")
 
-        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200]}")
+        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200] if text else '[photo]'}")
 
         # Reuse the same dedup set the WATI webhook uses — sender ID + mid
         # collisions across channels would be astronomically improbable.
@@ -6397,6 +6925,19 @@ def _process_instagram_event(event: dict) -> None:
             print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
             return
 
+        if is_photo:
+            # No model call for a photo, so no rate-limit budget either;
+            # _handle_instagram_photo answers at most once per burst.
+            _handle_instagram_photo(sender_id, timestamp)
+            return
+
+        # LLM rate limits (audit T1-3) — after the takeover gates, so a
+        # paused or human-handled sender never uses budget or gets a notice.
+        limit = _llm_admission("Instagram", sender_id)
+        if limit:
+            _ig_rate_limited(sender_id, text, timestamp, limit)
+            return
+
         # Best-effort order context. Sender IDs are 17-digit FB IDs and
         # won't match Indian phone numbers in the orders table — function
         # returns "" for the no-match case, which is fine.
@@ -6423,6 +6964,9 @@ def _process_instagram_event(event: dict) -> None:
             ):
                 classification, reply = "ESCALATE", ""
             else:
+                # No escalation signal: used to return silently — the
+                # customer got nothing and nobody was told (audit T1-8).
+                _ig_pipeline_failure(sender_id, text, timestamp, f"{type(e).__name__}: {e}")
                 return
 
         # The empty-reply gate must never swallow an ESCALATE verdict
@@ -6438,10 +6982,19 @@ def _process_instagram_event(event: dict) -> None:
                 )
                 reply = ESCALATE_FALLBACK_HOLDING_REPLY
                 fallback_escalation = True
-            else:
+            elif classification in ("AUTO", "DRAFT+APPROVE"):
+                # A deliberately empty reply — e.g. brain.md's "stay silent
+                # after a holding message" rule. Nothing to send.
                 print(
                     f"[INSTAGRAM] Twin returned empty result "
                     f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                )
+                return
+            else:
+                print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
+                _ig_pipeline_failure(
+                    sender_id, text, timestamp,
+                    f"unusable model output (classification={classification!r})",
                 )
                 return
 
@@ -6554,10 +7107,21 @@ def _process_instagram_event(event: dict) -> None:
                 print(f"[ESCALATE] PAUSE UNCONFIRMED for {sender_id} — founder must handle manually")
 
         else:
-            print(f"[INSTAGRAM] Unknown classification {classification!r} — no dispatch")
+            print(f"[INSTAGRAM] Unknown classification {classification!r}")
+            _ig_pipeline_failure(
+                sender_id, text, timestamp,
+                f"unusable model output (classification={classification!r})",
+            )
     except Exception as e:
         print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
+        # Not the reply pipeline: a reply may or may not have gone out
+        # before this, so alert only — never risk a duplicate message.
+        _alert_send_failure(
+            "Instagram", f"{type(e).__name__}: {e}",
+            locals().get("sender_id") or "(unknown)",
+            kind="pipeline", holding_sent=None,
+        )
 
 
 @app.route("/dashboard-data", methods=["GET"])

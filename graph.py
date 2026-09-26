@@ -3,8 +3,12 @@
 This module makes the twin's implicit message pipeline EXPLICIT as a graph:
 
     intake -> retrieve -> hydrate -> generate -> triage -> dispatch_*
-       \\ (gate hit)                                 \\ (unparseable / unknown)
+       \\ (gate hit)                                 \\ (deliberately empty reply)
         `-> END                                       `-> END
+
+dispatch_* is dispatch_auto / _draft / _escalate, or dispatch_failure when
+the pipeline itself failed (LLM error, unusable output) with no escalation
+signal: the customer still gets the brain's holding line (audit T1-8).
 
 Every node DELEGATES to the existing production function in app.py — the
 RAG layer, the brain.md prompt assembly, the DeepSeek call, the prefilters,
@@ -90,6 +94,7 @@ class TwinState(TypedDict, total=False):
     decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | DROP (final)
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
     pipeline_error: str  # hydrate/generate failure detail (routing + audit)
+    failure_detail: str  # "<ExcType>: <msg>" / unusable-output text, for dispatch_failure
 
     # -- dispatch --
     dispatch: dict  # what the dispatch node actually did, for the caller
@@ -108,7 +113,8 @@ def intake(state: TwinState) -> TwinState:
 
     Gate order is load-bearing and copied exactly: dedup FIRST (a duplicate
     delivery must not re-run the pause/human checks or reload context),
-    then the in-memory pause gate, then the DB-backed human-handling net.
+    then the in-memory pause gate, then the DB-backed human-handling net,
+    then the LLM rate limit (so paused/human-handled senders never use budget).
     """
     sender_id = state["sender_id"]
     msg_id = state.get("msg_id", "")
@@ -127,6 +133,12 @@ def intake(state: TwinState) -> TwinState:
     if app._udit_replied_recently_ig(sender_id):
         print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
         return {"drop_reason": "human_handling"}
+
+    # LLM rate limits (audit T1-3) — same gate and helper as production.
+    limit = app._llm_admission("Instagram", sender_id)
+    if limit:
+        app._ig_rate_limited(sender_id, state["text"], state.get("timestamp", ""), limit)
+        return {"drop_reason": f"rate_limited:{limit}"}
 
     return {
         "order_context": app._lookup_recent_order(sender_id),
@@ -171,7 +183,10 @@ def hydrate(state: TwinState) -> TwinState:
     except Exception as e:
         print(f"[GRAPH] Twin pipeline failed in hydrate: {type(e).__name__}: {e}")
         traceback.print_exc()
-        return {"pipeline_error": f"hydrate: {type(e).__name__}: {e}"}
+        return {
+            "pipeline_error": f"hydrate: {type(e).__name__}: {e}",
+            "failure_detail": f"{type(e).__name__}: {e}",
+        }
 
     return {"system_prompt": brain}
 
@@ -194,6 +209,7 @@ def generate(state: TwinState) -> TwinState:
         traceback.print_exc()
         return {
             "pipeline_error": f"generate: {type(e).__name__}: {e}",
+            "failure_detail": f"{type(e).__name__}: {e}",
             "raw_response": "",
             "llm_classification": "",
             "reply": "",
@@ -253,6 +269,11 @@ def triage(state: TwinState) -> TwinState:
     field, or a failed LLM call after a prefilter hit) substitutes the
     stock holding reply and dispatches instead of dropping. Production
     (_process_instagram_event) implements the same rule — parity holds.
+
+    Without an escalation verdict, a pipeline failure or an unusable
+    classification routes to FAIL -> dispatch_failure (holding line +
+    founder alert, audit T1-8); only a deliberately empty AUTO / DRAFT
+    reply drops.
     """
     classification = state.get("llm_classification", "")
     reply = state.get("reply", "")
@@ -286,15 +307,29 @@ def triage(state: TwinState) -> TwinState:
                 "reply": app.ESCALATE_FALLBACK_HOLDING_REPLY,
                 "fallback_escalation": True,
             }
-        print(
-            f"[INSTAGRAM] Twin returned empty result "
-            f"(classification={classification!r}, reply_len={len(reply)}); not sending"
-        )
-        return {"decision": "DROP"}
+        if state.get("pipeline_error"):
+            # hydrate/generate raised and no prefilter escalated: holding
+            # line + founder alert, same as production (audit T1-8).
+            return {"decision": "FAIL", "failure_detail": state.get("failure_detail", "")}
+        if classification in ("AUTO", "DRAFT+APPROVE"):
+            # A deliberately empty reply (brain.md's stay-silent rule).
+            print(
+                f"[INSTAGRAM] Twin returned empty result "
+                f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+            )
+            return {"decision": "DROP"}
+        print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
+        return {
+            "decision": "FAIL",
+            "failure_detail": f"unusable model output (classification={classification!r})",
+        }
 
     if classification not in ("AUTO", "DRAFT+APPROVE", "ESCALATE"):
-        print(f"[INSTAGRAM] Unknown classification {classification!r} — no dispatch")
-        return {"decision": "DROP"}
+        print(f"[INSTAGRAM] Unknown classification {classification!r}")
+        return {
+            "decision": "FAIL",
+            "failure_detail": f"unusable model output (classification={classification!r})",
+        }
 
     return {"decision": classification, "reply": reply, "fallback_escalation": False}
 
@@ -412,6 +447,20 @@ def dispatch_escalate(state: TwinState) -> TwinState:
     }
 
 
+def dispatch_failure(state: TwinState) -> TwinState:
+    """FAIL: the pipeline itself failed (LLM error or timeout, unusable
+    output) with no escalation signal. The customer still gets the brain's
+    holding line and the founder a rate-limited alert — the same helper
+    production calls, so the two can't drift (audit T1-8)."""
+    sent = app._ig_pipeline_failure(
+        state["sender_id"],
+        state["text"],
+        state.get("timestamp", ""),
+        state.get("failure_detail", ""),
+    )
+    return {"dispatch": {"channel": "instagram_failure", "holding_line_sent": sent}}
+
+
 # ---------------------------------------------------------------------------
 # Routers. Conditional-edge functions return a label; the path map at
 # add_conditional_edges translates labels to nodes (or END). Keeping
@@ -436,6 +485,7 @@ def _route_after_triage(state: TwinState) -> str:
         "AUTO": "auto",
         "DRAFT+APPROVE": "draft",
         "ESCALATE": "escalate",
+        "FAIL": "failure",
     }.get(state.get("decision", ""), "drop")
 
 
@@ -454,6 +504,7 @@ def build_graph():
     g.add_node("dispatch_auto", dispatch_auto)
     g.add_node("dispatch_draft", dispatch_draft)
     g.add_node("dispatch_escalate", dispatch_escalate)
+    g.add_node("dispatch_failure", dispatch_failure)
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
@@ -472,12 +523,14 @@ def build_graph():
             "auto": "dispatch_auto",
             "draft": "dispatch_draft",
             "escalate": "dispatch_escalate",
+            "failure": "dispatch_failure",
             "drop": END,
         },
     )
     g.add_edge("dispatch_auto", END)
     g.add_edge("dispatch_draft", END)
     g.add_edge("dispatch_escalate", END)
+    g.add_edge("dispatch_failure", END)
 
     return g.compile()
 
@@ -504,4 +557,10 @@ def handle_instagram_message(
     except Exception as e:
         print(f"[GRAPH] Twin pipeline failed: {type(e).__name__}: {e}")
         traceback.print_exc()
+        # Mirrors production's handler catch-all: alert only, since a
+        # reply may or may not have gone out before the error.
+        app._alert_send_failure(
+            "Instagram", f"{type(e).__name__}: {e}", sender_id or "(unknown)",
+            kind="pipeline", holding_sent=None,
+        )
         return None

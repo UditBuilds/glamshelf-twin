@@ -31,7 +31,7 @@ Live Shopify inventory is also injected per call, so stock counts and pricing ar
 | App | Python (Flask + gunicorn) |
 | Hosting | Render |
 | Text replies | DeepSeek v3 |
-| Image understanding | Claude Sonnet (reads order screenshots, eye photos) |
+| Image understanding | Claude Sonnet on WhatsApp (reads order screenshots, eye photos). On Instagram Twin can't view photos yet: it asks the customer to describe what they need and alerts the founder |
 | WhatsApp | WATI Business API |
 | Instagram | Meta Instagram Graph API |
 | Founder UI | Telegram Bot (inline buttons) |
