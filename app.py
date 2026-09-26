@@ -3122,6 +3122,8 @@ def send_draft_for_approval(
         "Drafted reply:\n"
         f'"{reply_text}"'
     )
+    if channel == "Instagram":
+        text += f"\n\n{IG_APPROVAL_DEADLINE_LINE}"
 
     # callback_data must be ≤ 64 bytes (Telegram hard limit). Our format:
     #   "action:<verb>|num:<wa_id-or-ig-sender-id>|id:<8-hex>"
@@ -3190,6 +3192,37 @@ def _parse_callback_data(data: str) -> dict:
             k, v = part.split(":", 1)
             out[k] = v
     return out
+
+
+# Instagram only accepts a reply within 24h of the customer's last message
+# (audit T2-14). The founder sees the deadline on every IG draft, and an
+# approval that misses it gets its own alert — the generic send-failure
+# alert shows Meta's raw error and is muted for 30 min after the first one.
+IG_APPROVAL_DEADLINE_LINE = "Approve within 24h — Instagram blocks replies after that."
+IG_REPLY_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def _ig_window_closed(error: str) -> bool:
+    """True when a failed Instagram send was refused because the 24h
+    messaging window has closed — Meta answers "(#10) This message is
+    sent outside of allowed window."."""
+    return "outside of allowed window" in (error or "").lower()
+
+
+def _ig_alert_window_closed(chat_id, name_for_display: str) -> None:
+    """Tell the founder, in plain words, that an approved Instagram reply
+    didn't go out because the 24h window closed. Not rate-limited: each
+    one is a customer who got nothing."""
+    _telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            f"⏰ Instagram reply NOT sent to {name_for_display}\n"
+            f"The 24h window has closed: Instagram blocks replies more than "
+            f"24h after the customer's last message. Reply to them yourself "
+            f"in the Instagram app — Twin can't reach them until they message again."
+        ),
+    })
+    print(f"[TELEGRAM DRAFT] Instagram 24h window closed for {name_for_display} — founder alerted")
 
 
 def _finalize_draft_message(
@@ -3310,6 +3343,30 @@ def _handle_telegram_callback(cb: dict) -> None:
     # because the follow-up text message handler needs to find it.
     draft = _draft_take(draft_id) if draft_id else None
 
+    # An Instagram draft tapped more than 24h after it was sent: the TTL
+    # prune has usually deleted it by now, and Instagram would refuse the
+    # reply anyway — say so instead of "Already handled" (audit T2-14).
+    # Recognised by the deadline line only IG drafts carry, and by the
+    # Telegram message's own send time, so a quick double-tap on a fresh
+    # draft still gets the dedup answer below.
+    sent_at = msg.get("date") or 0
+    if (
+        not draft
+        and action in ("send", "edit")
+        and IG_APPROVAL_DEADLINE_LINE in (msg.get("text") or "")
+        and sent_at
+        and time.time() - sent_at > IG_REPLY_WINDOW_SECONDS
+    ):
+        _telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id, "text": "Expired — Instagram's 24h window closed"
+        })
+        _finalize_draft_message(
+            chat_id, message_id, msg.get("text") or "",
+            f"⏰ Expired — NOT sent to {customer_number}",
+        )
+        _ig_alert_window_closed(chat_id, customer_number)
+        return
+
     # Dedup — second tap on same button (or post-restart orphan).
     if not draft:
         _telegram_api("answerCallbackQuery", {
@@ -3369,6 +3426,12 @@ def _handle_telegram_callback(cb: dict) -> None:
                 f"✅ Sent to {name_for_display}",
             )
             print(f"[TELEGRAM DRAFT] Send-as-is for {customer_number} (draft {draft_id})")
+        elif draft.get("channel") == "Instagram" and _ig_window_closed(send_err):
+            _finalize_draft_message(
+                chat_id, message_id, original_text,
+                f"⏰ NOT sent to {name_for_display} — Instagram's 24h window closed",
+            )
+            _ig_alert_window_closed(chat_id, name_for_display)
         else:
             _finalize_draft_message(
                 chat_id, message_id, original_text,
@@ -3521,11 +3584,16 @@ def _handle_telegram_message(msg: dict) -> None:
         # Sending an edited reply is a human takeover — keep the ticket on the
         # Bot so the webhook keeps receiving this customer's messages.
         _reassign_to_bot(customer_number)
+    window_closed = (
+        not sent and draft.get("channel") == "Instagram" and _ig_window_closed(send_err)
+    )
     if sent:
         _telegram_api("sendMessage", {
             "chat_id": chat_id,
             "text": f"✅ Sent your edit to {name_for_display}",
         })
+    elif window_closed:
+        _ig_alert_window_closed(chat_id, name_for_display)
     else:
         _telegram_api("sendMessage", {
             "chat_id": chat_id,
@@ -3542,7 +3610,8 @@ def _handle_telegram_message(msg: dict) -> None:
     if orig_chat and orig_msg:
         _finalize_draft_message(
             orig_chat, orig_msg, original_text,
-            f"✏️ Edited and sent to {name_for_display}",
+            f"⏰ Edited but NOT sent to {name_for_display} — Instagram's 24h window closed"
+            if window_closed else f"✏️ Edited and sent to {name_for_display}",
         )
 
     _draft_delete(target_id)
@@ -7086,6 +7155,60 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
+# DRAFT+APPROVE on Instagram (audit T2-14): the reply waits for the founder's
+# Telegram tap, which used to leave the customer in silence. They now get
+# brain.md's Default Handoff Line straight away — at most once per sender
+# per window, counting the same line sent by the pipeline-failure and
+# escalation paths, so a burst of drafts doesn't repeat it.
+IG_DRAFT_HANDOFF_WINDOW_SECONDS = 30 * 60
+
+
+def _ig_handoff_sent_recently(sender_id: str) -> bool:
+    """Did this sender get BRAIN_HOLDING_LINE inside the window? Read from
+    instagram_logs, so it survives restarts. Fails open (False)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM instagram_logs "
+                "WHERE sender_id = ? AND reply_text = ? "
+                "AND source IN ('DRAFT_HANDOFF_IG', 'PIPELINE_HOLDING_IG', 'ESCALATE_HOLDING_IG') "
+                "AND logged_at >= datetime('now', ?) LIMIT 1",
+                (sender_id, BRAIN_HOLDING_LINE, f"-{IG_DRAFT_HANDOFF_WINDOW_SECONDS} seconds"),
+            ).fetchone()
+        finally:
+            conn.close()
+        return hit is not None
+    except Exception as e:
+        print(f"[INSTAGRAM] Handoff-line window check failed for {sender_id}: {type(e).__name__}: {e}")
+        return False
+
+
+def _ig_draft_handoff(sender_id: str, timestamp: str) -> bool:
+    """Send the Default Handoff Line when an Instagram message goes to
+    DRAFT+APPROVE, unless this sender already got it inside the window.
+    Logged with an empty message_text — the customer's message belongs to
+    the pending draft row, and the delivered exchange is logged on
+    approval — so the row is audit-only and never enters history. A failed
+    send is logged under DRAFT_HANDOFF_FAILED_IG and the next draft tries
+    again. Returns whether the line was sent now.
+
+    Shared with graph.py's dispatch_draft so the two stay in parity."""
+    if _ig_handoff_sent_recently(sender_id):
+        print(f"[INSTAGRAM-DRAFT] {sender_id} already got the handoff line recently — not repeating it")
+        return False
+    sent, send_err = _send_instagram_reply(sender_id, BRAIN_HOLDING_LINE)
+    _log_instagram(
+        sender_id, "", BRAIN_HOLDING_LINE, timestamp,
+        source="DRAFT_HANDOFF_IG" if sent else "DRAFT_HANDOFF_FAILED_IG",
+    )
+    if sent:
+        print(f"[INSTAGRAM-DRAFT] Handoff line sent to {sender_id}")
+    else:
+        print(f"[INSTAGRAM-DRAFT] Handoff line to {sender_id} FAILED: {send_err}")
+    return sent
+
+
 def _ig_escalate(
     sender_id: str,
     text: str,
@@ -7549,11 +7672,13 @@ def _process_instagram_event(event: dict) -> None:
 
         elif classification == "DRAFT+APPROVE":
             # Same buttoned approval flow WhatsApp uses, keyed on the IG
-            # sender_id via the shared pending_drafts table. The customer
+            # sender_id via the shared pending_drafts table. The drafted
             # reply ships from /telegram-callback when Udit taps Send (or
-            # completes an Edit) — nothing is sent here. Falls back to a
-            # plain-text notification if the buttoned send fails so Udit
-            # always gets *some* heads-up about the pending draft.
+            # completes an Edit); meanwhile the customer gets the handoff
+            # line (audit T2-14). Falls back to a plain-text notification
+            # if the buttoned send fails so Udit always gets *some*
+            # heads-up about the pending draft.
+            _ig_draft_handoff(sender_id, timestamp)
             sent_with_buttons = send_draft_for_approval(
                 customer_number=sender_id,
                 customer_name="",
