@@ -213,6 +213,9 @@ class EndToEnd(RateLimitTestCase):
         self.common = [
             patch.object(glam, "_load_brain_cached", r("_load_brain_cached", CANNED_BRAIN)),
             patch.object(glam, "get_live_inventory", r("get_live_inventory", "")),
+            # The live prices a real inventory fetch would have cached —
+            # without them the output guard holds "₹849" for approval.
+            patch.dict(glam._inventory_cache, {"prices": {849.0}}),
             patch.object(glam, "get_live_policies", r("get_live_policies", "")),
             patch.object(glam, "_rag_retrieve", r("_rag_retrieve", "")),
             patch.object(glam, "ask_claude", r("ask_claude", AUTO_JSON)),

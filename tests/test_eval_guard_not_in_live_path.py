@@ -67,6 +67,9 @@ class InstagramSendNotBlockedByEvalGuard(unittest.TestCase):
             patch.object(glam, "_load_instagram_history", return_value=[]),
             patch.object(glam, "_load_brain_cached", return_value="BRAIN v-test"),
             patch.object(glam, "get_live_inventory", return_value=""),
+            # The live prices a real inventory fetch would have cached —
+            # without them the output guard holds "₹249" for approval.
+            patch.dict(glam._inventory_cache, {"prices": {249.0}}),
             patch.object(glam, "get_live_policies", return_value=""),
             patch.object(glam, "_rag_retrieve", return_value=""),
             patch.object(glam, "ask_claude", return_value=(
