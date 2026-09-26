@@ -2336,8 +2336,96 @@ def _alert_send_failure(
         print(f"[ALERT] Telegram alert failed: {type(e).__name__}: {e}")
 
 
+# Instagram length cap (audit T2-10). Meta rejects a DM text over its limit
+# (treated as 1000 characters) and the customer gets nothing. A longer reply
+# is split at a line break or sentence end into at most INSTAGRAM_MAX_PARTS
+# messages of up to INSTAGRAM_PART_MAX_CHARS each; if it still doesn't fit,
+# the last message is cut at its last full sentence and ends with
+# INSTAGRAM_CUT_ENDING. Never cuts mid-word or mid-price.
+INSTAGRAM_PART_MAX_CHARS = 900
+INSTAGRAM_MAX_PARTS = 2
+INSTAGRAM_CUT_ENDING = "Want more details on any of these? 🤍"
+
+# A sentence ends at . ! ? … or the brain's closing 🤍 (plus any closing
+# quote / bracket), followed by whitespace and then something that isn't a
+# digit — so "Rs. 849" is never treated as a sentence end.
+_IG_SENTENCE_END_RE = re.compile(r"[.!?…🤍][\"'”’)\]]*(?=\s+[^\s\d])")
+# Currency markers that must stay on the same side of a cut as their amount.
+_IG_PRICE_PREFIX_RE = re.compile(r"(?:₹|\bRs\.?|\bINR)$", re.IGNORECASE)
+
+
+def _ig_cut_point(text: str, limit: int) -> int:
+    """Where to cut `text` so text[:cut] holds at most `limit` characters.
+    Prefers the last line break or sentence end; falls back to the last
+    space that doesn't separate a currency marker from its amount; only a
+    reply with no space at all is cut hard at `limit`."""
+    breaks = [m.start() for m in re.finditer(r"\n", text[:limit + 1])]
+    breaks += [m.end() for m in _IG_SENTENCE_END_RE.finditer(text[:limit + 1])]
+    breaks = [c for c in breaks if 0 < c <= limit and text[:c].strip()]
+    if breaks:
+        return max(breaks)
+    for m in reversed(list(re.finditer(r"\s+", text[:limit + 1]))):
+        cut = m.start()
+        if cut <= 0 or not text[:cut].strip():
+            continue
+        if _IG_PRICE_PREFIX_RE.search(text[:cut]) and text[m.end():m.end() + 1].isdigit():
+            continue
+        return cut
+    print(f"[INSTAGRAM] No sentence or word boundary in the first {limit} chars — hard cut")
+    return limit
+
+
+def _ig_split_reply(text: str) -> tuple[list[str], str]:
+    """Split a reply into Instagram-sized messages.
+
+    Returns (parts, action): action is "" when the reply fits in one
+    message (returned unchanged), "split" when it went out as
+    INSTAGRAM_MAX_PARTS messages with nothing dropped, and "cut" when the
+    last message was cut at a full sentence and ends with
+    INSTAGRAM_CUT_ENDING."""
+    if len(text) <= INSTAGRAM_PART_MAX_CHARS:
+        return [text], ""
+    parts: list[str] = []
+    rest = text.strip()
+    while len(parts) < INSTAGRAM_MAX_PARTS - 1 and len(rest) > INSTAGRAM_PART_MAX_CHARS:
+        cut = _ig_cut_point(rest, INSTAGRAM_PART_MAX_CHARS)
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].strip()
+    if len(rest) <= INSTAGRAM_PART_MAX_CHARS:
+        return parts + [rest], "split"
+    budget = INSTAGRAM_PART_MAX_CHARS - len(INSTAGRAM_CUT_ENDING) - 2
+    cut = _ig_cut_point(rest, budget)
+    return parts + [rest[:cut].rstrip() + "\n\n" + INSTAGRAM_CUT_ENDING], "cut"
+
+
 def _send_instagram_reply(sender_id: str, text: str) -> tuple[bool, str]:
-    """Send an outbound Instagram DM via the Meta Graph Messages API.
+    """Send a reply as one Instagram DM, or as up to INSTAGRAM_MAX_PARTS
+    DMs when it's over INSTAGRAM_PART_MAX_CHARS (see _ig_split_reply).
+    Same contract as _send_instagram_message: (True, "") only when every
+    part was delivered; stops at the first failed part."""
+    parts, action = _ig_split_reply(text or "")
+    if action == "split":
+        print(
+            f"[INSTAGRAM] Reply to {sender_id} is {len(text)} chars — "
+            f"split into {len(parts)} messages"
+        )
+    elif action == "cut":
+        print(
+            f"[INSTAGRAM] Reply to {sender_id} is {len(text)} chars — split into "
+            f"{len(parts)} messages and cut to {sum(len(p) for p in parts)} chars "
+            f"with the 'more details' ending"
+        )
+    for i, part in enumerate(parts, 1):
+        sent, error = _send_instagram_message(sender_id, part)
+        if not sent:
+            if len(parts) > 1:
+                print(f"[INSTAGRAM] Part {i}/{len(parts)} to {sender_id} failed — not sending the rest")
+            return False, error
+    return True, ""
+
+
+def _send_instagram_message(sender_id: str, text: str) -> tuple[bool, str]:
+    """Send one outbound Instagram DM via the Meta Graph Messages API.
 
     Endpoint: POST https://graph.facebook.com/v19.0/me/messages
     Auth via ?access_token=... query param (Meta's documented pattern).
