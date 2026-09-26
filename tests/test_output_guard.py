@@ -263,6 +263,8 @@ class InventoryPricesTest(unittest.TestCase):
         ]}
         resp = Mock(ok=True); resp.json.return_value = products
         with patch.dict(glam._inventory_cache, {"text": "", "fetched_at": 0.0, "prices": set()}), \
+             patch.object(glam, "ALLOWED_PRICES_PATH",
+                          os.path.join(tempfile.mkdtemp(), "allowed_prices.json")), \
              patch.object(glam.requests, "get", Mock(return_value=resp)), \
              redirect_stdout(io.StringIO()):
             glam.get_live_inventory()

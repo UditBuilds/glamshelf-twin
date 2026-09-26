@@ -355,7 +355,71 @@ SHOPIFY_TIMEOUT_SECONDS = 8
 # shouldn't pin a no-data result for the full TTL. Only successful
 # fetches set fetched_at.
 INVENTORY_CACHE_TTL_SECONDS = 300
-_inventory_cache: dict = {"text": "", "fetched_at": 0.0, "prices": set()}
+_inventory_cache: dict = {"text": "", "fetched_at": 0.0, "prices": set(), "prices_source": ""}
+
+# The output guard's allowed ₹ amounts (audit T1-4) must survive a restart
+# during a Shopify outage. Every good inventory fetch saves its price set
+# here (on the Render persistent disk); on startup it's loaded back, and if
+# the file doesn't exist either, brain.md's Section 2 product table is used.
+ALLOWED_PRICES_PATH = "/var/data/allowed_prices.json"
+
+
+def _save_allowed_prices(prices: set[float]) -> None:
+    """Write the last successful Shopify price set. Written to a temp file
+    and swapped in, so a crash mid-write never leaves a half file. Skipped
+    (logged) when the directory doesn't exist — no persistent disk mounted
+    — rather than creating a directory a redeploy would wipe. Never raises."""
+    folder = os.path.dirname(ALLOWED_PRICES_PATH)
+    if not os.path.isdir(folder):
+        print(f"[PRICES] Not saved: {folder} doesn't exist (no persistent disk?)")
+        return
+    try:
+        tmp = ALLOWED_PRICES_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({
+                "prices": sorted(prices),
+                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }, f)
+        os.replace(tmp, ALLOWED_PRICES_PATH)
+    except Exception as e:
+        print(f"[PRICES] Save failed: {type(e).__name__}: {e}")
+
+
+def _brain_table_prices() -> set[float]:
+    """Prices from brain.md's Section 2 product tables ("| NAME | ₹849 | ...")
+    — the last-resort allowed set. Empty on any failure."""
+    try:
+        text = BRAIN_FILE.read_text(encoding="utf-8")
+        start = text.index("## SECTION 2")
+        end = text.index("### Generic Price Inquiry Handling", start)
+        return {
+            float(m.group(1).replace(",", ""))
+            for m in re.finditer(r"^\|[^|\n]+\|\s*₹([\d,]+)\s*\|", text[start:end], re.MULTILINE)
+        }
+    except Exception as e:
+        print(f"[PRICES] brain.md price table unreadable: {type(e).__name__}: {e}")
+        return set()
+
+
+def _load_startup_prices() -> tuple[set[float], str]:
+    """Allowed prices before the first Shopify fetch: the saved file, else
+    brain.md's product table. Returns (prices, source)."""
+    try:
+        with open(ALLOWED_PRICES_PATH, encoding="utf-8") as f:
+            prices = {float(p) for p in json.load(f)["prices"]}
+        if prices:
+            print(f"[PRICES] Loaded {len(prices)} allowed prices from {ALLOWED_PRICES_PATH}")
+            return prices, "file"
+        print(f"[PRICES] {ALLOWED_PRICES_PATH} holds no prices — using brain.md")
+    except FileNotFoundError:
+        print(f"[PRICES] No {ALLOWED_PRICES_PATH} yet — using brain.md's product table")
+    except Exception as e:
+        print(f"[PRICES] {ALLOWED_PRICES_PATH} unreadable ({type(e).__name__}) — using brain.md")
+    prices = _brain_table_prices()
+    return prices, "brain.md" if prices else ""
+
+
+_inventory_cache["prices"], _inventory_cache["prices_source"] = _load_startup_prices()
 
 # Instagram DM webhook config.
 #
@@ -4185,7 +4249,10 @@ def get_live_inventory() -> str:
     block = "\n".join(lines) + "\n"
     _inventory_cache["text"] = block
     _inventory_cache["fetched_at"] = now
-    _inventory_cache["prices"] = prices
+    if prices:
+        _inventory_cache["prices"] = prices
+        _inventory_cache["prices_source"] = "shopify"
+        _save_allowed_prices(prices)
     print(
         f"[INVENTORY] Fetched {len(products)} products from Shopify "
         f"({len(lines) - 1} with availability)"
@@ -7355,10 +7422,12 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     to DRAFT+APPROVE (handoff line to the customer, draft plus this reason
     to the founder). The text is never rewritten.
 
-    Allowed ₹ amounts: the live Shopify variant prices from the last
-    successful inventory fetch plus output_guard.FIXED_ALLOWED_INR. With no
-    successful fetch yet, only the fixed amounts pass (fails closed: a
-    product price then goes to a draft, never out unchecked).
+    Allowed ₹ amounts: the product prices in _inventory_cache — from the
+    last successful Shopify fetch, or before one, from ALLOWED_PRICES_PATH
+    or brain.md's product table (_load_startup_prices) — plus
+    output_guard.FIXED_ALLOWED_INR. If all three are unavailable, only the
+    fixed amounts pass (fails closed: a product price then goes to a
+    draft, never out unchecked).
 
     Rollback: OUTPUT_GUARD_DISABLED=1/true/yes skips the guard, read per
     call like ESCALATION_PREFILTER_DISABLED.
@@ -7370,7 +7439,7 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
         return ""
     prices = _inventory_cache.get("prices") or set()
     if not prices:
-        print("[OUTPUT-GUARD] No live Shopify prices cached — only the fixed ₹ amounts are allowed")
+        print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
     reasons = output_guard.check_reply(reply, prices)
     if not reasons:
         return ""
