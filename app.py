@@ -35,6 +35,7 @@ from openai import OpenAI
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import output_guard
 from pricing_rules import (
     ACTION_ESCALATE,
     BULK_MIN_TRAYS,
@@ -354,7 +355,7 @@ SHOPIFY_TIMEOUT_SECONDS = 8
 # shouldn't pin a no-data result for the full TTL. Only successful
 # fetches set fetched_at.
 INVENTORY_CACHE_TTL_SECONDS = 300
-_inventory_cache: dict = {"text": "", "fetched_at": 0.0}
+_inventory_cache: dict = {"text": "", "fetched_at": 0.0, "prices": set()}
 
 # Instagram DM webhook config.
 #
@@ -437,6 +438,8 @@ INSTAGRAM_TIMEOUT_SECONDS = 10
 #   WATI_WEBHOOK_VERIFY_DISABLED
 #   INSTAGRAM_WEBHOOK_VERIFY_DISABLED
 #   TELEGRAM_WEBHOOK_VERIFY_DISABLED
+# Same pattern, not webhook-related: OUTPUT_GUARD_DISABLED skips the
+# Instagram AUTO-reply output guard (_ig_output_guard, audit T1-4).
 #
 # INSTAGRAM_APP_SECRET — Meta App Dashboard → App settings → Basic →
 #   "App secret". Meta signs every webhook POST body with HMAC-SHA256
@@ -3091,6 +3094,7 @@ def send_draft_for_approval(
     reply_text: str,
     channel: str = "WhatsApp",
     ig_timestamp: str = "",
+    guard_note: str = "",
 ) -> bool:
     """Send a Telegram message with [✅ Send as-is | ✏️ Edit | ⛔ Skip]
     inline buttons and register the draft in the pending_drafts table so
@@ -3101,6 +3105,8 @@ def send_draft_for_approval(
     for WhatsApp, _send_instagram_reply for Instagram. For Instagram,
     customer_number carries the IG sender_id and ig_timestamp carries the
     original event timestamp (used when logging the delivered exchange).
+    `guard_note`, when set, is the output-guard rule that held an AUTO
+    reply back (audit T1-4) and is shown under the header.
 
     Returns True if the buttoned message was sent and state was registered;
     False on any failure (caller may fall back to plain-text notification).
@@ -3114,6 +3120,9 @@ def send_draft_for_approval(
         f"{customer_name} ({customer_number})" if customer_name else customer_number
     )
     header = "🟡 DRAFT + APPROVE"
+    if guard_note:
+        # Twin classified this AUTO; the output guard held it (audit T1-4).
+        header += f"\n🛡️ Output guard held Twin's AUTO reply — {guard_note}"
     text = (
         f"{header}\n\n"
         f"From: {sender_block}\n\n"
@@ -4124,9 +4133,17 @@ def get_live_inventory() -> str:
         return ""
 
     lines = ["[LIVE INVENTORY - checked now]"]
+    # Every variant price, sold out or not — the output guard's allowed ₹
+    # amounts (audit T1-4). Not added to the prompt block.
+    prices: set[float] = set()
     for p in products:
         title = (p.get("title") or "").strip()
         variants = p.get("variants") or []
+        for v in variants:
+            try:
+                prices.add(float(v.get("price")))
+            except (TypeError, ValueError):
+                pass
         if not title or not variants:
             continue
         # The public storefront endpoint exposes `available` (bool) per
@@ -4160,6 +4177,7 @@ def get_live_inventory() -> str:
     block = "\n".join(lines) + "\n"
     _inventory_cache["text"] = block
     _inventory_cache["fetched_at"] = now
+    _inventory_cache["prices"] = prices
     print(
         f"[INVENTORY] Fetched {len(products)} products from Shopify "
         f"({len(lines) - 1} with availability)"
@@ -7155,6 +7173,37 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
+def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
+    """Output guard for Instagram AUTO replies (audit T1-4): run the pure
+    checks in output_guard.py before an AUTO reply is sent. Returns "" when
+    it may go out, else the rule(s) that fired — the caller then routes it
+    to DRAFT+APPROVE (handoff line to the customer, draft plus this reason
+    to the founder). The text is never rewritten.
+
+    Allowed ₹ amounts: the live Shopify variant prices from the last
+    successful inventory fetch plus output_guard.FIXED_ALLOWED_INR. With no
+    successful fetch yet, only the fixed amounts pass (fails closed: a
+    product price then goes to a draft, never out unchecked).
+
+    Rollback: OUTPUT_GUARD_DISABLED=1/true/yes skips the guard, read per
+    call like ESCALATION_PREFILTER_DISABLED.
+
+    Shared with graph.py's route node so the two stay in parity."""
+    if classification != "AUTO" or not reply:
+        return ""
+    if (os.environ.get("OUTPUT_GUARD_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+        return ""
+    prices = _inventory_cache.get("prices") or set()
+    if not prices:
+        print("[OUTPUT-GUARD] No live Shopify prices cached — only the fixed ₹ amounts are allowed")
+    reasons = output_guard.check_reply(reply, prices)
+    if not reasons:
+        return ""
+    note = "; ".join(reasons)
+    print(f"[OUTPUT-GUARD] Held AUTO reply to {sender_id} for approval — {note}")
+    return note
+
+
 # DRAFT+APPROVE on Instagram (audit T2-14): the reply waits for the founder's
 # Telegram tap, which used to leave the customer in silence. They now get
 # brain.md's Default Handoff Line straight away — at most once per sender
@@ -7607,6 +7656,13 @@ def _process_instagram_event(event: dict) -> None:
                 _ig_pipeline_failure(sender_id, text, timestamp, f"{type(e).__name__}: {e}")
                 return
 
+        # Output guard (audit T1-4): an AUTO reply that trips a rule is held
+        # for approval instead of sent — before the LEAD check, so a
+        # tester's AUTO reply is guarded too.
+        guard_note = _ig_output_guard(sender_id, classification, reply)
+        if guard_note:
+            classification = "DRAFT+APPROVE"
+
         # Testers, brand owners and people asking about the AI service get
         # a friendly reply, a LEAD notice and no 4h lockout (audit T1-5) —
         # unless something more serious (legal, press, health, a
@@ -7686,6 +7742,7 @@ def _process_instagram_event(event: dict) -> None:
                 reply_text=reply,
                 channel="Instagram",
                 ig_timestamp=timestamp,
+                guard_note=guard_note,
             )
             if not sent_with_buttons:
                 try:

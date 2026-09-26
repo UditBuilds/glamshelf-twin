@@ -97,6 +97,7 @@ class TwinState(TypedDict, total=False):
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
     pipeline_error: str  # hydrate/generate failure detail (routing + audit)
     failure_detail: str  # "<ExcType>: <msg>" / unusable-output text, for dispatch_failure
+    guard_note: str  # output-guard rule(s) that held an AUTO reply for approval (audit T1-4)
 
     # -- dispatch --
     dispatch: dict  # what the dispatch node actually did, for the caller
@@ -303,6 +304,12 @@ def triage(state: TwinState) -> TwinState:
         )
         classification = "ESCALATE"
 
+    # Output guard (audit T1-4): an AUTO reply that trips a rule is held
+    # for approval — same helper and same place as production.
+    guard_note = app._ig_output_guard(state["sender_id"], classification, reply)
+    if guard_note:
+        classification = "DRAFT+APPROVE"
+
     # Testers / brand owners / questions about the AI service: friendly
     # reply, LEAD notice, no pause (audit T1-5) — same rule as production.
     tag = app._parse_twin_tag(state.get("raw_response", ""))
@@ -348,7 +355,10 @@ def triage(state: TwinState) -> TwinState:
             "failure_detail": f"unusable model output (classification={classification!r})",
         }
 
-    return {"decision": classification, "reply": reply, "fallback_escalation": False, "tag": tag}
+    return {
+        "decision": classification, "reply": reply, "fallback_escalation": False,
+        "tag": tag, "guard_note": guard_note,
+    }
 
 
 def dispatch_auto(state: TwinState) -> TwinState:
@@ -395,6 +405,7 @@ def dispatch_draft(state: TwinState) -> TwinState:
         reply_text=reply,
         channel="Instagram",
         ig_timestamp=state.get("timestamp", ""),
+        guard_note=state.get("guard_note", ""),
     )
     if not sent_with_buttons:
         try:
