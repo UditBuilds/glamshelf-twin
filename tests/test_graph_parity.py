@@ -188,11 +188,17 @@ class GraphParityTestCase(unittest.TestCase):
         self.assertEqual(draft[2]["customer_number"], SENDER)
         self.assertEqual(draft[2]["channel"], "Instagram")
         self.assertEqual(draft[2]["ig_timestamp"], str(TIMESTAMP))
+        # Audit T2-14: the customer gets the handoff line, logged
+        # audit-only (empty message_text); the draft itself isn't sent.
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
         # Buttons succeeded -> no plain-text fallback, pending log row.
         self.assertEqual(named(old, "send_telegram_notification"), [])
-        (log,) = named(old, "_log_instagram")
-        self.assertEqual(log[1], (SENDER, MSG, None, str(TIMESTAMP)))
-        self.assertEqual(log[2], {"source": "DRAFT_PENDING_IG"})
+        handoff_log, pending_log = named(old, "_log_instagram")
+        self.assertEqual(handoff_log[1], (SENDER, "", glam.BRAIN_HOLDING_LINE, str(TIMESTAMP)))
+        self.assertEqual(handoff_log[2], {"source": "DRAFT_HANDOFF_IG"})
+        self.assertEqual(pending_log[1], (SENDER, MSG, None, str(TIMESTAMP)))
+        self.assertEqual(pending_log[2], {"source": "DRAFT_PENDING_IG"})
 
         new = self._run("new", llm_response=DRAFT_JSON)
         self._assert_parity(old, new)

@@ -378,14 +378,16 @@ def dispatch_auto(state: TwinState) -> TwinState:
 
 
 def dispatch_draft(state: TwinState) -> TwinState:
-    """DRAFT+APPROVE: buttoned Telegram approval; nothing reaches the
-    customer here. The approval continuation (pending_drafts table +
-    /telegram-callback) lives outside the graph — see the Obsidian note
-    on why this isn't a LangGraph interrupt()."""
+    """DRAFT+APPROVE: the customer gets the handoff line (app._ig_draft_handoff,
+    audit T2-14) and the founder a buttoned Telegram approval; the drafted
+    reply itself doesn't reach the customer here. The approval continuation
+    (pending_drafts table + /telegram-callback) lives outside the graph —
+    see the Obsidian note on why this isn't a LangGraph interrupt()."""
     sender_id = state["sender_id"]
     text = state["text"]
     reply = state["reply"]
 
+    app._ig_draft_handoff(sender_id, state.get("timestamp", ""))
     sent_with_buttons = app.send_draft_for_approval(
         customer_number=sender_id,
         customer_name="",
