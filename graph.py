@@ -6,9 +6,10 @@ This module makes the twin's implicit message pipeline EXPLICIT as a graph:
        \\ (gate hit)                                 \\ (deliberately empty reply)
         `-> END                                       `-> END
 
-dispatch_* is dispatch_auto / _draft / _escalate, or dispatch_failure when
-the pipeline itself failed (LLM error, unusable output) with no escalation
-signal: the customer still gets the brain's holding line (audit T1-8).
+dispatch_* is dispatch_auto / _draft / _escalate / _lead, or
+dispatch_failure when the pipeline itself failed (LLM error, unusable
+output) with no escalation signal: the customer still gets the brain's
+holding line (audit T1-8).
 
 Every node DELEGATES to the existing production function in app.py — the
 RAG layer, the brain.md prompt assembly, the DeepSeek call, the prefilters,
@@ -91,7 +92,8 @@ class TwinState(TypedDict, total=False):
     reply: str               # drafted customer-facing text
 
     # -- triage --
-    decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | DROP (final)
+    decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL | DROP (final)
+    tag: str       # the model's optional JSON "tag" (LEAD/SAFETY/LEGAL/PRESS/ORDER/RESTOCK), "" if none
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
     pipeline_error: str  # hydrate/generate failure detail (routing + audit)
     failure_detail: str  # "<ExcType>: <msg>" / unusable-output text, for dispatch_failure
@@ -266,9 +268,14 @@ def triage(state: TwinState) -> TwinState:
     verdict is ESCALATE. Founder decision (July 17, 2026): an escalation
     verdict must survive regardless of what happens downstream, so an
     ESCALATE with unusable reply text (JSON parse failure, empty reply
-    field, or a failed LLM call after a prefilter hit) substitutes the
-    stock holding reply and dispatches instead of dropping. Production
+    field, or a failed LLM call after a prefilter hit) still escalates
+    instead of dropping; dispatch_escalate decides what the customer gets
+    (holding line, safety line, or silence for legal/press). Production
     (_process_instagram_event) implements the same rule — parity holds.
+
+    A tester / brand owner / question about the AI service decides LEAD
+    (friendly reply, LEAD notice, no pause) unless something more serious
+    is going on — see app._ig_is_lead.
 
     Without an escalation verdict, a pipeline failure or an unusable
     classification routes to FAIL -> dispatch_failure (holding line +
@@ -296,16 +303,26 @@ def triage(state: TwinState) -> TwinState:
         )
         classification = "ESCALATE"
 
+    # Testers / brand owners / questions about the AI service: friendly
+    # reply, LEAD notice, no pause (audit T1-5) — same rule as production.
+    tag = app._parse_twin_tag(state.get("raw_response", ""))
+    if app._ig_is_lead(state["text"], classification, reply, tag):
+        return {
+            "decision": "LEAD",
+            "reply": reply if classification == "AUTO" else "",
+            "tag": tag,
+        }
+
     if not classification or not reply:
         if classification == "ESCALATE":
-            print(
-                "[ESCALATE] Verdict with no usable reply — dispatching "
-                "fallback holding reply instead of dropping"
-            )
+            # No usable model reply: escalate like any other — the draft
+            # stays empty and _ig_escalate decides what the customer gets.
+            print("[ESCALATE] Verdict with no usable reply — escalating instead of dropping")
             return {
                 "decision": "ESCALATE",
-                "reply": app.ESCALATE_FALLBACK_HOLDING_REPLY,
+                "reply": "",
                 "fallback_escalation": True,
+                "tag": tag,
             }
         if state.get("pipeline_error"):
             # hydrate/generate raised and no prefilter escalated: holding
@@ -331,7 +348,7 @@ def triage(state: TwinState) -> TwinState:
             "failure_detail": f"unusable model output (classification={classification!r})",
         }
 
-    return {"decision": classification, "reply": reply, "fallback_escalation": False}
+    return {"decision": classification, "reply": reply, "fallback_escalation": False, "tag": tag}
 
 
 def dispatch_auto(state: TwinState) -> TwinState:
@@ -352,6 +369,10 @@ def dispatch_auto(state: TwinState) -> TwinState:
             source="AUTO_FAILED_IG",
         )
         print(f"[INSTAGRAM-AUTO] Send FAILED to {sender_id}: {send_err}")
+    # Order / restock heads-up to the founder — same helper as production.
+    topic = app._ig_fyi_topic(state["text"], state.get("tag", ""))
+    if topic:
+        app._ig_send_fyi(sender_id, state["text"], reply, topic, sent)
 
     return {"dispatch": {"channel": "instagram", "sent": sent, "error": send_err}}
 
@@ -391,60 +412,33 @@ def dispatch_draft(state: TwinState) -> TwinState:
 
 
 def dispatch_escalate(state: TwinState) -> TwinState:
-    """ESCALATE: page the founder (with the Stop-bot button via
-    customer_id), pause the thread 4h. Normally nothing is sent to the
-    customer and the log row carries a NULL reply; on the FALLBACK path
-    (escalation verdict with unusable LLM output) the stock holding reply
-    ships to the customer first, and the log source records whether it
-    was confirmed delivered (ESCALATE_HOLDING_IG, history-visible) or not
-    (ESCALATE_HOLDING_FAILED_IG, history-excluded)."""
-    sender_id = state["sender_id"]
-    text = state["text"]
-    reply = state["reply"]
-    fallback = state.get("fallback_escalation", False)
+    """ESCALATE: the customer gets the brain's holding line (or the safety
+    line for a reported reaction) unless it's a legal threat or press;
+    the founder is paged with a ▶️ Resume button; the thread pauses 4h.
+    All of it lives in app._ig_escalate, the helper production calls, so
+    the two can't drift (audit T1-5)."""
+    result = app._ig_escalate(
+        state["sender_id"],
+        state["text"],
+        state.get("timestamp", ""),
+        state.get("reply", ""),
+        state.get("tag", ""),
+        state.get("fallback_escalation", False),
+    )
+    return {"dispatch": result}
 
-    holding_sent = False
-    holding_err = ""
-    if fallback:
-        holding_sent, holding_err = app._send_instagram_reply(sender_id, reply)
-        if holding_sent:
-            print(f"[ESCALATE] Fallback holding reply sent to {sender_id}")
-        else:
-            print(f"[ESCALATE] Fallback holding reply FAILED to {sender_id}: {holding_err}")
 
-    try:
-        app.send_telegram_notification(
-            state["decision"], text, reply,
-            sender_info=f"Instagram DM — sender {sender_id}",
-            channel="Instagram",
-            customer_id=sender_id,
-            holding_reply_sent=holding_sent,
-        )
-        print(f"[INSTAGRAM-ESCALATE] Notified founder for {sender_id}")
-    except Exception as tg_err:
-        print(
-            f"[INSTAGRAM-TG] Notification failed: "
-            f"{type(tg_err).__name__}: {tg_err}"
-        )
-    pause_confirmed = app._pause_number(sender_id)
-    if fallback and holding_sent:
-        app._log_instagram(sender_id, text, reply, state.get("timestamp", ""), source="ESCALATE_HOLDING_IG")
-    elif fallback:
-        app._log_instagram(sender_id, text, reply, state.get("timestamp", ""), source="ESCALATE_HOLDING_FAILED_IG")
-    else:
-        app._log_instagram(sender_id, text, None, state.get("timestamp", ""), source="ESCALATE_IG")
-    if pause_confirmed:
-        print(f"[ESCALATE] Auto-paused {sender_id} for 4h")
-    else:
-        print(f"[ESCALATE] PAUSE UNCONFIRMED for {sender_id} — founder must handle manually")
-
-    return {
-        "dispatch": {
-            "channel": "telegram_escalate",
-            "paused": True,
-            "holding_reply_sent": holding_sent,
-        }
-    }
+def dispatch_lead(state: TwinState) -> TwinState:
+    """LEAD: a tester / brand owner / question about the AI service gets a
+    friendly reply and the founder a LEAD notice — no pause. Same helper
+    as production (audit T1-5)."""
+    sent = app._ig_lead(
+        state["sender_id"],
+        state["text"],
+        state.get("timestamp", ""),
+        state.get("reply", ""),
+    )
+    return {"dispatch": {"channel": "instagram_lead", "sent": sent}}
 
 
 def dispatch_failure(state: TwinState) -> TwinState:
@@ -486,6 +480,7 @@ def _route_after_triage(state: TwinState) -> str:
         "DRAFT+APPROVE": "draft",
         "ESCALATE": "escalate",
         "FAIL": "failure",
+        "LEAD": "lead",
     }.get(state.get("decision", ""), "drop")
 
 
@@ -505,6 +500,7 @@ def build_graph():
     g.add_node("dispatch_draft", dispatch_draft)
     g.add_node("dispatch_escalate", dispatch_escalate)
     g.add_node("dispatch_failure", dispatch_failure)
+    g.add_node("dispatch_lead", dispatch_lead)
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
@@ -524,6 +520,7 @@ def build_graph():
             "draft": "dispatch_draft",
             "escalate": "dispatch_escalate",
             "failure": "dispatch_failure",
+            "lead": "dispatch_lead",
             "drop": END,
         },
     )
@@ -531,6 +528,7 @@ def build_graph():
     g.add_edge("dispatch_draft", END)
     g.add_edge("dispatch_escalate", END)
     g.add_edge("dispatch_failure", END)
+    g.add_edge("dispatch_lead", END)
 
     return g.compile()
 

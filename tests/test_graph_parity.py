@@ -206,15 +206,23 @@ class GraphParityTestCase(unittest.TestCase):
         self._assert_parity(old, new)
 
     def test_escalate(self):
+        # Audit T1-5: an ordinary escalation no longer means silence. The
+        # customer gets brain.md's holding line (never the model's own
+        # draft, which only goes to the founder), then page + 4h pause.
         old = self._run("old", llm_response=ESCALATE_JSON)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
-        self.assertEqual(tg[2]["customer_id"], SENDER)  # carries the Stop-bot button
+        self.assertEqual(tg[1][2], json.loads(ESCALATE_JSON)["reply"])  # draft shown, not sent
+        self.assertEqual(tg[2]["customer_id"], SENDER)  # Stop / Resume buttons
+        self.assertTrue(tg[2]["holding_reply_sent"])
+        self.assertIn(glam.BRAIN_HOLDING_LINE, tg[2]["customer_line"])
         (pause,) = named(old, "_pause_number")
         self.assertEqual(pause[1], (SENDER,))
         (log,) = named(old, "_log_instagram")
-        self.assertEqual(log[2], {"source": "ESCALATE_IG"})
-        self.assertEqual(named(old, "_send_instagram_reply"), [])  # customer gets nothing
+        self.assertEqual(log[1], (SENDER, MSG, glam.BRAIN_HOLDING_LINE, str(TIMESTAMP)))
+        self.assertEqual(log[2], {"source": "ESCALATE_HOLDING_IG"})
 
         new = self._run("new", llm_response=ESCALATE_JSON)
         self._assert_parity(old, new)
@@ -224,10 +232,12 @@ class GraphParityTestCase(unittest.TestCase):
     def test_prefilter_phrase_upgrades_auto_to_escalate(self):
         msg = "This is unacceptable, I will contact my lawyer about this order"
         old = self._run("old", llm_response=AUTO_JSON, message=msg)
-        # LLM said AUTO; the phrase filter must force the ESCALATE path.
+        # LLM said AUTO; the phrase filter must force the ESCALATE path —
+        # and a legal threat stays silent (founder decision).
         self.assertEqual(named(old, "_send_instagram_reply"), [])
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
+        self.assertIn("legal escalations get no automated reply", tg[2]["customer_line"])
         self.assertEqual(len(named(old, "_pause_number")), 1)
 
         new = self._run("new", llm_response=AUTO_JSON, message=msg)
@@ -236,7 +246,10 @@ class GraphParityTestCase(unittest.TestCase):
     def test_bulk_commit_upgrades_auto_to_escalate(self):
         msg = "ok I'll take 50 trays"
         old = self._run("old", llm_response=AUTO_JSON, message=msg)
-        self.assertEqual(named(old, "_send_instagram_reply"), [])
+        # Not legal/press: the customer gets the holding line, not the
+        # model's AUTO answer.
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
 
@@ -251,14 +264,15 @@ class GraphParityTestCase(unittest.TestCase):
         reply at all, no fallback and no page to the founder.
 
         Now the call is retried once, and if the retry is also unusable the
-        thread escalates: the stock holding reply ships to the customer and
-        the founder is notified. Both implementations must agree.
+        thread escalates: brain.md's holding line ships to the customer (the
+        July 17 "I hear you…" text is retired on Instagram) and the founder
+        is notified. Both implementations must agree.
         """
         garbage = "sorry, I can't produce JSON today"
         old = self._run("old", llm_response=garbage)
         self.assertEqual(len(named(old, "ask_claude")), 2, "original call + one retry")
         (send,) = named(old, "_send_instagram_reply")
-        self.assertEqual(send[1], (SENDER, glam.ESCALATE_FALLBACK_HOLDING_REPLY))
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
 
@@ -266,47 +280,40 @@ class GraphParityTestCase(unittest.TestCase):
         self._assert_parity(old, new)
 
     def test_prefilter_escalation_survives_unparseable_llm_output(self):
-        # REGRESSION TEST for the July 17 escalation-gap fix. This exact
-        # combination — high-risk prefilter forces ESCALATE, LLM output
-        # fails to parse as JSON — used to be silently dropped by the
-        # empty-reply gate: no page, no reply, nothing. Founder decision:
-        # the escalation verdict must survive regardless of what happens
-        # downstream. Assert a holding reply goes OUT and a page is SENT.
+        # REGRESSION TEST for the July 17 escalation-gap fix: a prefilter
+        # escalation whose LLM output fails to parse must still page the
+        # founder and pause — never be dropped by the empty-reply gate.
+        # What the CUSTOMER gets changed with audit T1-5: a legal threat
+        # stays silent on every path, fallback included (founder decision).
         msg = "I am going to the consumer court"
         old = self._run("old", llm_response="not json", message=msg)
-        # Customer gets the stock holding reply — not silence.
-        (send,) = named(old, "_send_instagram_reply")
-        self.assertEqual(send[1], (SENDER, glam.ESCALATE_FALLBACK_HOLDING_REPLY))
-        # Founder is paged, and the page says the holding reply was sent.
+        self.assertEqual(named(old, "_send_instagram_reply"), [])
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
         self.assertEqual(tg[2]["customer_id"], SENDER)
-        self.assertTrue(tg[2]["holding_reply_sent"])
-        # Thread paused; delivered holding reply logged history-visible.
+        self.assertFalse(tg[2]["holding_reply_sent"])
+        self.assertIn("(Twin's own reply was unusable.)", tg[2]["customer_line"])
         self.assertEqual(len(named(old, "_pause_number")), 1)
         (log,) = named(old, "_log_instagram")
-        self.assertEqual(
-            log[1], (SENDER, msg, glam.ESCALATE_FALLBACK_HOLDING_REPLY, str(TIMESTAMP))
-        )
-        self.assertEqual(log[2], {"source": "ESCALATE_HOLDING_IG"})
+        self.assertEqual(log[1], (SENDER, msg, None, str(TIMESTAMP)))
+        self.assertEqual(log[2], {"source": "ESCALATE_IG"})
 
         new = self._run("new", llm_response="not json", message=msg)
         self._assert_parity(old, new)
 
     def test_prefilter_escalation_survives_llm_exception(self):
-        # Same rule, harder failure: the LLM call itself raises (outage,
-        # timeout) on a prefilter-hit message. The verdict must still
-        # dispatch: holding reply + page, never a swallowed escalation.
+        # Same rule, harder failure: the LLM call itself raises on a
+        # prefilter-hit message. Page + pause still happen; a legal threat
+        # still gets no automated reply.
         msg = "This is unacceptable, I will contact my lawyer about this order"
         old = self._run(
             "old", llm_response=None, message=msg,
             llm_exception=RuntimeError("DeepSeek unavailable"),
         )
-        (send,) = named(old, "_send_instagram_reply")
-        self.assertEqual(send[1], (SENDER, glam.ESCALATE_FALLBACK_HOLDING_REPLY))
+        self.assertEqual(named(old, "_send_instagram_reply"), [])
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
-        self.assertTrue(tg[2]["holding_reply_sent"])
+        self.assertFalse(tg[2]["holding_reply_sent"])
         self.assertEqual(len(named(old, "_pause_number")), 1)
 
         new = self._run(
@@ -382,20 +389,147 @@ class GraphParityTestCase(unittest.TestCase):
         self._assert_parity(old, new)
 
     def test_fallback_holding_send_failure_still_pages(self):
-        # If the fallback holding reply can't be delivered, the page must
-        # still fire (with holding_reply_sent=False so the founder knows
-        # the customer saw nothing), and the attempted text is logged
-        # under the history-excluded ESCALATE_HOLDING_FAILED_IG source.
-        msg = "I am going to the consumer court"
-        old = self._run("old", llm_response="not json", message=msg, send_ok=False)
+        # If the holding line can't be delivered, the page must still fire
+        # (holding_reply_sent=False, and the page says the send FAILED) and
+        # the attempted text is logged under the history-excluded
+        # ESCALATE_HOLDING_FAILED_IG source.
+        old = self._run("old", llm_response="not json", send_ok=False)
         (tg,) = named(old, "send_telegram_notification")
         self.assertEqual(tg[1][0], "ESCALATE")
         self.assertFalse(tg[2]["holding_reply_sent"])
+        self.assertIn("FAILED", tg[2]["customer_line"])
         self.assertEqual(len(named(old, "_pause_number")), 1)
         (log,) = named(old, "_log_instagram")
         self.assertEqual(log[2], {"source": "ESCALATE_HOLDING_FAILED_IG"})
 
-        new = self._run("new", llm_response="not json", message=msg, send_ok=False)
+        new = self._run("new", llm_response="not json", send_ok=False)
+        self._assert_parity(old, new)
+
+    # ---- escalation kinds and LEADs (audit T1-5) ----
+
+    def _escalate_tagged(self, tag, reply="drafted holding reply"):
+        return json.dumps({"classification": "ESCALATE", "reply": reply, "tag": tag})
+
+    def test_safety_escalation_sends_the_allergy_line(self):
+        msg = "My eyelids got swollen and red after wearing GS2"
+        old = self._run("old", llm_response=self._escalate_tagged("SAFETY"), message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.ALLERGY_HOLDING_REPLY))
+        self.assertEqual(len(named(old, "_pause_number")), 1)
+
+        new = self._run("new", llm_response=self._escalate_tagged("SAFETY"), message=msg)
+        self._assert_parity(old, new)
+
+    def test_legal_plus_symptoms_sends_the_safety_text_only(self):
+        # Eval row 10 — founder decision: health advice, no holding promise.
+        msg = "Mene aapke eyelashes khareeda the, rashes ho gaye, ab court me jaaunga"
+        old = self._run("old", llm_response=self._escalate_tagged("LEGAL"), message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.ALLERGY_SAFETY_TEXT))
+
+        new = self._run("new", llm_response=self._escalate_tagged("LEGAL"), message=msg)
+        self._assert_parity(old, new)
+
+    def test_press_escalation_stays_silent(self):
+        msg = "Hi, I'm a journalist writing about Indian lash brands"
+        old = self._run("old", llm_response=self._escalate_tagged("PRESS"), message=msg)
+        self.assertEqual(named(old, "_send_instagram_reply"), [])
+        self.assertEqual(len(named(old, "_pause_number")), 1)
+
+        new = self._run("new", llm_response=self._escalate_tagged("PRESS"), message=msg)
+        self._assert_parity(old, new)
+
+    def test_lead_tag_on_auto_reply_notifies_and_never_pauses(self):
+        msg = "Hi! Udit asked me to test your assistant"
+        lead = json.dumps({
+            "classification": "AUTO",
+            "reply": "Thanks for checking it out! Udit will message you personally 🤍",
+            "tag": "LEAD",
+        })
+        old = self._run("old", llm_response=lead, message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, json.loads(lead)["reply"]))
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "LEAD")
+        self.assertEqual(named(old, "_pause_number"), [])
+        (log,) = named(old, "_log_instagram")
+        self.assertEqual(log[2], {"source": "LEAD_IG"})
+
+        new = self._run("new", llm_response=lead, message=msg)
+        self._assert_parity(old, new)
+
+    def test_lead_tag_on_escalate_becomes_a_lead_with_the_fixed_line(self):
+        # The model escalated a tester for naming the founder, but tagged
+        # it LEAD: no lockout, and the fixed LEAD line — not the draft.
+        msg = "Udit told me to try out your chatbot, can I speak to him?"
+        old = self._run("old", llm_response=self._escalate_tagged("LEAD"), message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.LEAD_REPLY))
+        self.assertEqual(named(old, "_pause_number"), [])
+
+        new = self._run("new", llm_response=self._escalate_tagged("LEAD"), message=msg)
+        self._assert_parity(old, new)
+
+    def test_lead_regex_backstop_adds_notice_to_untagged_auto_reply(self):
+        msg = "I'm a brand owner, just testing your AI assistant"
+        old = self._run("old", llm_response=AUTO_JSON, message=msg)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "LEAD")
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, json.loads(AUTO_JSON)["reply"]))
+
+        new = self._run("new", llm_response=AUTO_JSON, message=msg)
+        self._assert_parity(old, new)
+
+    # ---- order / restock heads-up on AUTO replies (audit T1-6) ----
+
+    def test_order_tag_sends_reply_and_founder_heads_up(self):
+        msg = "Where is my order? It's been 9 days"
+        order = json.dumps({
+            "classification": "AUTO",
+            "reply": "Sorry for the delay. Could you share your order ID? I've passed this to the team 🤍",
+            "tag": "ORDER",
+        })
+        old = self._run("old", llm_response=order, message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, json.loads(order)["reply"]))
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ORDER")
+        self.assertEqual(named(old, "_pause_number"), [])  # a heads-up, not an escalation
+
+        new = self._run("new", llm_response=order, message=msg)
+        self._assert_parity(old, new)
+
+    def test_order_number_backstop_when_the_tag_is_missing(self):
+        msg = "any update on #1043?"
+        old = self._run("old", llm_response=AUTO_JSON, message=msg)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ORDER")
+
+        new = self._run("new", llm_response=AUTO_JSON, message=msg)
+        self._assert_parity(old, new)
+
+    def test_restock_tag_sends_reply_and_founder_heads_up(self):
+        msg = "when is GS3 back? notify me pls"
+        restock = json.dumps({"classification": "AUTO", "reply": "GS3 is sold out right now 🤍", "tag": "RESTOCK"})
+        old = self._run("old", llm_response=restock, message=msg)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "RESTOCK")
+        self.assertEqual(len(named(old, "_send_instagram_reply")), 1)
+
+        new = self._run("new", llm_response=restock, message=msg)
+        self._assert_parity(old, new)
+
+    def test_legal_threat_outranks_a_lead_tag(self):
+        msg = "Udit asked me to test this. I'll also call the police on you."
+        lead = json.dumps({"classification": "AUTO", "reply": "hi", "tag": "LEAD"})
+        old = self._run("old", llm_response=lead, message=msg)
+        self.assertEqual(named(old, "_send_instagram_reply"), [])  # legal: silent
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ESCALATE")
+        self.assertEqual(len(named(old, "_pause_number")), 1)
+
+        new = self._run("new", llm_response=lead, message=msg)
         self._assert_parity(old, new)
 
     # ---- intake gates ----

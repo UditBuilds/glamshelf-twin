@@ -214,7 +214,9 @@ class ParseFailureFallbackTestCase(unittest.TestCase):
 
         sends = named(calls, "_send_instagram_reply")
         self.assertEqual(len(sends), 1, "customer must receive exactly one message, not silence")
-        self.assertEqual(sends[0][1][1], glam.ESCALATE_FALLBACK_HOLDING_REPLY)
+        # Instagram escalations send brain.md's holding line (audit T1-5);
+        # the "I hear you…" fallback text is WhatsApp-only now.
+        self.assertEqual(sends[0][1][1], glam.BRAIN_HOLDING_LINE)
 
         notifications = named(calls, "send_telegram_notification")
         self.assertEqual(len(notifications), 1, "founder must be notified")
