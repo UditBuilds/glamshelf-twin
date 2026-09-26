@@ -154,6 +154,9 @@ class InstagramHandlerErrorAlerts(unittest.TestCase):
             # A bug after the reply went out:
             patch.object(glam, "_log_instagram", r("_log_instagram", exc=RuntimeError("disk full"))),
             patch.object(glam, "_alert_send_failure", r("_alert_send_failure")),
+            # The live prices a real inventory fetch would have cached —
+            # without them the output guard holds "₹849" for approval.
+            patch.dict(glam._inventory_cache, {"prices": {849.0}}),
         ]
         with ExitStack() as stack:
             for p in patches:

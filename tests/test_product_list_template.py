@@ -96,5 +96,37 @@ class ProductListTemplateTest(unittest.TestCase):
         self.assertIn("Free shipping above ₹799\n", tail)
 
 
+class WhatsNewTemplateTest(unittest.TestCase):
+    """The "What's new?" reply: bullets naming GS3 and the Everyday + Glam
+    Duo, ending with a one-line question — no paragraph list."""
+
+    def setUp(self):
+        self.reply = quoted_block_after('**"What\'s new? / Any new launches?":**')
+
+    def test_names_gs3_and_the_duo_as_bullets(self):
+        bullets = [l for l in self.reply.splitlines() if l.startswith("• ")]
+        self.assertEqual(bullets, [
+            "• GS3 — ₹849 · half lash tray, natural lift",
+            "• Everyday + Glam Duo — ₹499 · 1 natural + 1 glam",
+        ])
+
+    def test_ends_with_a_one_line_question(self):
+        last = self.reply.splitlines()[-1]
+        self.assertTrue(last.endswith("? 🤍"), last)
+        self.assertEqual(self.reply.count("?"), 1)
+        self.assertEqual(self.reply.count("🤍"), 1)
+
+    def test_no_paragraph_list(self):
+        self.assertNotIn(";", self.reply)
+        self.assertNotIn("|", self.reply)
+        self.assertNotIn("Clean Girl, Kawaii", self.reply)
+
+    def test_passes_the_output_guard(self):
+        import sys
+        sys.path.insert(0, str(BRAIN.parent.parent))
+        import output_guard
+        self.assertEqual(output_guard.check_reply(self.reply, {499.0, 849.0}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

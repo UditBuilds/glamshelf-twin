@@ -53,12 +53,14 @@ Infrastructure retry — read this before touching it:
     not this file's; see the notes on ask_claude.)
 
 Run:  python -m unittest tests.test_vision_followup_wati
-      (needs DEEPSEEK_API_KEY; set VISION_FOLLOWUP_REPEAT to change runs,
+      (needs DEEPSEEK_API_KEY and a reachable api.deepseek.com — otherwise
+       the two live tests skip; set VISION_FOLLOWUP_REPEAT to change runs,
        VISION_FOLLOWUP_API_RETRIES to change the infrastructure retry budget)
 """
 
 import os
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -108,6 +110,24 @@ ASKS_WHICH_PRODUCT = re.compile(
 )
 
 
+# The live-model tests skip, rather than fail, when the reply model's host
+# can't be reached — an offline run can't say anything about what the twin
+# would reply. One TCP connect per test run: no request, no API call.
+DEEPSEEK_HOST = "api.deepseek.com"
+_deepseek_reachable: bool | None = None
+
+
+def deepseek_reachable() -> bool:
+    global _deepseek_reachable
+    if _deepseek_reachable is None:
+        try:
+            socket.create_connection((DEEPSEEK_HOST, 443), timeout=5).close()
+            _deepseek_reachable = True
+        except OSError:
+            _deepseek_reachable = False
+    return _deepseek_reachable
+
+
 def image_event(wa_id, *, caption=None, msg_id=""):
     payload = {
         "type": "image",
@@ -139,6 +159,11 @@ class VisionFollowUpReconstruction(unittest.TestCase):
         self.addCleanup(os.environ.pop, "WATI_WEBHOOK_VERIFY_DISABLED", None)
         if not os.environ.get("DEEPSEEK_API_KEY"):
             self.skipTest("DEEPSEEK_API_KEY not set — reply model unavailable")
+        if not deepseek_reachable():
+            self.skipTest(
+                f"{DEEPSEEK_HOST} not reachable (offline or network blocked) — "
+                f"these tests call the live reply model"
+            )
         self._reset_state()
 
     def _reset_state(self):
