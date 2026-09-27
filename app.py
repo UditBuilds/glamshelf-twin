@@ -1180,6 +1180,63 @@ def _is_bot_outbound(text_body: str) -> bool:
     return True
 
 
+# Instagram echo detection by message id (audit T2-11). The text match above
+# lives in memory for 5 minutes, so after a restart Twin's own reply echoing
+# back was logged as "Udit replied" and paused the customer for 4h. Every
+# Instagram send now stores the message_id Meta returns in ig_sent_mids;
+# an echo whose mid is stored is Twin's own. The text match stays as the
+# fallback. Rows are pruned after a week.
+IG_SENT_MID_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _record_ig_sent_mid(resp) -> None:
+    """Store the message_id from a successful Instagram Send API response.
+    Best effort — never raises."""
+    try:
+        data = resp.json()
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    mid = data.get("message_id") or data.get("mid")
+    if not isinstance(mid, str) or not mid:
+        print("[INSTAGRAM] Send response had no message_id — echo falls back to the text match")
+        return
+    now = time.time()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO ig_sent_mids (mid, sent_at) VALUES (?, ?)", (mid, now)
+            )
+            conn.execute(
+                "DELETE FROM ig_sent_mids WHERE sent_at < ?",
+                (now - IG_SENT_MID_RETENTION_SECONDS,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[INSTAGRAM] Failed to store sent message id: {type(e).__name__}: {e}")
+
+
+def _is_ig_sent_mid(mid: str) -> bool:
+    """Is this echo's mid one Twin sent? Fails to False (text fallback)."""
+    if not mid:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM ig_sent_mids WHERE mid = ? LIMIT 1", (mid,)
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[INSTAGRAM] Sent message id lookup failed: {type(e).__name__}: {e}")
+        return False
+
+
 def _is_outbound_event(data: dict) -> bool:
     """Best-effort detection that a WATI webhook event is an OUTBOUND message
     (sent FROM the business TO a customer), not an inbound customer message.
@@ -1771,6 +1828,12 @@ def _init_db() -> None:
         # check) — restart-safe, so a redeploy doesn't re-run it early.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scheduled_jobs (job TEXT PRIMARY KEY, last_run REAL NOT NULL)"
+        )
+        # Message ids Meta returned for Twin's Instagram sends, so their
+        # echoes aren't mistaken for Udit's replies after a restart (audit
+        # T2-11). Pruned after a week by _record_ig_sent_mid.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ig_sent_mids (mid TEXT PRIMARY KEY, sent_at REAL NOT NULL)"
         )
 
         conn.commit()
@@ -2548,9 +2611,11 @@ def _send_instagram_message(sender_id: str, text: str) -> tuple[bool, str]:
             # HUMAN_UDIT_IG detection in _process_instagram_event. Without
             # this, every bot AUTO reply's echo would auto-pause the
             # customer for 4h and the IG flow would break. Mirrors the
-            # WATI _record_bot_outbound design (text-only here; IG echoes
-            # are matched by text, not msg id).
+            # WATI _record_bot_outbound design. The message_id Meta returns
+            # is stored too (audit T2-11), so the echo is still recognized
+            # after a restart; the text match is the fallback.
             _record_bot_outbound(text)
+            _record_ig_sent_mid(resp)
             return True, ""
         else:
             # On failure, surface diagnostic info about the token so
@@ -7770,19 +7835,25 @@ def _process_instagram_event(event: dict) -> None:
         #   (a) the bot's own Send API replies, AND
         #   (b) Udit's manual replies typed in the IG app / Business Suite.
         # Meta provides no structural field to tell (a) from (b), so we match
-        # the echoed text against recently-sent bot replies (registered in
-        # _send_instagram_reply via _record_bot_outbound).
+        # the echo's mid against the message ids Meta returned for our sends
+        # (ig_sent_mids — survives restarts, audit T2-11), then fall back to
+        # the echoed text against recently-sent bot replies (in memory,
+        # registered in _send_instagram_message via _record_bot_outbound).
         #
         # This MUST run BEFORE the generic is_echo drop below — otherwise
         # Udit's manual replies (which are also echoes) would be swallowed by
         # the is_echo return and HUMAN_UDIT_IG would never fire. That was the
         # ordering bug this block fixes.
         if INSTAGRAM_PAGE_ID and sender_id == INSTAGRAM_PAGE_ID:
+            # The bot's own reply echoing back — already handled on send.
+            # Skipping here is what KEEPS the IG AUTO flow working: without
+            # this match, every bot reply's echo would be tagged HUMAN_UDIT
+            # and auto-pause the customer for 4h.
+            if _is_ig_sent_mid(message.get("mid") or ""):
+                print(f"[ECHO-IG] Twin's own reply to {recipient_id} (matched by message id) — skipped")
+                return
             if _is_bot_outbound(text):
-                # The bot's own reply echoing back — already handled on send.
-                # Skipping here is what KEEPS the IG AUTO flow working: without
-                # this match, every bot reply's echo would be tagged
-                # HUMAN_UDIT and auto-pause the customer for 4h.
+                print(f"[ECHO-IG] Twin's own reply to {recipient_id} (matched by text) — skipped")
                 return
             # Not a recent bot send → Udit replied manually from the IG app.
             if not recipient_id:
