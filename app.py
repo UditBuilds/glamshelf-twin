@@ -5791,17 +5791,68 @@ def ask_claude(
     return cleaned
 
 
+def _secret_equals(provided, expected: str) -> bool:
+    """Constant-time comparison for APP_PASSWORD / DASHBOARD_KEY (audit
+    T2-1). Compared as bytes: hmac.compare_digest raises TypeError on
+    non-ASCII str input, which a client-supplied value can contain."""
+    if not isinstance(provided, str) or not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+# Login brute-force limit (audit T2-2): at most LOGIN_MAX_FAILURES wrong
+# passwords per IP per LOGIN_FAILURE_WINDOW_SECONDS, then 429 until the
+# oldest failure ages out — even for the right password. In memory: one
+# gunicorn worker, and a restart only resets the count.
+LOGIN_MAX_FAILURES = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+_login_failures: dict[str, list[float]] = {}
+_login_failures_lock = threading.Lock()
+
+
+def _login_client_ip() -> str:
+    """The client IP behind Render's proxy: the right-most X-Forwarded-For
+    entry (the one the proxy appended — earlier entries are client-supplied
+    and spoofable), else remote_addr."""
+    forwarded = [p.strip() for p in (request.headers.get("X-Forwarded-For") or "").split(",") if p.strip()]
+    return forwarded[-1] if forwarded else (request.remote_addr or "unknown")
+
+
+def _login_recent_failures(ip: str, now: float) -> list[float]:
+    """Failures for this IP inside the window; prunes expired ones. Call
+    with _login_failures_lock held."""
+    cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+    for key in list(_login_failures):
+        kept = [t for t in _login_failures[key] if t > cutoff]
+        if kept:
+            _login_failures[key] = kept
+        else:
+            del _login_failures[key]
+    return _login_failures.get(ip, [])
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     if request.method == "POST":
+        ip = _login_client_ip()
+        now = time.time()
+        with _login_failures_lock:
+            if len(_login_recent_failures(ip, now)) >= LOGIN_MAX_FAILURES:
+                print(f"[AUTH] Login blocked for {ip} — {LOGIN_MAX_FAILURES} failed attempts in 15 min")
+                return render_template(
+                    "login.html",
+                    error="Too many failed attempts. Please try again in 15 minutes.",
+                ), 429
         password = (request.form.get("password") or "").strip()
-        if password == APP_PASSWORD:
+        if _secret_equals(password, APP_PASSWORD):
             session["authed"] = True
             session.permanent = True
             print("[AUTH] Login successful")
             return redirect(url_for("home"))
-        print("[AUTH] Login failed (wrong password)")
+        with _login_failures_lock:
+            _login_failures.setdefault(ip, []).append(now)
+        print(f"[AUTH] Login failed (wrong password) from {ip}")
         error = "Incorrect password. Please try again."
     return render_template("login.html", error=error)
 
@@ -5838,12 +5889,14 @@ def _dashboard_key_header_ok() -> bool:
     logs, browser history and Referer headers. Compared as bytes:
     hmac.compare_digest raises TypeError on non-ASCII str input, which a
     client-supplied header can contain."""
-    provided = request.headers.get("X-Dashboard-Key") or ""
-    if not provided:
-        return False
-    return hmac.compare_digest(
-        provided.encode("utf-8"), DASHBOARD_KEY.encode("utf-8")
-    )
+    return _secret_equals(request.headers.get("X-Dashboard-Key") or "", DASHBOARD_KEY)
+
+
+def _dashboard_key_param_ok() -> bool:
+    """True iff the ?key= URL param matches DASHBOARD_KEY, compared in
+    constant time (audit T2-1). The dashboard still passes the key this
+    way, so the param stays."""
+    return _secret_equals(request.args.get("key") or "", DASHBOARD_KEY)
 
 
 @app.route("/healthz")
@@ -5923,7 +5976,7 @@ def inventory_debug():
             "shopify_products_url": "<string>"
         }
     """
-    if request.args.get("key") != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return jsonify({"error": "unauthorized"}), 401
     block = get_live_inventory()
     return jsonify({
@@ -5963,7 +6016,7 @@ def review_debug():
             "review_delay_seconds": REVIEW_DELAY_SECONDS
         }
     """
-    if request.args.get("key") != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return jsonify({"error": "unauthorized"}), 401
 
     now = time.time()
@@ -6005,8 +6058,7 @@ def dashboard():
     """Serve the static control-panel HTML, gated by the same DASHBOARD_KEY
     query parameter as /dashboard-data. Pure HTML — the page itself fetches
     /dashboard-data?key=... from JS and renders the JSON client-side."""
-    key = request.args.get("key", "")
-    if key != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return "Unauthorized", 401
     return render_template("glamshelf-twin-control-panel.html")
 
@@ -8156,7 +8208,7 @@ def dashboard_data():
       error_log      — last 20 ERROR / ESCALATE / slow (>5s) rows
       bulk_spike     — distinct senders in last 30min, is_spike flag if >=5
     """
-    if request.args.get("key") != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return jsonify({"error": "unauthorized"}), 401
 
     try:
