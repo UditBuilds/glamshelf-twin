@@ -3,8 +3,10 @@
   - APP_PASSWORD and DASHBOARD_KEY are compared with hmac.compare_digest
     (via _secret_equals), non-ASCII input included.
   - /login: at most 5 failed attempts per IP per 15 minutes, then 429 —
-    even for the right password. The IP is the right-most X-Forwarded-For
-    entry (Render's proxy), so a spoofed left-most entry doesn't help.
+    even for the right password. The IP comes from _client_ip (PR F):
+    CF-Connecting-IP, True-Client-IP, the first X-Forwarded-For entry,
+    then remote_addr, skipping malformed values. (The right-most
+    X-Forwarded-For entry was a Cloudflare edge shared by many visitors.)
   - The dashboard key still travels as ?key= (the dashboard depends on it).
 
 No live API call: Flask's test client only.
@@ -59,10 +61,19 @@ class LoginLimitTest(unittest.TestCase):
             self.login("wrong", ip="203.0.113.7")
         self.assertEqual(self.login(PASSWORD, ip="198.51.100.9").status_code, 302)
 
-    def test_spoofed_left_most_forwarded_entry_is_ignored(self):
-        for i in range(5):
-            self.login("wrong", ip=f"10.0.0.{i}, 203.0.113.7")
-        self.assertEqual(self.login(PASSWORD, ip="10.9.9.9, 203.0.113.7").status_code, 429)
+    def test_visitors_behind_one_cloudflare_edge_have_separate_limits(self):
+        # The live finding: every visitor arrived via the same edge address.
+        edge = "172.68.174.232"
+        for _ in range(5):
+            self.login("wrong", ip=f"203.0.113.7, {edge}")
+        self.assertEqual(self.login(PASSWORD, ip=f"203.0.113.7, {edge}").status_code, 429)
+        self.assertEqual(self.login(PASSWORD, ip=f"198.51.100.9, {edge}").status_code, 302)
+
+    def test_failed_login_log_names_the_ip_and_its_source(self):
+        with redirect_stdout(io.StringIO()) as buf:
+            self.client.post("/login", data={"password": "wrong"},
+                             headers={"CF-Connecting-IP": "1.2.3.4"})
+        self.assertIn("[AUTH] Login failed from 1.2.3.4 (via CF-Connecting-IP)", buf.getvalue())
 
     def test_failures_expire_after_15_minutes(self):
         for _ in range(5):
@@ -73,6 +84,51 @@ class LoginLimitTest(unittest.TestCase):
 
     def test_non_ascii_password_is_a_plain_failure(self):
         self.assertEqual(self.login("pässwörd").status_code, 200)
+
+
+class ClientIpTest(unittest.TestCase):
+    """_client_ip: header order, validation and the remote_addr fallback."""
+
+    def ip(self, headers=None, remote="192.0.2.50"):
+        with glam.app.test_request_context(
+            "/login", headers=headers or {}, environ_base={"REMOTE_ADDR": remote}
+        ):
+            return glam._client_ip()
+
+    def test_cf_connecting_ip_wins_over_forwarded_for(self):
+        self.assertEqual(
+            self.ip({"CF-Connecting-IP": "1.2.3.4", "True-Client-IP": "5.6.7.8",
+                     "X-Forwarded-For": "9.9.9.9, 172.68.174.232"}),
+            ("1.2.3.4", "CF-Connecting-IP"),
+        )
+
+    def test_true_client_ip_is_second(self):
+        self.assertEqual(
+            self.ip({"True-Client-IP": "5.6.7.8", "X-Forwarded-For": "9.9.9.9"}),
+            ("5.6.7.8", "True-Client-IP"),
+        )
+
+    def test_forwarded_for_first_hop_without_cf_header(self):
+        self.assertEqual(
+            self.ip({"X-Forwarded-For": " 9.9.9.9 , 172.68.174.232"}),
+            ("9.9.9.9", "X-Forwarded-For"),
+        )
+
+    def test_ipv6_is_accepted(self):
+        self.assertEqual(self.ip({"CF-Connecting-IP": "2001:db8::1"}),
+                         ("2001:db8::1", "CF-Connecting-IP"))
+
+    def test_malformed_headers_are_skipped(self):
+        self.assertEqual(
+            self.ip({"CF-Connecting-IP": "not-an-ip", "True-Client-IP": "999.1.1.1",
+                     "X-Forwarded-For": "9.9.9.9"}),
+            ("9.9.9.9", "X-Forwarded-For"),
+        )
+
+    def test_falls_back_to_remote_addr(self):
+        self.assertEqual(self.ip(), ("192.0.2.50", "remote_addr"))
+        self.assertEqual(self.ip({"X-Forwarded-For": "garbage, 9.9.9.9"}),
+                         ("192.0.2.50", "remote_addr"))
 
 
 class SecretCompareTest(unittest.TestCase):

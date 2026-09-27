@@ -14,6 +14,7 @@ Auth: DEEPSEEK_API_KEY (text replies) + ANTHROPIC_API_KEY (vision/image extracti
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -5810,12 +5811,33 @@ _login_failures: dict[str, list[float]] = {}
 _login_failures_lock = threading.Lock()
 
 
-def _login_client_ip() -> str:
-    """The client IP behind Render's proxy: the right-most X-Forwarded-For
-    entry (the one the proxy appended — earlier entries are client-supplied
-    and spoofable), else remote_addr."""
-    forwarded = [p.strip() for p in (request.headers.get("X-Forwarded-For") or "").split(",") if p.strip()]
-    return forwarded[-1] if forwarded else (request.remote_addr or "unknown")
+def _valid_ip(value) -> str:
+    """The value as a normalized IP address, or "" when it isn't one."""
+    try:
+        return str(ipaddress.ip_address((value or "").strip()))
+    except ValueError:
+        return ""
+
+
+def _client_ip() -> tuple[str, str]:
+    """(ip, source) for the real client behind Cloudflare and Render's proxy.
+    Tried in order: CF-Connecting-IP, True-Client-IP, the first
+    X-Forwarded-For entry, then remote_addr; a malformed value is skipped.
+    (The old right-most X-Forwarded-For entry turned out to be a Cloudflare
+    edge address, shared by everyone behind that edge.)
+
+    These headers can be spoofed by a client that reaches the app directly,
+    so the result is ONLY for rate limiting and logging — never use it to
+    allow access."""
+    for header in ("CF-Connecting-IP", "True-Client-IP"):
+        ip = _valid_ip(request.headers.get(header))
+        if ip:
+            return ip, header
+    first_hop = (request.headers.get("X-Forwarded-For") or "").split(",")[0]
+    ip = _valid_ip(first_hop)
+    if ip:
+        return ip, "X-Forwarded-For"
+    return _valid_ip(request.remote_addr) or "unknown", "remote_addr"
 
 
 def _login_recent_failures(ip: str, now: float) -> list[float]:
@@ -5835,11 +5857,11 @@ def _login_recent_failures(ip: str, now: float) -> list[float]:
 def login():
     error = None
     if request.method == "POST":
-        ip = _login_client_ip()
+        ip, ip_source = _client_ip()
         now = time.time()
         with _login_failures_lock:
             if len(_login_recent_failures(ip, now)) >= LOGIN_MAX_FAILURES:
-                print(f"[AUTH] Login blocked for {ip} — {LOGIN_MAX_FAILURES} failed attempts in 15 min")
+                print(f"[AUTH] Login blocked for {ip} (via {ip_source}) — {LOGIN_MAX_FAILURES} failed attempts in 15 min")
                 return render_template(
                     "login.html",
                     error="Too many failed attempts. Please try again in 15 minutes.",
@@ -5852,7 +5874,7 @@ def login():
             return redirect(url_for("home"))
         with _login_failures_lock:
             _login_failures.setdefault(ip, []).append(now)
-        print(f"[AUTH] Login failed (wrong password) from {ip}")
+        print(f"[AUTH] Login failed from {ip} (via {ip_source})")
         error = "Incorrect password. Please try again."
     return render_template("login.html", error=error)
 
