@@ -117,6 +117,40 @@ class ApprovedExceptionsTest(unittest.TestCase):
         self.assertEqual(check("GS1 is ₹849.00 🤍"), [])
 
 
+class OrderTotalsTest(unittest.TestCase):
+    """PR E item 1: a sum of up to 6 live prices passes when it's ≤ ₹1,500."""
+
+    def test_valid_totals_up_to_1500_pass(self):
+        for text in ("2 Clean Girl pairs come to ₹498 🤍",       # 2 × 249
+                     "GS1 + Kawaii is ₹1,148 in total 🤍",       # 849 + 299
+                     "Two Mink Trios come to ₹1,398 🤍",         # 2 × 699
+                     "That's Rs. 1398.00 for both 🤍"):
+            with self.subTest(text=text):
+                self.assertEqual(check(text), [])
+
+    def test_totals_above_1500_stay_held(self):
+        reasons = " ".join(check("2 GS1 trays come to ₹1,698 🤍"))   # 2 × 849
+        self.assertIn("rule 1", reasons)
+        self.assertIn("₹1,698", reasons)
+
+    def test_amount_that_is_not_a_sum_is_held(self):
+        reasons = " ".join(check("Your total is ₹1,234 🤍"))
+        self.assertIn("rule 1", reasons)
+        self.assertIn("₹1,234", reasons)
+
+    def test_more_than_six_items_is_held(self):
+        # 7 × 199 would be ≤ ₹1,500, but only 6 items may be summed.
+        self.assertIn("rule 1", " ".join(output_guard.check_reply("₹1,393", {199.0})))
+        self.assertEqual(output_guard.check_reply("₹1,194", {199.0}), [])   # 6 × 199
+
+    def test_fixed_amounts_are_not_summed(self):
+        # ₹100 = 2 × ₹50 (a fixed brain.md amount), not a product sum.
+        self.assertIn("rule 1", " ".join(check("Only ₹100 extra")))
+
+    def test_no_live_prices_means_no_totals(self):
+        self.assertIn("rule 1", " ".join(output_guard.check_reply("₹498", set())))
+
+
 class StillFiresTest(unittest.TestCase):
     def assertFires(self, text, rule):
         reasons = " ".join(check(text))
