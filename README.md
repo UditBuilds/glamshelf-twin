@@ -1,6 +1,8 @@
 # Glam Shelf Twin
 
-AI customer support agent for **The Glam Shelf**, a live Indian D2C false-eyelash brand. It handles real customer conversations on WhatsApp and Instagram — replies autonomously where it can, flags the founder when it can't, and learns from every product SKU to stay accurate.
+AI customer support agent for **The Glam Shelf**, a live Indian D2C false-eyelash brand. It handles real customer conversations on Instagram — replies automatically where it can and flags the founder when it can't, answering from per-SKU product data.
+
+**Channel status:** Instagram is live. The WhatsApp channel (via WATI) is built but **currently paused**.
 
 ---
 
@@ -10,9 +12,9 @@ Every incoming message on WhatsApp or Instagram is classified into one of three 
 
 **AUTO** — Routine questions the twin can answer confidently: pricing, shipping timelines, product recommendations, return policies, payment methods. The reply goes out immediately. No founder involvement.
 
-**DRAFT+APPROVE** — The twin drafts a reply but isn't confident enough to send alone. The founder gets it on Telegram with one-tap buttons: ✅ Send, ✏️ Edit, or ⛔ Skip. The customer waits; nothing ships until the founder acts.
+**DRAFT+APPROVE** — The twin drafts a reply but isn't confident enough to send alone. The founder gets it on Telegram with one-tap buttons: ✅ Send, ✏️ Edit, or ⛔ Skip. The draft itself goes out only when the founder acts; meanwhile, on Instagram, the customer gets a short handoff line ("I've passed this to the team — they'll reply to you here 🤍").
 
-**ESCALATE** — Situations that need human judgment: refund disputes, damage claims, angry customers, legal threats, bulk negotiations. The founder is paged on Telegram and the twin pauses itself for that customer for 4 hours (lift it early from Telegram with ▶️ Resume bot or `#resume <id>`). On Instagram the customer gets a standard holding line — or, for an allergic reaction, advice to stop using the product and see a doctor — except legal threats and press enquiries, which get no automated reply. On WhatsApp a normal escalation sends nothing; a stock holding reply goes out only when the model's output was unusable.
+**ESCALATE** — Situations that need human judgment: refund disputes, damage claims, angry customers, legal threats, bulk negotiations. The founder is paged on Telegram and the twin pauses itself for that customer for 4 hours (lift it early from Telegram with ▶️ Resume bot or `#resume <id>`). On Instagram the customer gets the same handoff line — or, for an allergic reaction, advice to stop using the product and see a doctor — except legal threats and press enquiries, which get no automated reply. On WhatsApp a normal escalation sends nothing; a stock holding reply goes out only when the model's output was unusable.
 
 People testing the assistant, or asking about it, get a friendly one-liner and the founder a LEAD notice on Telegram — no pause.
 
@@ -22,7 +24,15 @@ People testing the assistant, or asking about it, get a friendly one-liner and t
 
 The twin uses a **RAG retrieval layer** built on `fastembed` with ONNX embeddings. Behind every reply, it searches a per-SKU product knowledge base — materials, band types, lash lengths, care instructions — and injects relevant facts into the prompt before generating a response. This means the twin doesn't guess about product details. If a customer asks "are GS1 lashes suitable for hooded eyes?", it retrieves the actual GS1 specs and answers from real data, not training memory.
 
-Live Shopify inventory is also injected per call, so stock counts and pricing are always current.
+Prices and stock come from the live Shopify storefront feed (cached for up to 5 minutes) and are injected into every call — they are not hard-coded in the prompt.
+
+---
+
+## Safety rails
+
+- **Output guard** — before an Instagram AUTO reply is sent, a plain-Python check holds it for founder approval (the customer gets the handoff line) if it mentions a ₹ amount that isn't a current Shopify price, a fixed policy amount, or an order total of up to ₹1,500 built from those prices; offers a code, discount, refund or freebie; links anywhere other than the brand's own site and Instagram; or talks about its own instructions.
+- **Rate limits** — at most 8 messages per sender per 10 minutes and 40 per day reach the model, plus a daily cap on model calls overall. Over a limit, the sender gets one short notice and the founder a Telegram alert.
+- **Fixed escalation words** — legal threats (lawyer, court, consumer forum, legal notice, police, FIR, and Hinglish forms such as "case kar dunga") always escalate, whatever the model decides.
 
 ---
 
@@ -33,8 +43,8 @@ Live Shopify inventory is also injected per call, so stock counts and pricing ar
 | App | Python (Flask + gunicorn) |
 | Hosting | Render |
 | Text replies | DeepSeek v3 |
-| Image understanding | Claude Sonnet on WhatsApp (reads order screenshots, eye photos). On Instagram Twin can't view photos yet: it asks the customer to describe what they need and alerts the founder |
-| WhatsApp | WATI Business API |
+| Image understanding | Claude Sonnet on WhatsApp (reads order screenshots, eye photos). On Instagram Twin can't read photos yet: it asks for the customer's eye shape or the occasion instead and alerts the founder |
+| WhatsApp | WATI Business API (channel currently paused) |
 | Instagram | Meta Instagram Graph API |
 | Founder UI | Telegram Bot (inline buttons) |
 | Commerce | Shopify webhooks + live storefront feed |
@@ -45,7 +55,7 @@ Live Shopify inventory is also injected per call, so stock counts and pricing ar
 
 ## In production
 
-The twin handles real customer traffic daily. It's not a demo or a prototype — it's the actual support layer behind a live D2C store. The founder reviews a small fraction of replies via Telegram; the rest go out autonomously with product facts, inventory context, and conversation history injected into every response.
+The twin answers real customers of a live D2C store on Instagram. Drafts, output-guard holds and escalations go to the founder on Telegram; the other replies go out automatically, with product facts, live Shopify prices and stock, and the conversation history injected into every call.
 
 ---
 

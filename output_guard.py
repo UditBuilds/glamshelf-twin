@@ -7,14 +7,18 @@ founder sees exactly what the model wrote.
 
 Rules (each returns a short reason naming the rule and what matched):
   1. A ₹ / Rs / INR amount that isn't allowed. The caller passes the live
-     Shopify prices; FIXED_ALLOWED_INR adds brain.md's fixed amounts.
+     Shopify prices; FIXED_ALLOWED_INR adds brain.md's fixed amounts. An
+     order total also passes when it is a sum of up to MAX_ORDER_ITEMS
+     live prices (repeats allowed) and at most ₹1,500 (the Hard Money
+     Threshold) — larger totals still go to a draft.
   2. code, coupon, promo, discount, refund, cashback or "free" — except
      the approved phrases in _APPROVED_PHRASES ("free shipping",
      "shipping is free", "cruelty-free", the discount decline).
   3. A link, domain, email or @handle other than glamshelf.in,
      instagram.com/glamshelfstore, @glamshelfstore and the brand email.
-  4. Talk of the system prompt, instructions, the brain, QA mode or
-     classifying.
+  4. Prompt-injection phrasing: "system prompt", "my/your instructions",
+     "ignore previous", QA mode or classifying. Plain "instructions"
+     ("care instructions") and "brain" in product text pass.
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -37,6 +41,10 @@ FIXED_ALLOWED_INR = frozenset({
     12, 17,                         # ~₹12–17 per wear
     50,                             # "cheap ₹50 white glues" (lash glue)
 })
+
+# Rule 1 order totals: "2 GS1 trays" style sums of live prices, up to this
+# many items and no higher than the Hard Money Threshold.
+MAX_ORDER_ITEMS = 6
 
 BRAND_EMAIL = "glamshelfstore@gmail.com"
 BRAND_HANDLE = "glamshelfstore"
@@ -67,7 +75,8 @@ _BARE_DOMAIN_RE = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[a-z]{2,24}\b(?:/[^\s<>\"')
 
 # Rule 4.
 _META_RE = re.compile(
-    r"system[- ]?prompt|\binstructions?\b|\bbrain\b|\bqa[- ]?mode\b|\bclassif(?:y|ied|ies|ying|ication)\b",
+    r"system[- ]?prompt|\b(?:my|your) instructions?\b|\bignore (?:all |any |the )?previous\b"
+    r"|\bqa[- ]?mode\b|\bclassif(?:y|ied|ies|ying|ication)\b",
     re.IGNORECASE,
 )
 
@@ -77,6 +86,23 @@ def _amount_value(digits: str, fraction: str | None) -> float:
     if fraction:
         value += float(fraction)
     return value
+
+
+def _order_totals_paise(prices) -> set[int]:
+    """Every sum of 1..MAX_ORDER_ITEMS live prices (repeats allowed) that is
+    at most HARD_MONEY_THRESHOLD_INR, in paise so floats compare exactly.
+    Built from the live prices only — never FIXED_ALLOWED_INR."""
+    cap = HARD_MONEY_THRESHOLD_INR * 100
+    units = {round(float(p) * 100) for p in prices or ()}
+    units = {u for u in units if 0 < u <= cap}
+    totals: set[int] = set()
+    layer = {0}
+    for _ in range(MAX_ORDER_ITEMS):
+        layer = {t + u for t in layer for u in units if t + u <= cap}
+        if not layer:
+            break
+        totals |= layer
+    return totals
 
 
 def _link_allowed(link: str) -> bool:
@@ -96,13 +122,18 @@ def _link_allowed(link: str) -> bool:
 def check_reply(text: str, allowed_amounts) -> list[str]:
     """Return one reason per rule that fired ([] = the reply may be sent).
     `allowed_amounts` are the live product prices; FIXED_ALLOWED_INR is
-    always added."""
+    always added, and so are order totals up to ₹1,500 built from the live
+    prices (_order_totals_paise)."""
     text = text or ""
     allowed = set(FIXED_ALLOWED_INR) | {float(a) for a in allowed_amounts or ()}
+    totals = _order_totals_paise(allowed_amounts)
     reasons: list[str] = []
 
+    def amount_ok(value: float) -> bool:
+        return value in allowed or round(value * 100) in totals
+
     bad = [m.group(0) for m in _AMOUNT_RE.finditer(text)
-           if _amount_value(m.group(1), m.group(2)) not in allowed]
+           if not amount_ok(_amount_value(m.group(1), m.group(2)))]
     if bad:
         reasons.append(f"rule 1 (₹ amount not allowed): {', '.join(bad)}")
 

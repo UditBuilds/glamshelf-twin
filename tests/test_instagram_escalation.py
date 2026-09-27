@@ -81,6 +81,33 @@ class EscalationReplyTable(unittest.TestCase):
         self.assertIn(glam.ALLERGY_HOLDING_REPLY, brain)
 
 
+class LegalKeywordBackstop(unittest.TestCase):
+    """English + Hinglish legal words (audit T2-17, PR E item 4): each one
+    escalates via the prefilter and stays silent like the existing ones."""
+
+    def setUp(self):
+        os.environ.pop("ESCALATION_PREFILTER_DISABLED", None)
+
+    def test_legal_words_escalate_as_legal(self):
+        for msg in ("court me jaaunga", "Court me jaunga main", "see you in court",
+                    "consumer court me case karungi", "I'll go to the consumer forum",
+                    "FIR karwa dungi", "police complaint karungi", "legal notice bhejungi",
+                    "my lawyer will call you", "vakeel se baat karungi",
+                    "case karunga tum pe", "case kar dunga"):
+            with self.subTest(msg=msg):
+                self.assertIsNotNone(glam._escalation_prefilter_hit(msg))
+                self.assertEqual(glam._ig_escalation_reply(msg, ""), ("legal", ""))
+
+    def test_look_alikes_do_not_escalate(self):
+        for msg in ("courtesy", "Thanks for the courtesy call", "FIRst order!",
+                    "fir se order karna hai", "Fir kab aayega?",
+                    "court marriage ke liye lashes chahiye", "Court wedding next week",
+                    "what's your return policy?"):
+            with self.subTest(msg=msg):
+                self.assertIsNone(glam._escalation_prefilter_hit(msg))
+                self.assertEqual(glam._ig_escalation_reply(msg, "")[0], "other")
+
+
 class LeadDecision(unittest.TestCase):
     def test_lead_tag(self):
         self.assertTrue(glam._ig_is_lead("Udit asked me to test this", "AUTO", "hi", "LEAD"))

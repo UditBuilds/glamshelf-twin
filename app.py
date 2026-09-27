@@ -1180,6 +1180,63 @@ def _is_bot_outbound(text_body: str) -> bool:
     return True
 
 
+# Instagram echo detection by message id (audit T2-11). The text match above
+# lives in memory for 5 minutes, so after a restart Twin's own reply echoing
+# back was logged as "Udit replied" and paused the customer for 4h. Every
+# Instagram send now stores the message_id Meta returns in ig_sent_mids;
+# an echo whose mid is stored is Twin's own. The text match stays as the
+# fallback. Rows are pruned after a week.
+IG_SENT_MID_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _record_ig_sent_mid(resp) -> None:
+    """Store the message_id from a successful Instagram Send API response.
+    Best effort — never raises."""
+    try:
+        data = resp.json()
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    mid = data.get("message_id") or data.get("mid")
+    if not isinstance(mid, str) or not mid:
+        print("[INSTAGRAM] Send response had no message_id — echo falls back to the text match")
+        return
+    now = time.time()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO ig_sent_mids (mid, sent_at) VALUES (?, ?)", (mid, now)
+            )
+            conn.execute(
+                "DELETE FROM ig_sent_mids WHERE sent_at < ?",
+                (now - IG_SENT_MID_RETENTION_SECONDS,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[INSTAGRAM] Failed to store sent message id: {type(e).__name__}: {e}")
+
+
+def _is_ig_sent_mid(mid: str) -> bool:
+    """Is this echo's mid one Twin sent? Fails to False (text fallback)."""
+    if not mid:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM ig_sent_mids WHERE mid = ? LIMIT 1", (mid,)
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[INSTAGRAM] Sent message id lookup failed: {type(e).__name__}: {e}")
+        return False
+
+
 def _is_outbound_event(data: dict) -> bool:
     """Best-effort detection that a WATI webhook event is an OUTBOUND message
     (sent FROM the business TO a customer), not an inbound customer message.
@@ -1772,6 +1829,12 @@ def _init_db() -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scheduled_jobs (job TEXT PRIMARY KEY, last_run REAL NOT NULL)"
         )
+        # Message ids Meta returned for Twin's Instagram sends, so their
+        # echoes aren't mistaken for Udit's replies after a restart (audit
+        # T2-11). Pruned after a week by _record_ig_sent_mid.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ig_sent_mids (mid TEXT PRIMARY KEY, sent_at REAL NOT NULL)"
+        )
 
         conn.commit()
         conn.close()
@@ -2351,6 +2414,26 @@ SEND_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
 _send_failure_last_alert: dict[str, float] = {}
 
 
+# Secrets in error strings (audit T2-8). A requests connection error names
+# the URL it was fetching: the Instagram token rides in ?access_token=, the
+# Telegram bot token in the /bot<token>/ path segment (printed without the
+# host, e.g. "url: /bot123:ABC/sendMessage"). _redact_secrets masks both
+# before an error reaches the logs or a Telegram alert.
+_ACCESS_TOKEN_RE = re.compile(r"(access_token=)[^&\s'\"<>)]+", re.IGNORECASE)
+_TELEGRAM_BOT_TOKEN_RE = re.compile(r"(/bot)\d+:[A-Za-z0-9_-]+")
+
+
+def _redact_secrets(text) -> str:
+    """The text with access_token values and Telegram bot tokens masked."""
+    text = str(text)
+    text = _ACCESS_TOKEN_RE.sub(r"\1<redacted>", text)
+    text = _TELEGRAM_BOT_TOKEN_RE.sub(r"\1<redacted>", text)
+    for secret in (INSTAGRAM_PAGE_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN):
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "<redacted>")
+    return text
+
+
 def _alert_send_failure(
     channel: str,
     error: str,
@@ -2372,6 +2455,7 @@ def _alert_send_failure(
     Never raises — alerting is a side effect and must not break the
     webhook 200 response, same contract as every other Telegram call.
     """
+    error = _redact_secrets(error)
     key = f"{channel}|{error[:120]}" if kind == "send" else f"{kind}|{channel}|{error[:120]}"
     now = time.time()
     if now - _send_failure_last_alert.get(key, 0.0) < SEND_FAILURE_ALERT_COOLDOWN_SECONDS:
@@ -2548,9 +2632,11 @@ def _send_instagram_message(sender_id: str, text: str) -> tuple[bool, str]:
             # HUMAN_UDIT_IG detection in _process_instagram_event. Without
             # this, every bot AUTO reply's echo would auto-pause the
             # customer for 4h and the IG flow would break. Mirrors the
-            # WATI _record_bot_outbound design (text-only here; IG echoes
-            # are matched by text, not msg id).
+            # WATI _record_bot_outbound design. The message_id Meta returns
+            # is stored too (audit T2-11), so the echo is still recognized
+            # after a restart; the text match is the fallback.
             _record_bot_outbound(text)
+            _record_ig_sent_mid(resp)
             return True, ""
         else:
             # On failure, surface diagnostic info about the token so
@@ -2576,12 +2662,12 @@ def _send_instagram_message(sender_id: str, text: str) -> tuple[bool, str]:
             _alert_send_failure("Instagram", error, sender_id)
             return False, error
     except requests.RequestException as e:
-        print(f"[INSTAGRAM] Network error: {type(e).__name__}: {e}")
+        print(f"[INSTAGRAM] Network error: {type(e).__name__}: {_redact_secrets(e)}")
         error = f"Network error: {type(e).__name__}"
         _alert_send_failure("Instagram", error, sender_id)
         return False, error
     except Exception as e:
-        print(f"[INSTAGRAM] Unexpected error: {type(e).__name__}: {e}")
+        print(f"[INSTAGRAM] Unexpected error: {type(e).__name__}: {_redact_secrets(e)}")
         error = f"Unexpected error: {type(e).__name__}"
         _alert_send_failure("Instagram", error, sender_id)
         return False, error
@@ -3108,10 +3194,10 @@ def send_telegram_notification(
                 f"{response.text[:300]}"
             )
     except requests.RequestException as e:
-        print(f"[TG] Network error: {type(e).__name__}: {e}")
+        print(f"[TG] Network error: {type(e).__name__}: {_redact_secrets(e)}")
     except Exception as e:
         # Defensive — never let a Telegram bug break the API call.
-        print(f"[TG] Unexpected error: {type(e).__name__}: {e}")
+        print(f"[TG] Unexpected error: {type(e).__name__}: {_redact_secrets(e)}")
 
 
 # ===== Telegram inline-button DRAFT approval flow =====
@@ -3129,6 +3215,9 @@ def _telegram_api(method: str, payload: dict) -> dict | None:
         print(f"[TELEGRAM DRAFT] {method} skipped: TELEGRAM_BOT_TOKEN not set")
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    if isinstance(payload.get("text"), str):
+        # Every alert goes out through here — never with a token in it.
+        payload = {**payload, "text": _redact_secrets(payload["text"])}
     try:
         resp = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
         if not resp.ok:
@@ -3136,10 +3225,10 @@ def _telegram_api(method: str, payload: dict) -> dict | None:
             return None
         return resp.json()
     except requests.RequestException as e:
-        print(f"[TELEGRAM DRAFT] {method} network error: {type(e).__name__}: {e}")
+        print(f"[TELEGRAM DRAFT] {method} network error: {type(e).__name__}: {_redact_secrets(e)}")
         return None
     except Exception as e:
-        print(f"[TELEGRAM DRAFT] {method} unexpected error: {type(e).__name__}: {e}")
+        print(f"[TELEGRAM DRAFT] {method} unexpected error: {type(e).__name__}: {_redact_secrets(e)}")
         return None
 
 
@@ -4945,11 +5034,23 @@ get_live_policies()
 #
 # Word boundaries matter: \bpolice\b must not fire on "policy" — a return
 # policy question is one of the most common AUTO messages the twin sees.
+# Same for the English + Hinglish legal backstop (audit T2-17, PR E):
+# "court" must not fire on "courtesy", nor on "court marriage" (a bridal
+# customer, founder decision); FIR matches upper-case only, since "fir"
+# is everyday Hinglish for "then / again" ("fir se order karna hai").
 _ESCALATION_PREFILTER_PATTERNS = re.compile(
     r"\b("
     r"lawyer"
+    r"|vakeel"
     r"|consumer\s+court"
+    r"|consumer\s+forum"
+    r"|court\s+me\s+jaa?unga"
+    r"|court(?!\s+(?:marriage|wedding|shaadi)\b)"
     r"|legal\s+notice"
+    r"|(?-i:FIR)"
+    r"|case\s+karunga"
+    r"|case\s+kar\s+dunga"
+    r"|police\s+complaint"
     r"|police"
     r"|refund\s+karo"        # imperative refund demand (Hinglish). Variants pending Udit's confirmed list — do not add unconfirmed spellings.
     r"|post\s+(?:this\s+|it\s+)?on\s+social\s+media"
@@ -5029,8 +5130,11 @@ TWIN_TAGS = ("LEAD", "SAFETY", "LEGAL", "PRESS", "ORDER", "RESTOCK")
 
 # Which prefilter phrases are legal threats — the escalations that stay
 # SILENT on Instagram. Social-media threats and "refund karo" still get
-# the holding line.
-_LEGAL_PREFILTER_PHRASES = ("lawyer", "consumer court", "legal notice", "police")
+# the holding line. Matched against the prefilter's normalized match text.
+_LEGAL_PREFILTER_PHRASES = re.compile(
+    r"lawyer|vakeel|consumer court|consumer forum|court me jaa?unga|court|legal notice"
+    r"|fir|case karunga|case kar dunga|police complaint|police"
+)
 
 # Deterministic backstops for a missing tag. Consulted only for a message
 # that is ALREADY escalating, so they can never cause an escalation. They
@@ -5098,7 +5202,7 @@ def _legal_threat_hit(message: str) -> bool:
     if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
         return False
     return any(
-        " ".join(m.group(0).lower().split()) in _LEGAL_PREFILTER_PHRASES
+        _LEGAL_PREFILTER_PHRASES.fullmatch(" ".join(m.group(0).lower().split()))
         for m in _ESCALATION_PREFILTER_PATTERNS.finditer(message or "")
     )
 
@@ -5687,17 +5791,68 @@ def ask_claude(
     return cleaned
 
 
+def _secret_equals(provided, expected: str) -> bool:
+    """Constant-time comparison for APP_PASSWORD / DASHBOARD_KEY (audit
+    T2-1). Compared as bytes: hmac.compare_digest raises TypeError on
+    non-ASCII str input, which a client-supplied value can contain."""
+    if not isinstance(provided, str) or not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+# Login brute-force limit (audit T2-2): at most LOGIN_MAX_FAILURES wrong
+# passwords per IP per LOGIN_FAILURE_WINDOW_SECONDS, then 429 until the
+# oldest failure ages out — even for the right password. In memory: one
+# gunicorn worker, and a restart only resets the count.
+LOGIN_MAX_FAILURES = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+_login_failures: dict[str, list[float]] = {}
+_login_failures_lock = threading.Lock()
+
+
+def _login_client_ip() -> str:
+    """The client IP behind Render's proxy: the right-most X-Forwarded-For
+    entry (the one the proxy appended — earlier entries are client-supplied
+    and spoofable), else remote_addr."""
+    forwarded = [p.strip() for p in (request.headers.get("X-Forwarded-For") or "").split(",") if p.strip()]
+    return forwarded[-1] if forwarded else (request.remote_addr or "unknown")
+
+
+def _login_recent_failures(ip: str, now: float) -> list[float]:
+    """Failures for this IP inside the window; prunes expired ones. Call
+    with _login_failures_lock held."""
+    cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+    for key in list(_login_failures):
+        kept = [t for t in _login_failures[key] if t > cutoff]
+        if kept:
+            _login_failures[key] = kept
+        else:
+            del _login_failures[key]
+    return _login_failures.get(ip, [])
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     if request.method == "POST":
+        ip = _login_client_ip()
+        now = time.time()
+        with _login_failures_lock:
+            if len(_login_recent_failures(ip, now)) >= LOGIN_MAX_FAILURES:
+                print(f"[AUTH] Login blocked for {ip} — {LOGIN_MAX_FAILURES} failed attempts in 15 min")
+                return render_template(
+                    "login.html",
+                    error="Too many failed attempts. Please try again in 15 minutes.",
+                ), 429
         password = (request.form.get("password") or "").strip()
-        if password == APP_PASSWORD:
+        if _secret_equals(password, APP_PASSWORD):
             session["authed"] = True
             session.permanent = True
             print("[AUTH] Login successful")
             return redirect(url_for("home"))
-        print("[AUTH] Login failed (wrong password)")
+        with _login_failures_lock:
+            _login_failures.setdefault(ip, []).append(now)
+        print(f"[AUTH] Login failed (wrong password) from {ip}")
         error = "Incorrect password. Please try again."
     return render_template("login.html", error=error)
 
@@ -5734,12 +5889,14 @@ def _dashboard_key_header_ok() -> bool:
     logs, browser history and Referer headers. Compared as bytes:
     hmac.compare_digest raises TypeError on non-ASCII str input, which a
     client-supplied header can contain."""
-    provided = request.headers.get("X-Dashboard-Key") or ""
-    if not provided:
-        return False
-    return hmac.compare_digest(
-        provided.encode("utf-8"), DASHBOARD_KEY.encode("utf-8")
-    )
+    return _secret_equals(request.headers.get("X-Dashboard-Key") or "", DASHBOARD_KEY)
+
+
+def _dashboard_key_param_ok() -> bool:
+    """True iff the ?key= URL param matches DASHBOARD_KEY, compared in
+    constant time (audit T2-1). The dashboard still passes the key this
+    way, so the param stays."""
+    return _secret_equals(request.args.get("key") or "", DASHBOARD_KEY)
 
 
 @app.route("/healthz")
@@ -5819,7 +5976,7 @@ def inventory_debug():
             "shopify_products_url": "<string>"
         }
     """
-    if request.args.get("key") != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return jsonify({"error": "unauthorized"}), 401
     block = get_live_inventory()
     return jsonify({
@@ -5859,7 +6016,7 @@ def review_debug():
             "review_delay_seconds": REVIEW_DELAY_SECONDS
         }
     """
-    if request.args.get("key") != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return jsonify({"error": "unauthorized"}), 401
 
     now = time.time()
@@ -5901,8 +6058,7 @@ def dashboard():
     """Serve the static control-panel HTML, gated by the same DASHBOARD_KEY
     query parameter as /dashboard-data. Pure HTML — the page itself fetches
     /dashboard-data?key=... from JS and renders the JSON client-side."""
-    key = request.args.get("key", "")
-    if key != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return "Unauthorized", 401
     return render_template("glamshelf-twin-control-panel.html")
 
@@ -7770,19 +7926,25 @@ def _process_instagram_event(event: dict) -> None:
         #   (a) the bot's own Send API replies, AND
         #   (b) Udit's manual replies typed in the IG app / Business Suite.
         # Meta provides no structural field to tell (a) from (b), so we match
-        # the echoed text against recently-sent bot replies (registered in
-        # _send_instagram_reply via _record_bot_outbound).
+        # the echo's mid against the message ids Meta returned for our sends
+        # (ig_sent_mids — survives restarts, audit T2-11), then fall back to
+        # the echoed text against recently-sent bot replies (in memory,
+        # registered in _send_instagram_message via _record_bot_outbound).
         #
         # This MUST run BEFORE the generic is_echo drop below — otherwise
         # Udit's manual replies (which are also echoes) would be swallowed by
         # the is_echo return and HUMAN_UDIT_IG would never fire. That was the
         # ordering bug this block fixes.
         if INSTAGRAM_PAGE_ID and sender_id == INSTAGRAM_PAGE_ID:
+            # The bot's own reply echoing back — already handled on send.
+            # Skipping here is what KEEPS the IG AUTO flow working: without
+            # this match, every bot reply's echo would be tagged HUMAN_UDIT
+            # and auto-pause the customer for 4h.
+            if _is_ig_sent_mid(message.get("mid") or ""):
+                print(f"[ECHO-IG] Twin's own reply to {recipient_id} (matched by message id) — skipped")
+                return
             if _is_bot_outbound(text):
-                # The bot's own reply echoing back — already handled on send.
-                # Skipping here is what KEEPS the IG AUTO flow working: without
-                # this match, every bot reply's echo would be tagged
-                # HUMAN_UDIT and auto-pause the customer for 4h.
+                print(f"[ECHO-IG] Twin's own reply to {recipient_id} (matched by text) — skipped")
                 return
             # Not a recent bot send → Udit replied manually from the IG app.
             if not recipient_id:
@@ -8046,7 +8208,7 @@ def dashboard_data():
       error_log      — last 20 ERROR / ESCALATE / slow (>5s) rows
       bulk_spike     — distinct senders in last 30min, is_spike flag if >=5
     """
-    if request.args.get("key") != DASHBOARD_KEY:
+    if not _dashboard_key_param_ok():
         return jsonify({"error": "unauthorized"}), 401
 
     try:
