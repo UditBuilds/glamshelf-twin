@@ -5010,11 +5010,23 @@ get_live_policies()
 #
 # Word boundaries matter: \bpolice\b must not fire on "policy" — a return
 # policy question is one of the most common AUTO messages the twin sees.
+# Same for the English + Hinglish legal backstop (audit T2-17, PR E):
+# "court" must not fire on "courtesy", nor on "court marriage" (a bridal
+# customer, founder decision); FIR matches upper-case only, since "fir"
+# is everyday Hinglish for "then / again" ("fir se order karna hai").
 _ESCALATION_PREFILTER_PATTERNS = re.compile(
     r"\b("
     r"lawyer"
+    r"|vakeel"
     r"|consumer\s+court"
+    r"|consumer\s+forum"
+    r"|court\s+me\s+jaa?unga"
+    r"|court(?!\s+(?:marriage|wedding|shaadi)\b)"
     r"|legal\s+notice"
+    r"|(?-i:FIR)"
+    r"|case\s+karunga"
+    r"|case\s+kar\s+dunga"
+    r"|police\s+complaint"
     r"|police"
     r"|refund\s+karo"        # imperative refund demand (Hinglish). Variants pending Udit's confirmed list — do not add unconfirmed spellings.
     r"|post\s+(?:this\s+|it\s+)?on\s+social\s+media"
@@ -5094,8 +5106,11 @@ TWIN_TAGS = ("LEAD", "SAFETY", "LEGAL", "PRESS", "ORDER", "RESTOCK")
 
 # Which prefilter phrases are legal threats — the escalations that stay
 # SILENT on Instagram. Social-media threats and "refund karo" still get
-# the holding line.
-_LEGAL_PREFILTER_PHRASES = ("lawyer", "consumer court", "legal notice", "police")
+# the holding line. Matched against the prefilter's normalized match text.
+_LEGAL_PREFILTER_PHRASES = re.compile(
+    r"lawyer|vakeel|consumer court|consumer forum|court me jaa?unga|court|legal notice"
+    r"|fir|case karunga|case kar dunga|police complaint|police"
+)
 
 # Deterministic backstops for a missing tag. Consulted only for a message
 # that is ALREADY escalating, so they can never cause an escalation. They
@@ -5163,7 +5178,7 @@ def _legal_threat_hit(message: str) -> bool:
     if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
         return False
     return any(
-        " ".join(m.group(0).lower().split()) in _LEGAL_PREFILTER_PHRASES
+        _LEGAL_PREFILTER_PHRASES.fullmatch(" ".join(m.group(0).lower().split()))
         for m in _ESCALATION_PREFILTER_PATTERNS.finditer(message or "")
     )
 

@@ -249,6 +249,20 @@ class GraphParityTestCase(unittest.TestCase):
         new = self._run("new", llm_response=AUTO_JSON, message=msg)
         self._assert_parity(old, new)
 
+    def test_hinglish_legal_threat_escalates_silently(self):
+        # PR E item 4: "court me jaaunga" escalates like the English words —
+        # silent to the customer, founder paged, 4h pause.
+        msg = "Order abhi tak nahi aaya, court me jaaunga"
+        old = self._run("old", llm_response=AUTO_JSON, message=msg)
+        self.assertEqual(named(old, "_send_instagram_reply"), [])
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ESCALATE")
+        self.assertIn("legal escalations get no automated reply", tg[2]["customer_line"])
+        self.assertEqual(len(named(old, "_pause_number")), 1)
+
+        new = self._run("new", llm_response=AUTO_JSON, message=msg)
+        self._assert_parity(old, new)
+
     def test_bulk_commit_upgrades_auto_to_escalate(self):
         msg = "ok I'll take 50 trays"
         old = self._run("old", llm_response=AUTO_JSON, message=msg)
