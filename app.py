@@ -2414,6 +2414,26 @@ SEND_FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
 _send_failure_last_alert: dict[str, float] = {}
 
 
+# Secrets in error strings (audit T2-8). A requests connection error names
+# the URL it was fetching: the Instagram token rides in ?access_token=, the
+# Telegram bot token in the /bot<token>/ path segment (printed without the
+# host, e.g. "url: /bot123:ABC/sendMessage"). _redact_secrets masks both
+# before an error reaches the logs or a Telegram alert.
+_ACCESS_TOKEN_RE = re.compile(r"(access_token=)[^&\s'\"<>)]+", re.IGNORECASE)
+_TELEGRAM_BOT_TOKEN_RE = re.compile(r"(/bot)\d+:[A-Za-z0-9_-]+")
+
+
+def _redact_secrets(text) -> str:
+    """The text with access_token values and Telegram bot tokens masked."""
+    text = str(text)
+    text = _ACCESS_TOKEN_RE.sub(r"\1<redacted>", text)
+    text = _TELEGRAM_BOT_TOKEN_RE.sub(r"\1<redacted>", text)
+    for secret in (INSTAGRAM_PAGE_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN):
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "<redacted>")
+    return text
+
+
 def _alert_send_failure(
     channel: str,
     error: str,
@@ -2435,6 +2455,7 @@ def _alert_send_failure(
     Never raises — alerting is a side effect and must not break the
     webhook 200 response, same contract as every other Telegram call.
     """
+    error = _redact_secrets(error)
     key = f"{channel}|{error[:120]}" if kind == "send" else f"{kind}|{channel}|{error[:120]}"
     now = time.time()
     if now - _send_failure_last_alert.get(key, 0.0) < SEND_FAILURE_ALERT_COOLDOWN_SECONDS:
@@ -2641,12 +2662,12 @@ def _send_instagram_message(sender_id: str, text: str) -> tuple[bool, str]:
             _alert_send_failure("Instagram", error, sender_id)
             return False, error
     except requests.RequestException as e:
-        print(f"[INSTAGRAM] Network error: {type(e).__name__}: {e}")
+        print(f"[INSTAGRAM] Network error: {type(e).__name__}: {_redact_secrets(e)}")
         error = f"Network error: {type(e).__name__}"
         _alert_send_failure("Instagram", error, sender_id)
         return False, error
     except Exception as e:
-        print(f"[INSTAGRAM] Unexpected error: {type(e).__name__}: {e}")
+        print(f"[INSTAGRAM] Unexpected error: {type(e).__name__}: {_redact_secrets(e)}")
         error = f"Unexpected error: {type(e).__name__}"
         _alert_send_failure("Instagram", error, sender_id)
         return False, error
@@ -3173,10 +3194,10 @@ def send_telegram_notification(
                 f"{response.text[:300]}"
             )
     except requests.RequestException as e:
-        print(f"[TG] Network error: {type(e).__name__}: {e}")
+        print(f"[TG] Network error: {type(e).__name__}: {_redact_secrets(e)}")
     except Exception as e:
         # Defensive — never let a Telegram bug break the API call.
-        print(f"[TG] Unexpected error: {type(e).__name__}: {e}")
+        print(f"[TG] Unexpected error: {type(e).__name__}: {_redact_secrets(e)}")
 
 
 # ===== Telegram inline-button DRAFT approval flow =====
@@ -3194,6 +3215,9 @@ def _telegram_api(method: str, payload: dict) -> dict | None:
         print(f"[TELEGRAM DRAFT] {method} skipped: TELEGRAM_BOT_TOKEN not set")
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    if isinstance(payload.get("text"), str):
+        # Every alert goes out through here — never with a token in it.
+        payload = {**payload, "text": _redact_secrets(payload["text"])}
     try:
         resp = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
         if not resp.ok:
@@ -3201,10 +3225,10 @@ def _telegram_api(method: str, payload: dict) -> dict | None:
             return None
         return resp.json()
     except requests.RequestException as e:
-        print(f"[TELEGRAM DRAFT] {method} network error: {type(e).__name__}: {e}")
+        print(f"[TELEGRAM DRAFT] {method} network error: {type(e).__name__}: {_redact_secrets(e)}")
         return None
     except Exception as e:
-        print(f"[TELEGRAM DRAFT] {method} unexpected error: {type(e).__name__}: {e}")
+        print(f"[TELEGRAM DRAFT] {method} unexpected error: {type(e).__name__}: {_redact_secrets(e)}")
         return None
 
 
