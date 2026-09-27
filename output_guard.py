@@ -16,8 +16,9 @@ Rules (each returns a short reason naming the rule and what matched):
      "shipping is free", "cruelty-free", the discount decline).
   3. A link, domain, email or @handle other than glamshelf.in,
      instagram.com/glamshelfstore, @glamshelfstore and the brand email.
-  4. Talk of the system prompt, instructions, the brain, QA mode or
-     classifying.
+  4. Prompt-injection phrasing: "system prompt", "my/your instructions",
+     "ignore previous", QA mode or classifying. Plain "instructions"
+     ("care instructions") and "brain" in product text pass.
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -74,7 +75,8 @@ _BARE_DOMAIN_RE = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[a-z]{2,24}\b(?:/[^\s<>\"')
 
 # Rule 4.
 _META_RE = re.compile(
-    r"system[- ]?prompt|\binstructions?\b|\bbrain\b|\bqa[- ]?mode\b|\bclassif(?:y|ied|ies|ying|ication)\b",
+    r"system[- ]?prompt|\b(?:my|your) instructions?\b|\bignore (?:all |any |the )?previous\b"
+    r"|\bqa[- ]?mode\b|\bclassif(?:y|ied|ies|ying|ication)\b",
     re.IGNORECASE,
 )
 
