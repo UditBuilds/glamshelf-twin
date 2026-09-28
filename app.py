@@ -6017,6 +6017,7 @@ def healthz():
         "brain_path": str(BRAIN_FILE),
         "brand": BRAND["brand_name"],
         "brand_config": str(BRAND_CONFIG_FILE),
+        "draft_only_mode": _draft_only_mode(),
         "model": DEEPSEEK_MODEL,
         "vision_model": CLAUDE_MODEL,
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
@@ -6645,6 +6646,15 @@ def webhook(token=""):
 
         sender_info = f"{sender_name} ({wa_id})" if sender_name else wa_id
 
+        # Draft-only mode (multi-brand task 4): the AUTO reply waits for the
+        # founder's approval like any DRAFT+APPROVE (Instagram does the same
+        # in _ig_output_guard). The customer gets nothing until then.
+        draft_note = ""
+        if classification == "AUTO" and _draft_only_mode():
+            print(f"[DRAFT-ONLY] Holding WhatsApp AUTO reply to {wa_id} for approval")
+            classification = "DRAFT+APPROVE"
+            draft_note = DRAFT_ONLY_NOTE
+
         if classification == "AUTO":
             # Same false-success guard as the Instagram AUTO branch: WATI
             # failures (including result=false on HTTP 200) must not log
@@ -6681,6 +6691,7 @@ def webhook(token=""):
                 customer_name=sender_name,
                 customer_message=text_body,
                 reply_text=reply,
+                guard_note=draft_note,
             )
             if not sent_with_buttons:
                 send_telegram_notification(
@@ -7644,6 +7655,21 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
+# Draft-only mode (multi-brand task 4): DRAFT_ONLY_MODE=1/true/yes sends
+# every AUTO reply — Instagram and WhatsApp — through the existing
+# DRAFT+APPROVE Telegram flow instead of straight to the customer. Meant for
+# a new brand's first days. Off by default; read per call, so flipping it on
+# Render takes effect on the restart. Instagram holds the reply in
+# _ig_output_guard (shared with graph.py); WhatsApp, which has no output
+# guard, flips the classification in the WATI webhook.
+DRAFT_ONLY_NOTE = "draft-only mode is on (DRAFT_ONLY_MODE) — every AUTO reply waits for approval"
+
+
+def _draft_only_mode() -> bool:
+    value = (os.environ.get("DRAFT_ONLY_MODE") or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
 def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     """Output guard for Instagram AUTO replies (audit T1-4): run the pure
     checks in output_guard.py before an AUTO reply is sent. Returns "" when
@@ -7661,15 +7687,26 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     Rollback: OUTPUT_GUARD_DISABLED=1/true/yes skips the guard, read per
     call like ESCALATION_PREFILTER_DISABLED.
 
+    Draft-only mode (multi-brand task 4): with DRAFT_ONLY_MODE on, EVERY
+    AUTO reply is held here, whatever the checks say — a new brand's first
+    days run on founder approval. Checked before the OUTPUT_GUARD_DISABLED
+    early return, so switching the guard off never switches draft-only off.
+
     Shared with graph.py's route node so the two stay in parity."""
     if classification != "AUTO" or not reply:
         return ""
-    if (os.environ.get("OUTPUT_GUARD_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+    draft_only = _draft_only_mode()
+    guard_off = (os.environ.get("OUTPUT_GUARD_DISABLED") or "").strip().lower() in ("1", "true", "yes")
+    if guard_off and not draft_only:
         return ""
-    prices = _inventory_cache.get("prices") or set()
-    if not prices:
-        print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
-    reasons = output_guard.check_reply(reply, prices)
+    reasons = []
+    if not guard_off:
+        prices = _inventory_cache.get("prices") or set()
+        if not prices:
+            print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
+        reasons = output_guard.check_reply(reply, prices)
+    if draft_only:
+        reasons.insert(0, DRAFT_ONLY_NOTE)
     if not reasons:
         return ""
     note = "; ".join(reasons)

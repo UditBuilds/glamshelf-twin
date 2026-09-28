@@ -619,6 +619,54 @@ class GraphParityTestCase(unittest.TestCase):
         self.assertEqual(old_llm[2], new_llm[2])      # history=, source="Instagram DM"
         self.assertEqual(new_llm[2].get("source"), "Instagram DM")
 
+    # ---- draft-only mode (multi-brand task 4) ----
+
+    def _draft_only(self, **env):
+        values = {"DRAFT_ONLY_MODE": "1", "OUTPUT_GUARD_DISABLED": ""}
+        values.update(env)
+        p = patch.dict(os.environ, values)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_draft_only_holds_an_auto_reply(self):
+        self._draft_only()
+        old = self._run("old", llm_response=AUTO_JSON)
+        # The drafted reply goes to the founder, never to the customer; the
+        # customer gets the handoff line (the DRAFT+APPROVE path).
+        (draft,) = named(old, "send_draft_for_approval")
+        self.assertEqual(draft[2]["reply_text"], json.loads(AUTO_JSON)["reply"])
+        self.assertIn("DRAFT_ONLY_MODE", draft[2]["guard_note"])
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
+
+        new = self._run("new", llm_response=AUTO_JSON)
+        self._assert_parity(old, new)
+
+    def test_draft_only_survives_the_guard_kill_switch(self):
+        self._draft_only(OUTPUT_GUARD_DISABLED="1")
+        old = self._run("old", llm_response=AUTO_JSON)
+        self.assertEqual(len(named(old, "send_draft_for_approval")), 1)
+        new = self._run("new", llm_response=AUTO_JSON)
+        self._assert_parity(old, new)
+
+    def test_draft_only_leaves_escalations_alone(self):
+        self._draft_only()
+        old = self._run("old", llm_response=ESCALATE_JSON)
+        self.assertEqual(named(old, "send_draft_for_approval"), [])
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1][0], "ESCALATE")
+        new = self._run("new", llm_response=ESCALATE_JSON)
+        self._assert_parity(old, new)
+
+    def test_draft_only_off_by_default(self):
+        with patch.dict(os.environ, {"DRAFT_ONLY_MODE": ""}):
+            old = self._run("old", llm_response=AUTO_JSON)
+            new = self._run("new", llm_response=AUTO_JSON)
+        self.assertEqual(named(old, "send_draft_for_approval"), [])
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, json.loads(AUTO_JSON)["reply"]))
+        self._assert_parity(old, new)
+
 
 if __name__ == "__main__":
     unittest.main()
