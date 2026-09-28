@@ -11,6 +11,10 @@ on sample replies, the pricing decisions and a hash of every HTML page.
 Comparing that snapshot (not hand-typed values) is what catches a byte
 of drift where an f-string became a config template.
 
+The "rag" section (the words that fire a product/policy lookup and the
+wrong-SKU product map) was added later, captured from 663f263 — before
+those words moved into the brand file, and byte-identical to 95135fa.
+
 Never regenerate the fixture from changed code to make this pass — a
 difference here means Glam Shelf's customers would see something new.
 
@@ -73,6 +77,27 @@ PRICING_GRID = [
 BULK_MESSAGES = [
     "ok I'll take 50", "let's do 30", "how do I pay for 25",
     "I'll take 19", "I'll take 20", "how much for 40 trays",
+]
+# RAG gate: every trigger word (with its plural / tense variants), case and
+# word-boundary edges, and messages that must NOT fire a lookup.
+RAG_TRIGGER_SAMPLES = [
+    "Is GS1 good for beginners?", "gs 2 vs GS 3", "gs3", "Kawaii tray?",
+    "the clean girl look", "is it mink", "duo or trio", "two trays", "Lashes!",
+    "one lash", "half lashes", "halflash", "band thickness", "which glue",
+    "how many wears", "can I wear it daily", "reusable?", "reusability",
+    "what material", "materials", "fiber", "fibers", "colour", "colors",
+    "black or brown", "shades", "return", "returned", "returns", "refunded",
+    "exchanged", "exchanges", "shipping", "shipped", "ships", "delivery",
+    "deliveries", "delivered", "policy", "policies", "cancel", "cancelled",
+    "cancellation", "COD?", "payments", "tracking", "courier", "damage",
+    "damaged", "broken", "replacement", "warranty",
+    "hi", "price?", "eyelash", "eyelashes", "splash", "trayful", "codes",
+    "shipment", "gs10", "gs 4", "blackpink", "brownie", "bands", "glued",
+    "₹849", "", "what's your instagram",
+]
+RAG_NAMED_SAMPLES = [
+    "gs1", "GS 1 or GS2", "gs 3", "half lash", "Half Lashes", "kawaii",
+    "Clean Girl", "gs10", "gs3 and kawaii", "cleangirl", "hi",
 ]
 FULFILLMENT_BASE = {
     "order_id": 5550001, "name": "#1042.1",
@@ -303,6 +328,20 @@ def _capture_pages() -> dict:
             for name, r in (("login", login), ("index", index), ("dashboard", dash))}
 
 
+def _capture_rag() -> dict:
+    def hit(message):
+        m = glam._RAG_TRIGGER_RE.search(message)
+        return m.group(0) if m else None
+
+    return {
+        "trigger_pattern": glam._RAG_TRIGGER_RE.pattern,
+        "trigger_flags": int(glam._RAG_TRIGGER_RE.flags),
+        "trigger_hits": [[s, hit(s)] for s in RAG_TRIGGER_SAMPLES],
+        "named_product_terms": [list(p) for p in glam._RAG_NAMED_PRODUCT_TERMS],
+        "named_products": [[s, sorted(glam._rag_named_products(s))] for s in RAG_NAMED_SAMPLES],
+    }
+
+
 def capture() -> dict:
     project = Path(glam.PROJECT_DIR)
     return {
@@ -345,6 +384,7 @@ def capture() -> dict:
                           for q, a, i in PRICING_GRID],
             "bulk_prefilter": [[m, glam._bulk_commit_prefilter_hit(m)] for m in BULK_MESSAGES],
         },
+        "rag": _capture_rag(),
         "rendered": {
             "review": _capture_review(),
             "shipping": _capture_shipping(),
@@ -371,7 +411,7 @@ class GlamShelfGoldenTest(unittest.TestCase):
         cls.actual = _normalise(capture())
 
     def test_values_unchanged(self):
-        for section in ("app", "output_guard", "pricing_rules"):
+        for section in ("app", "output_guard", "pricing_rules", "rag"):
             with self.subTest(section=section):
                 self.assertEqual(self.actual[section], self.expected[section])
 

@@ -255,6 +255,392 @@
       ]
     ]
   },
+  "rag": {
+    "trigger_pattern": "\\b(gs ?1|gs ?2|gs ?3|kawaii|clean girl|mink|duo|trio|tray(s)?|lash(es)?|half ?lash(es)?|band|glue|wear(s)?|reusab\\w*|material(s)?|fiber(s)?|colou?r(s)?|black|brown|shade(s)?|return(s|ed)?|refund(s|ed)?|exchange(s|d)?|ship(ping|ped|s)?|deliver(y|ies|ed)?|polic(y|ies)|cancel(led|lation)?|cod|payment(s)?|track(ing)?|courier|damaged?|broken|replace(ment)?|warranty)\\b",
+    "trigger_flags": 34,
+    "trigger_hits": [
+      [
+        "Is GS1 good for beginners?",
+        "GS1"
+      ],
+      [
+        "gs 2 vs GS 3",
+        "gs 2"
+      ],
+      [
+        "gs3",
+        "gs3"
+      ],
+      [
+        "Kawaii tray?",
+        "Kawaii"
+      ],
+      [
+        "the clean girl look",
+        "clean girl"
+      ],
+      [
+        "is it mink",
+        "mink"
+      ],
+      [
+        "duo or trio",
+        "duo"
+      ],
+      [
+        "two trays",
+        "trays"
+      ],
+      [
+        "Lashes!",
+        "Lashes"
+      ],
+      [
+        "one lash",
+        "lash"
+      ],
+      [
+        "half lashes",
+        "half lashes"
+      ],
+      [
+        "halflash",
+        "halflash"
+      ],
+      [
+        "band thickness",
+        "band"
+      ],
+      [
+        "which glue",
+        "glue"
+      ],
+      [
+        "how many wears",
+        "wears"
+      ],
+      [
+        "can I wear it daily",
+        "wear"
+      ],
+      [
+        "reusable?",
+        "reusable"
+      ],
+      [
+        "reusability",
+        "reusability"
+      ],
+      [
+        "what material",
+        "material"
+      ],
+      [
+        "materials",
+        "materials"
+      ],
+      [
+        "fiber",
+        "fiber"
+      ],
+      [
+        "fibers",
+        "fibers"
+      ],
+      [
+        "colour",
+        "colour"
+      ],
+      [
+        "colors",
+        "colors"
+      ],
+      [
+        "black or brown",
+        "black"
+      ],
+      [
+        "shades",
+        "shades"
+      ],
+      [
+        "return",
+        "return"
+      ],
+      [
+        "returned",
+        "returned"
+      ],
+      [
+        "returns",
+        "returns"
+      ],
+      [
+        "refunded",
+        "refunded"
+      ],
+      [
+        "exchanged",
+        "exchanged"
+      ],
+      [
+        "exchanges",
+        "exchanges"
+      ],
+      [
+        "shipping",
+        "shipping"
+      ],
+      [
+        "shipped",
+        "shipped"
+      ],
+      [
+        "ships",
+        "ships"
+      ],
+      [
+        "delivery",
+        "delivery"
+      ],
+      [
+        "deliveries",
+        "deliveries"
+      ],
+      [
+        "delivered",
+        "delivered"
+      ],
+      [
+        "policy",
+        "policy"
+      ],
+      [
+        "policies",
+        "policies"
+      ],
+      [
+        "cancel",
+        "cancel"
+      ],
+      [
+        "cancelled",
+        "cancelled"
+      ],
+      [
+        "cancellation",
+        "cancellation"
+      ],
+      [
+        "COD?",
+        "COD"
+      ],
+      [
+        "payments",
+        "payments"
+      ],
+      [
+        "tracking",
+        "tracking"
+      ],
+      [
+        "courier",
+        "courier"
+      ],
+      [
+        "damage",
+        "damage"
+      ],
+      [
+        "damaged",
+        "damaged"
+      ],
+      [
+        "broken",
+        "broken"
+      ],
+      [
+        "replacement",
+        "replacement"
+      ],
+      [
+        "warranty",
+        "warranty"
+      ],
+      [
+        "hi",
+        null
+      ],
+      [
+        "price?",
+        null
+      ],
+      [
+        "eyelash",
+        null
+      ],
+      [
+        "eyelashes",
+        null
+      ],
+      [
+        "splash",
+        null
+      ],
+      [
+        "trayful",
+        null
+      ],
+      [
+        "codes",
+        null
+      ],
+      [
+        "shipment",
+        null
+      ],
+      [
+        "gs10",
+        null
+      ],
+      [
+        "gs 4",
+        null
+      ],
+      [
+        "blackpink",
+        null
+      ],
+      [
+        "brownie",
+        null
+      ],
+      [
+        "bands",
+        null
+      ],
+      [
+        "glued",
+        null
+      ],
+      [
+        "₹849",
+        null
+      ],
+      [
+        "",
+        null
+      ],
+      [
+        "what's your instagram",
+        null
+      ]
+    ],
+    "named_product_terms": [
+      [
+        "gs1",
+        "gs1"
+      ],
+      [
+        "gs 1",
+        "gs1"
+      ],
+      [
+        "gs2",
+        "gs2"
+      ],
+      [
+        "gs 2",
+        "gs2"
+      ],
+      [
+        "gs3",
+        "gs3"
+      ],
+      [
+        "gs 3",
+        "gs3"
+      ],
+      [
+        "half lash",
+        "gs3"
+      ],
+      [
+        "kawaii",
+        "kawaii"
+      ],
+      [
+        "clean girl",
+        "clean-girl"
+      ]
+    ],
+    "named_products": [
+      [
+        "gs1",
+        [
+          "gs1"
+        ]
+      ],
+      [
+        "GS 1 or GS2",
+        [
+          "gs1",
+          "gs2"
+        ]
+      ],
+      [
+        "gs 3",
+        [
+          "gs3"
+        ]
+      ],
+      [
+        "half lash",
+        [
+          "gs3"
+        ]
+      ],
+      [
+        "Half Lashes",
+        [
+          "gs3"
+        ]
+      ],
+      [
+        "kawaii",
+        [
+          "kawaii"
+        ]
+      ],
+      [
+        "Clean Girl",
+        [
+          "clean-girl"
+        ]
+      ],
+      [
+        "gs10",
+        [
+          "gs1"
+        ]
+      ],
+      [
+        "gs3 and kawaii",
+        [
+          "gs3",
+          "kawaii"
+        ]
+      ],
+      [
+        "cleangirl",
+        []
+      ],
+      [
+        "hi",
+        []
+      ]
+    ]
+  },
   "rendered": {
     "review": [
       {
