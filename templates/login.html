@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sign In · The Glam Shelf</title>
+  <title>Sign In · {{ brand_name }}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -188,7 +188,7 @@
       </svg>
     </div>
 
-    <h1 class="brand">The Glam Shelf</h1>
+    <h1 class="brand">{{ brand_name }}</h1>
     <div class="subtitle">Support Twin · Internal Tool</div>
 
     <form method="POST" action="{{ url_for('login') }}" autocomplete="off">
@@ -212,7 +212,7 @@
   </div>
 
   <footer>
-    <a href="https://glamshelf.in" target="_blank" rel="noopener">glamshelf.in</a>
+    <a href="https://{{ website_domain }}" target="_blank" rel="noopener">{{ website_domain }}</a>
     &nbsp;·&nbsp;
     For founder use only
   </footer>

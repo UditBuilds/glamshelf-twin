@@ -59,6 +59,12 @@ The twin answers real customers of a live D2C store on Instagram. Drafts, output
 
 ---
 
+## Running it for another brand
+
+Each brand runs its own copy: its own Render service, Meta app and Telegram group. Everything brand-specific (links, prices, store feed, canned messages) lives in one settings file: `brands/glamshelf.json` for The Glam Shelf, or the file `BRAND_CONFIG_PATH` points to. `BRAIN_FILE_PATH` points to that brand's brain. With neither set, Twin runs as The Glam Shelf, exactly as before. Setup checklist: [docs/CLIENT_SETUP.md](docs/CLIENT_SETUP.md).
+
+---
+
 ## Development setup
 
 The project virtualenv (`venv/`) is the canonical local environment and must match `requirements.txt`. After pulling changes that touch `requirements.txt`, re-sync it:

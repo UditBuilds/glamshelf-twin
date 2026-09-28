@@ -18,10 +18,13 @@ routing skeleton; app.py remains the single source of behavior. Parity with
 _process_instagram_event (app.py) is enforced by tests/test_graph_parity.py.
 
 NOT YET WIRED INTO PRODUCTION. app.py does not import this module. To swap
-it in, _process_instagram_event would keep its transport-level steps 1-2
-(page-echo / HUMAN_UDIT_IG detection, is_echo drop, empty-text/sender
-checks) and then call handle_instagram_message() instead of the rest of its
-body. Until then the graph is exercised only by the parity test suite.
+it in, _process_instagram_event would keep its transport-level steps 0-2
+(other-account filter, page-echo / HUMAN_UDIT_IG detection, is_echo drop,
+empty-text/sender checks) and then call handle_instagram_message() instead
+of the rest of its body. Until then the graph is exercised only by the
+parity test suite. Everything after those transport steps — including
+DRAFT_ONLY_MODE, which lives in app._ig_output_guard — is shared with
+production through the app helpers the nodes call.
 
 Design notes (full write-ups in the Obsidian vault,
 langgraph-glamshelf-twin.md):
@@ -305,7 +308,8 @@ def triage(state: TwinState) -> TwinState:
         classification = "ESCALATE"
 
     # Output guard (audit T1-4): an AUTO reply that trips a rule is held
-    # for approval — same helper and same place as production.
+    # for approval — same helper and same place as production. The same
+    # helper holds every AUTO reply while DRAFT_ONLY_MODE is on.
     guard_note = app._ig_output_guard(state["sender_id"], classification, reply)
     if guard_note:
         classification = "DRAFT+APPROVE"

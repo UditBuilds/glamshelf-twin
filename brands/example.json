@@ -1,0 +1,54 @@
+{
+  "_comment": "FAKE brand for tests and as a starting template. Not a real business: every domain uses the reserved .example TLD, which never resolves. Copy this file for a real client, fill it in, and upload it to Render as a Secret File — never commit a client's file (see docs/CLIENT_SETUP.md).",
+  "brand_name": "Example Candle Co",
+  "brand_short_name": "ExampleCandle",
+  "instagram_handle": "examplecandleco",
+  "email": "hello@examplecandle.example",
+  "website_domain": "examplecandle.example",
+  "dashboard_api_base": null,
+  "allowed_links": {
+    "_comment": "Your own website_domain, instagram_handle and email are always allowed in replies. List only OTHER domains / Instagram handles / emails Twin may mention.",
+    "domains": ["track.examplecourier.example"],
+    "instagram_handles": [],
+    "emails": []
+  },
+  "vision": {
+    "brand_description": "a small-batch candle brand",
+    "product_singular": "candle",
+    "product_plural": "candles",
+    "example_product": "Amber Woods Jar Candle"
+  },
+  "shopify": {
+    "products_url": null,
+    "prompt_policy_pages": [
+      {"title": "Refund Policy", "url": "https://examplecandle.example/policies/refund-policy"}
+    ],
+    "rag_policy_pages": []
+  },
+  "pricing": {
+    "free_shipping_threshold_inr": 999,
+    "hard_money_threshold_inr": 2500,
+    "bulk_rate_inr": 399,
+    "bulk_floor_inr": 349,
+    "bulk_min_units": 12,
+    "extra_allowed_inr": [49]
+  },
+  "messages": {
+    "review_request": null,
+    "lead_reply": "Thanks for trying our assistant! The Example Candle team will message you personally.",
+    "allergy_holding_line": "The Example Candle team will look into this and get back to you shortly.",
+    "escalate_fallback_holding_reply": "Thanks for telling us — I'm passing this to the Example Candle team, who'll reach out to you personally within a few hours.",
+    "instagram_photo_reply": "I can't view photos here yet — tell me the scent or room you're shopping for and I'll suggest one!",
+    "shipped_intro": "Hi {first_name}! Your Example Candle Co order #{order_number} is on its way",
+    "out_for_delivery": "Hi {first_name}! Your Example Candle Co order #{order_number} is out for delivery today.",
+    "delivered": "Hi {first_name}! Your order #{order_number} has been delivered. Enjoy your candles!"
+  },
+  "shipping": {
+    "tracking_url_prefix": "https://track.examplecourier.example/",
+    "default_carrier": "Example Courier",
+    "wati_template_name": "example_shipping_template"
+  },
+  "bot_text_signatures": [],
+  "_storage_prefix": "Names this copy's files: <prefix>_logs.db (temp-folder DB and the default GITHUB_BACKUP_PATH), <prefix>_seen_ids.txt. Give every brand its own, so brands sharing one backup repo never overwrite each other.",
+  "storage_prefix": "examplecandle"
+}

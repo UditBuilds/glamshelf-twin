@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from html import unescape
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from openai import OpenAI
@@ -37,6 +38,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 import output_guard
+from brand_config import BRAND, BRAND_CONFIG_FILE, BRAND_IS_DEFAULT, resolve_path
 from pricing_rules import (
     ACTION_ESCALATE,
     BULK_MIN_TRAYS,
@@ -71,6 +73,11 @@ for _stream in (sys.stdout, sys.stderr):
 
 app = Flask(__name__)
 
+# Per-brand settings (brand_config.py): BRAND_CONFIG_PATH, default
+# brands/glamshelf.json. Logged so Render shows which brand this copy is.
+print(f"[BRAND] {BRAND['brand_name']} — settings from {BRAND_CONFIG_FILE}"
+      f"{'' if BRAND_IS_DEFAULT else ' (BRAND_CONFIG_PATH)'}")
+
 
 def _require_env(name: str) -> str:
     """Read a required env var or raise on missing/empty.
@@ -103,7 +110,23 @@ app.secret_key = _require_env("SECRET_KEY")
 APP_PASSWORD = _require_env("APP_PASSWORD")
 
 PROJECT_DIR = Path(__file__).parent.resolve()
-BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
+# The brain (multi-brand task 2): BRAIN_FILE_PATH, default brain/brain.md.
+# A relative path is resolved against the project folder. A client brand's
+# brain is uploaded to Render as a Secret File, mounted at
+# /etc/secrets/<filename> — it never goes in this public repo.
+DEFAULT_BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
+BRAIN_FILE = resolve_path(os.environ.get("BRAIN_FILE_PATH"), DEFAULT_BRAIN_FILE)
+print(f"[BRAIN] Brain file: {BRAIN_FILE}{'' if BRAIN_FILE.exists() else ' — NOT FOUND'}")
+# A brand's settings and its brain belong together. Half-configured copies
+# run, but say so loudly in the boot log: another brand answering from
+# Glam Shelf's brain (or Glam Shelf's settings with another brain) is the
+# mistake these catch.
+if not BRAND_IS_DEFAULT and BRAIN_FILE.resolve() == DEFAULT_BRAIN_FILE.resolve():
+    print(f"[BRAND] WARNING: settings are for {BRAND['brand_name']} but the brain is the "
+          f"default brain/brain.md (The Glam Shelf's) — set BRAIN_FILE_PATH")
+elif BRAND_IS_DEFAULT and BRAIN_FILE.resolve() != DEFAULT_BRAIN_FILE.resolve():
+    print("[BRAND] WARNING: BRAIN_FILE_PATH is set but BRAND_CONFIG_PATH isn't — replies use "
+          "The Glam Shelf's settings (links, prices, messages, store feed)")
 DEEPSEEK_MODEL = "deepseek-chat"        # all text replies
 CLAUDE_MODEL = "claude-sonnet-4-6"      # vision only (image extraction)
 # Reply output budget (audit T1-3), sized from real replies: the longest of
@@ -130,36 +153,41 @@ MAX_TOKENS = 400
 VISION_MAX_TOKENS = 512                # extraction output is short JSON
 VISION_DOWNLOAD_TIMEOUT_SECONDS = 10   # per spec — give up fast on slow WATI media
 
-VISION_SYSTEM_PROMPT = """You are analyzing a customer image for The Glam Shelf, an Indian eyelash brand. Identify what kind of image it is and extract whatever's useful.
+# Brand words come from the brand file's "vision" block (Glam Shelf: "an
+# Indian eyelash brand", lash / lashes, "GS1 Luxe Light Lash Tray").
+_PRODUCT = BRAND["vision"]["product_singular"]
+_PRODUCTS = BRAND["vision"]["product_plural"]
+
+VISION_SYSTEM_PROMPT = f"""You are analyzing a customer image for {BRAND["brand_name"]}, {BRAND["vision"]["brand_description"]}. Identify what kind of image it is and extract whatever's useful.
 
 FIRST, classify the image into ONE of:
 - "order_screenshot" → screenshot of an order confirmation, payment receipt, tracking page, invoice, or anything order-related
-- "eye_photo" → a close-up of a customer's eye(s) or face showing eyes — they're asking for a lash recommendation based on their eye shape
-- "product_photo" → a photo of lashes (ours or competitor's), a swatch, or makeup look reference
+- "eye_photo" → a close-up of a customer's eye(s) or face showing eyes — they're asking for a {_PRODUCT} recommendation based on their eye shape
+- "product_photo" → a photo of {_PRODUCTS} (ours or competitor's), a swatch, or makeup look reference
 - "other" → anything else (selfie without eyes visible, food, random scene, blurry, etc.)
 
 THEN extract the relevant fields based on image_type:
 
 For order_screenshot: order_id, payment_status, amount, product, customer_name, date.
 For eye_photo: eye_shape (one of: "hooded", "monolid", "almond", "round", "downturned", or null if unclear).
-For product_photo: product — the lash style / product name if you can identify it (ours or a
+For product_photo: product — the {_PRODUCT} style / product name if you can identify it (ours or a
 competitor's), else null. Leave the order fields null.
 For other: leave extraction fields null.
 
 Respond ONLY in this JSON format (always include every key — use null when not applicable):
-{
+{{
   "image_type": "order_screenshot" | "eye_photo" | "product_photo" | "other",
   "order_id": "1042" or null,
   "payment_status": "paid" or null,
   "amount": "849" or null,
-  "product": "GS1 Luxe Light Lash Tray" or null,
+  "product": "{BRAND["vision"]["example_product"]}" or null,
   "customer_name": "Priya" or null,
   "eye_shape": "hooded" or null,
   "confidence": "high" or "low"
-}
+}}
 
 Confidence is about image_type, NOT about how much you managed to extract. Use "high" whenever you're
-genuinely sure what kind of image this is — a clear photo of lashes is high confidence even if you can't
+genuinely sure what kind of image this is — a clear photo of {_PRODUCTS} is high confidence even if you can't
 name the product, and a clear eye close-up is high confidence even if the eye shape is unreadable. Set
 "low" only when the image is too blurry/dark to make out or you genuinely can't tell which category it
 falls into; then return your best guess for image_type and leave extraction fields null."""
@@ -293,9 +321,15 @@ OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "")
 # have allowed anyone to access the dashboard if env var were missing.
 DASHBOARD_KEY = _require_env("DASHBOARD_KEY")
 
+# This copy's file names come from the brand file's storage_prefix
+# (multi-brand task 6; Glam Shelf: "glamshelf"), so brands never share a
+# temp-folder DB, a dedup cache or a GitHub backup file.
+STORAGE_PREFIX = BRAND["storage_prefix"]
+BACKUP_FILE_NAME = f"{STORAGE_PREFIX}_logs.db"
+
 # SQLite path for ALL persistent state (message logs, Instagram logs,
 # orders, shipping dedup, paused senders, pending drafts).
-#   - Legacy/local default: <tempdir>/glamshelf_logs.db (ephemeral on Render).
+#   - Legacy/local default: <tempdir>/<prefix>_logs.db (ephemeral on Render).
 #   - Production on Render: set DB_PATH (preferred) or DASHBOARD_DB_PATH
 #     (legacy name, still honored) to a path on a mounted persistent disk,
 #     e.g. /var/data/glamshelf.db. The disk needs to be created in
@@ -305,18 +339,21 @@ DASHBOARD_KEY = _require_env("DASHBOARD_KEY")
 #   - On startup, if a legacy /tmp DB exists and the persistent path is
 #     empty, _init_db() copies the file across once so historical rows
 #     aren't lost when you flip on the persistent disk.
-_LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
+_LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), BACKUP_FILE_NAME)
 DB_PATH = (
     os.environ.get("DB_PATH")
     or os.environ.get("DASHBOARD_DB_PATH")
     or _LEGACY_DB_PATH
 )
 
-# GitHub backup config — when all three env vars are set, the SQLite DB
-# is restored from GitHub on cold start (if no local copy) and backed up
-# every BACKUP_INTERVAL_SECONDS thereafter, plus once at startup.
+# GitHub backup config — when GITHUB_TOKEN and GITHUB_REPO are set, the
+# SQLite DB is restored from GitHub on cold start (if no local copy) and
+# backed up every BACKUP_INTERVAL_SECONDS thereafter, plus once at startup.
 # Use a private repo + a token scoped to repo (or "Contents: read/write"
-# on a fine-grained PAT). All three must be set; missing any → skip silently.
+# on a fine-grained PAT). Either one empty → restore, backup and the loop
+# are all skipped (no GitHub call at all). GITHUB_BACKUP_PATH (the file in
+# the repo) defaults to the brand's <prefix>_logs.db, so two brands can
+# share a backup repo without overwriting each other.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-backup
 # Tolerate someone pasting a full URL by mistake — strip the github.com
@@ -325,7 +362,7 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-
 # by the GitHub Contents API. This is the exact mistake that caused the
 # earlier 404s during initial setup.
 GITHUB_REPO = GITHUB_REPO.replace("https://github.com/", "").rstrip("/")
-GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", "glamshelf_logs.db")
+GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", BACKUP_FILE_NAME)
 BACKUP_INTERVAL_SECONDS = 60 * 60
 
 # Shopify webhook secret — used to HMAC-verify inbound order webhooks at
@@ -346,7 +383,11 @@ SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 # `available` boolean. We use that boolean to mark IN STOCK / SOLD OUT
 # — sufficient for Claude to decide when to use the out-of-stock script
 # without us having to manage a Shopify Admin App token.
-SHOPIFY_PRODUCTS_URL = "https://glamshelf.in/products.json"
+#
+# From the brand file (shopify.products_url). null = no store feed: no
+# live inventory block, no product chunks in RAG, and the output guard's
+# prices come from the saved file / brain.md's product table only.
+SHOPIFY_PRODUCTS_URL = BRAND["shopify"]["products_url"]
 SHOPIFY_PRODUCTS_LIMIT = 250  # the endpoint's max page size
 SHOPIFY_TIMEOUT_SECONDS = 8
 
@@ -468,9 +509,64 @@ def _clean_meta_token(raw: str) -> str:
     return s
 
 
-INSTAGRAM_PAGE_ACCESS_TOKEN = _clean_meta_token(
-    os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
-)
+_IG_ENV_TOKEN = _clean_meta_token(os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", ""))
+INSTAGRAM_PAGE_ACCESS_TOKEN = _IG_ENV_TOKEN
+
+# ----- Auto-refreshed Instagram token (multi-brand task 5) -----
+#
+# The daily token check refreshes the long-lived token when it has
+# IG_TOKEN_REFRESH_DAYS or fewer left (_ig_token_refresh_if_due). The new
+# token must outlive a restart, and the env var can't be rewritten from
+# here, so it's saved to IG_TOKEN_STORE_PATH: a file next to the SQLite DB
+# on the persistent disk (Glam Shelf: /var/data). NOT inside the DB — the
+# DB file is pushed to GitHub every hour, and a live token must never
+# land in a repo. Refreshing only happens when that folder is real
+# persistent storage (exists, not the temp folder); otherwise it's off.
+#
+# At boot the saved token is used only if it descends from the CURRENT
+# env token (a SHA-256 of the env token is stored beside it). A founder
+# who pastes a new INSTAGRAM_PAGE_ACCESS_TOKEN on Render always wins.
+#
+# Kill switch: TOKEN_AUTO_REFRESH_DISABLED=1 stops refreshing. A token
+# already saved from the current env token stays in use (it's the live
+# one); to stop using it, paste a fresh token into the env var.
+# The token is never printed or sent anywhere but Meta.
+IG_TOKEN_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "instagram_token.json")
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _load_stored_ig_token(env_token: str) -> tuple[str, float]:
+    """(token, expires_at) to use at boot: the saved refreshed token when
+    it was refreshed from `env_token`, else (env_token, 0.0). Never raises."""
+    if not env_token:
+        return env_token, 0.0
+    try:
+        with open(IG_TOKEN_STORE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return env_token, 0.0
+    except Exception as e:
+        print(f"[TOKEN-REFRESH] Saved token unreadable ({type(e).__name__}) — using INSTAGRAM_PAGE_ACCESS_TOKEN")
+        return env_token, 0.0
+    token = _clean_meta_token(str(data.get("access_token") or "")) if isinstance(data, dict) else ""
+    if not token or data.get("env_token_sha256") != _token_fingerprint(env_token):
+        print("[TOKEN-REFRESH] Saved token doesn't come from the current INSTAGRAM_PAGE_ACCESS_TOKEN — using the env token")
+        return env_token, 0.0
+    try:
+        expires_at = float(data.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    when = datetime.fromtimestamp(expires_at, timezone.utc).strftime("%d %b %Y") if expires_at else "unknown"
+    print(f"[TOKEN-REFRESH] Using the auto-refreshed Instagram token (expires {when})")
+    return token, expires_at
+
+
+# Expiry of the token in use, when known: from the saved file at boot,
+# then from each daily debug_token check.
+INSTAGRAM_PAGE_ACCESS_TOKEN, _ig_token_expires_at = _load_stored_ig_token(_IG_ENV_TOKEN)
 
 # Instagram-connected Account ID. Visible in Meta Business Suite under
 # the Instagram account → Account info, or by hitting the /me endpoint
@@ -536,7 +632,7 @@ WATI_WEBHOOK_TOKEN = os.environ.get("WATI_WEBHOOK_TOKEN", "").strip()
 #   - Not synchronised across multiple gunicorn workers, but Render uses 1
 #     by default. With concurrent workers worst-case is occasional duplicate
 #     processing, not a true loop.
-DEDUP_CACHE_FILE = os.path.join(tempfile.gettempdir(), "glamshelf_seen_ids.txt")
+DEDUP_CACHE_FILE = os.path.join(tempfile.gettempdir(), f"{STORAGE_PREFIX}_seen_ids.txt")
 DEDUP_MAX_AGE_SECONDS = 60 * 60  # 1 hour — long enough to cover the loop window
 
 
@@ -657,15 +753,20 @@ HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
 REVIEW_DELAY_SECONDS = 10 * 24 * 60 * 60   # 864000s = 10 days
 _scheduled_reviews: dict[str, dict] = {}
 
-REVIEW_REQUEST_TEMPLATE = (
-    "Hi {first_name}! Hope you're loving your lashes from The Glam Shelf 🤍\n\n"
-    "If you have a minute, a quick review on our website would mean so much "
-    "to us — it helps other girls find us too!\n\n"
-    "→ glamshelf.in/pages/reviews\n\n"
-    "And if you've worn them, we'd love to see! Tag us @glamshelfstore on "
-    "Instagram 🤍\n\n"
-    "— Team The Glam Shelf"
-)
+# From the brand file (messages.review_request, {first_name} placeholder).
+# null = no review requests: _schedule_review_request skips them.
+REVIEW_REQUEST_TEMPLATE = BRAND["messages"]["review_request"]
+
+# WhatsApp shipping updates (_process_shipping_event / _process_order_update),
+# from the brand file. The message templates take {first_name} and
+# {order_number}; the tracking link is TRACKING_URL_PREFIX + number, and
+# the WATI template's button has that same prefix baked in.
+SHIPPED_INTRO_TEMPLATE = BRAND["messages"]["shipped_intro"]
+OUT_FOR_DELIVERY_TEMPLATE = BRAND["messages"]["out_for_delivery"]
+DELIVERED_TEMPLATE = BRAND["messages"]["delivered"]
+TRACKING_URL_PREFIX = BRAND["shipping"]["tracking_url_prefix"]
+SHIPPING_DEFAULT_CARRIER = BRAND["shipping"]["default_carrier"]
+SHIPPING_WATI_TEMPLATE = BRAND["shipping"]["wati_template_name"]
 
 # ----- Telegram DRAFT inline-button approval flow -----
 #
@@ -1308,11 +1409,14 @@ def _udit_replied_recently(wa_id: str, window_seconds: int = HUMAN_HANDLING_WIND
 # once the in-memory _bot_recent_replies TTL lapses we'd otherwise mistake
 # them for a human reply. Matching these signatures keeps them attributed
 # to the bot. Kept deliberately narrow (URLs / fixed template phrases) so a
-# message Udit actually types can't accidentally match.
+# message Udit actually types can't accidentally match. The tracking link
+# (brand file's shipping.tracking_url_prefix without the scheme) and the
+# tracking follow-up's phrase are always in; the brand file's
+# bot_text_signatures add the rest (Glam Shelf: its reviews link).
 _BOT_TEXT_SIGNATURES = (
-    "shiprocket.in/tracking",
+    re.sub(r"^https?://", "", TRACKING_URL_PREFIX.lower()).rstrip("/"),
     "here's your tracking link",
-    "glamshelf.in/pages/reviews",
+    *BRAND["bot_text_signatures"],
 )
 
 
@@ -2429,7 +2533,8 @@ def _redact_secrets(text) -> str:
     text = str(text)
     text = _ACCESS_TOKEN_RE.sub(r"\1<redacted>", text)
     text = _TELEGRAM_BOT_TOKEN_RE.sub(r"\1<redacted>", text)
-    for secret in (INSTAGRAM_PAGE_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN):
+    # The env token too: after an auto-refresh it's no longer the one in use.
+    for secret in (INSTAGRAM_PAGE_ACCESS_TOKEN, _IG_ENV_TOKEN, TELEGRAM_BOT_TOKEN):
         if secret and len(secret) >= 8:
             text = text.replace(secret, "<redacted>")
     return text
@@ -2841,7 +2946,7 @@ def _github_headers() -> dict:
 
 
 def _github_contents_url() -> str:
-    # GITHUB_BACKUP_PATH is a path-within-repo (e.g. "glamshelf_logs.db").
+    # GITHUB_BACKUP_PATH is a path-within-repo (Glam Shelf: "glamshelf_logs.db").
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
 
 
@@ -2918,7 +3023,7 @@ def _backup_db_to_github() -> None:
             print(f"[BACKUP] SHA lookup error ({type(e).__name__}: {e}) — proceeding as create")
 
         payload = {
-            "message": f"auto-backup glamshelf_logs.db @ {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            "message": f"auto-backup {BACKUP_FILE_NAME} @ {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
             "content": content_b64,
         }
         if existing_sha:
@@ -3122,7 +3227,7 @@ def send_telegram_notification(
             ),
             "RESTOCK": (
                 "🔔 RESTOCK request — there's no waitlist",
-                f"→ Twin pointed them to @glamshelfstore. Reach out from {approve_destination} if you want to.",
+                f"→ Twin pointed them to @{BRAND['instagram_handle']}. Reach out from {approve_destination} if you want to.",
             ),
         }[classification]
         text = (
@@ -4175,9 +4280,10 @@ def _html_to_blocks(raw: str) -> list[str]:
 # edit in Shopify Admin reaches the bot within one cache interval, and a
 # brain.md-vs-store contradiction (like the v1.8 "no returns" incident)
 # can't silently persist. Cached with the same TTL as brain.md.
-_POLICY_PROMPT_PAGES = (
-    ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
-    ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
+# Pages come from the brand file (shopify.prompt_policy_pages); an empty
+# list means no policy block in the prompt.
+_POLICY_PROMPT_PAGES = tuple(
+    (page["title"], page["url"]) for page in BRAND["shopify"]["prompt_policy_pages"]
 )
 _policy_cache: dict = {"text": "", "fetched_at": 0.0}
 
@@ -4224,7 +4330,7 @@ def get_live_policies() -> str:
         return _policy_cache["text"]
 
     block = (
-        "[LIVE STORE POLICIES - published at glamshelf.in]\n"
+        f"[LIVE STORE POLICIES - published at {BRAND['website_domain']}]\n"
         "The following is the store's live published policy text, for factual "
         "reference when answering policy questions. It does not override any "
         "classification, escalation, or Never-list rule above.\n\n"
@@ -4265,6 +4371,9 @@ def get_live_inventory() -> str:
     here, so a product rename in Shopify takes effect on the next 5-min
     cache rollover with no brain.md change.
     """
+    if not SHOPIFY_PRODUCTS_URL:
+        return ""  # brand file: shopify.products_url is null (no store feed)
+
     now = time.time()
     age = now - _inventory_cache["fetched_at"]
     if _inventory_cache["text"] and age < INVENTORY_CACHE_TTL_SECONDS:
@@ -4388,10 +4497,9 @@ RAG_MAX_CONTEXT_CHARS = 2000       # ≈500 tokens (audit 5.4 budget)
 RAG_CHUNK_MAX_CHARS = 500
 RAG_REINDEX_INTERVAL_SECONDS = 60 * 60   # hourly fallback re-index
 
-_RAG_POLICY_SOURCES = (
-    ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
-    ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
-    ("Terms of Service", "https://glamshelf.in/policies/terms-of-service"),
+# From the brand file (shopify.rag_policy_pages).
+_RAG_POLICY_SOURCES = tuple(
+    (page["title"], page["url"]) for page in BRAND["shopify"]["rag_policy_pages"]
 )
 
 _rag_embedder = None  # fastembed TextEmbedding, loaded once at startup; None = retrieval disabled
@@ -4605,16 +4713,18 @@ def _rag_build_corpus() -> list[tuple[str, str, str]]:
     customer identifiers, no stock status, no prices-as-text."""
     chunks: list[tuple[str, str, str]] = []
 
-    try:
-        resp = requests.get(
-            SHOPIFY_PRODUCTS_URL,
-            params={"limit": SHOPIFY_PRODUCTS_LIMIT},
-            timeout=SHOPIFY_TIMEOUT_SECONDS,
-        )
-        products = (resp.json() or {}).get("products") or [] if resp.ok else []
-    except Exception as e:
-        print(f"[RAG] Product fetch failed: {type(e).__name__}: {e}")
-        products = []
+    products = []
+    if SHOPIFY_PRODUCTS_URL:  # null in the brand file = no store feed
+        try:
+            resp = requests.get(
+                SHOPIFY_PRODUCTS_URL,
+                params={"limit": SHOPIFY_PRODUCTS_LIMIT},
+                timeout=SHOPIFY_TIMEOUT_SECONDS,
+            )
+            products = (resp.json() or {}).get("products") or [] if resp.ok else []
+        except Exception as e:
+            print(f"[RAG] Product fetch failed: {type(e).__name__}: {e}")
+            products = []
 
     for p in products:
         title = (p.get("title") or "").strip()
@@ -4832,7 +4942,9 @@ def _ig_token_debug_check(now: float) -> bool | None:
             "(Checked daily; this repeats until the token works.)"
         )
         return False
+    global _ig_token_expires_at
     expires_at = data.get("expires_at") or 0
+    _ig_token_expires_at = float(expires_at)   # for _ig_token_refresh_if_due
     if not expires_at:
         print("[TOKEN-CHECK] Instagram token valid, no expiry date")
         return True
@@ -4849,10 +4961,140 @@ def _ig_token_debug_check(now: float) -> bool | None:
     return True
 
 
+IG_TOKEN_REFRESH_URL = "https://graph.instagram.com/refresh_access_token"
+IG_TOKEN_REFRESH_DAYS = 15
+
+
+def _token_auto_refresh_disabled() -> bool:
+    value = (os.environ.get("TOKEN_AUTO_REFRESH_DISABLED") or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
+def _ig_token_store_problem() -> str:
+    """Why a refreshed token couldn't be kept across restarts, or "" when
+    IG_TOKEN_STORE_PATH's folder is real persistent storage."""
+    folder = os.path.dirname(IG_TOKEN_STORE_PATH)
+    if not os.path.isdir(folder):
+        return f"{folder} doesn't exist (no persistent disk?)"
+    real = os.path.normcase(os.path.realpath(folder))
+    temp = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+    if real == temp or real.startswith(temp + os.sep):
+        return f"{folder} is in the temp folder, which a restart wipes (DB_PATH isn't on a persistent disk)"
+    return ""
+
+
+def _save_ig_token(token: str, expires_at: float, now: float) -> bool:
+    """Write the refreshed token next to the DB: owner-only file, written
+    to a temp file and swapped in so a crash never leaves half a token."""
+    tmp = IG_TOKEN_STORE_PATH + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({
+                "access_token": token,
+                "expires_at": expires_at,
+                "refreshed_at": now,
+                "env_token_sha256": _token_fingerprint(_IG_ENV_TOKEN),
+            }, f)
+        os.replace(tmp, IG_TOKEN_STORE_PATH)
+        return True
+    except Exception as e:
+        print(f"[TOKEN-REFRESH] Could not save the refreshed token: {type(e).__name__}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _ig_token_refresh_if_due(now: float) -> None:
+    """Refresh the long-lived Instagram token with Meta's Instagram Login
+    refresh endpoint (GET graph.instagram.com/refresh_access_token,
+    grant_type=ig_refresh_token; the token must be 24h+ old and still
+    valid — always true this close to a 60-day expiry) when
+    IG_TOKEN_REFRESH_DAYS or fewer are left. Called by the daily check
+    right after it confirmed the token works. Telegram alert on success
+    and on failure; the token itself is never printed or alerted. Needs
+    the expiry date (debug_token, i.e. INSTAGRAM_APP_ID + _SECRET, or the
+    saved refresh) and persistent storage; otherwise logs why and skips."""
+    global INSTAGRAM_PAGE_ACCESS_TOKEN, _ig_token_expires_at
+    if _token_auto_refresh_disabled():
+        print("[TOKEN-REFRESH] Off (TOKEN_AUTO_REFRESH_DISABLED)")
+        return
+    if not _ig_token_expires_at:
+        print("[TOKEN-REFRESH] Skipped: expiry date unknown — set INSTAGRAM_APP_ID and "
+              "INSTAGRAM_APP_SECRET so the daily check can read it")
+        return
+    days_left = (_ig_token_expires_at - now) / 86400
+    if days_left > IG_TOKEN_REFRESH_DAYS:
+        return
+    problem = _ig_token_store_problem()
+    if problem:
+        print(f"[TOKEN-REFRESH] Not refreshing: {problem} — a new token wouldn't survive a restart")
+        return
+
+    print(f"[TOKEN-REFRESH] {days_left:.1f} days left — refreshing the Instagram token")
+    failure = ""
+    data: dict = {}
+    try:
+        resp = requests.get(
+            IG_TOKEN_REFRESH_URL,
+            params={"grant_type": "ig_refresh_token", "access_token": INSTAGRAM_PAGE_ACCESS_TOKEN},
+            timeout=INSTAGRAM_TIMEOUT_SECONDS,
+        )
+        try:
+            data = resp.json() or {}
+        except ValueError:
+            data = {}
+        if not resp.ok:
+            err = _meta_error(resp)
+            failure = f"HTTP {resp.status_code}: {(err.get('message') or resp.text or '')[:200]}"
+    except requests.RequestException as e:
+        failure = f"network error ({type(e).__name__})"
+    new_token = _clean_meta_token(str(data.get("access_token") or "")) if isinstance(data, dict) else ""
+    try:
+        expires_in = int(data.get("expires_in") or 0) if isinstance(data, dict) else 0
+    except (TypeError, ValueError):
+        expires_in = 0
+    if not failure and (not new_token or expires_in <= 0):
+        failure = "Meta's answer had no new token"
+    if failure:
+        failure = _redact_secrets(failure)
+        print(f"[TOKEN-REFRESH] FAILED: {failure}")
+        _ig_token_alert(
+            "⚠️ Instagram token auto-refresh FAILED\n"
+            f"{failure}\n"
+            f"The current token still works for about {max(0, int(days_left))} day(s). "
+            "Twin tries again tomorrow; if this keeps failing, generate a new token and "
+            "update INSTAGRAM_PAGE_ACCESS_TOKEN on Render."
+        )
+        return
+
+    new_expires_at = now + expires_in
+    saved = _save_ig_token(new_token, new_expires_at, now)
+    INSTAGRAM_PAGE_ACCESS_TOKEN = new_token
+    _ig_token_expires_at = new_expires_at
+    date = datetime.fromtimestamp(new_expires_at, timezone.utc).strftime("%d %b %Y")
+    print(f"[TOKEN-REFRESH] Refreshed — valid until {date}{'' if saved else ' (NOT saved to disk)'}")
+    if saved:
+        _ig_token_alert(
+            f"✅ Instagram token auto-refreshed — now valid until {date} (UTC).\n"
+            "Nothing to do. (INSTAGRAM_PAGE_ACCESS_TOKEN on Render keeps the old value; "
+            "Twin uses the refreshed one saved on its disk.)"
+        )
+    else:
+        _ig_token_alert(
+            f"⚠️ Instagram token refreshed (valid until {date} UTC) but it could NOT be saved "
+            "to disk. It works until the next restart; after that Twin falls back to "
+            "INSTAGRAM_PAGE_ACCESS_TOKEN. Generate a new token and update it on Render."
+        )
+
+
 def _ig_token_check_if_due(now: float | None = None) -> None:
     """Run the Instagram token check if 24h have passed since the last
     completed one. A check that couldn't reach Meta isn't recorded, so the
-    next hourly tick retries. Never raises."""
+    next hourly tick retries. A token confirmed working is then refreshed
+    if it's close to expiry (_ig_token_refresh_if_due). Never raises."""
     now = time.time() if now is None else now
     try:
         if not INSTAGRAM_PAGE_ACCESS_TOKEN:
@@ -4866,8 +5108,10 @@ def _ig_token_check_if_due(now: float | None = None) -> None:
             result = _ig_token_basic_check()
         if result is not None:
             _job_mark_run(IG_TOKEN_CHECK_JOB, now)
+        if result:
+            _ig_token_refresh_if_due(now)
     except Exception as e:
-        print(f"[TOKEN-CHECK] Check crashed: {type(e).__name__}: {e}")
+        print(f"[TOKEN-CHECK] Check crashed: {type(e).__name__}: {_redact_secrets(e)}")
 
 
 def _start_rag_reindex_loop() -> None:
@@ -5090,10 +5334,8 @@ def _parse_twin_reply(raw: str) -> tuple[str, str]:
     )
 
 
-ESCALATE_FALLBACK_HOLDING_REPLY = (
-    "I hear you, and I want this handled properly — I'm bringing it straight to "
-    "the GlamShelf team, who'll reach out to you personally within the next few hours."
-)
+# From the brand file (messages.escalate_fallback_holding_reply).
+ESCALATE_FALLBACK_HOLDING_REPLY = BRAND["messages"]["escalate_fallback_holding_reply"]
 
 # brain.md's Default Handoff Line (INTERNAL NOTES), sent verbatim when the
 # reply pipeline itself fails on Instagram — DeepSeek down or timing out,
@@ -5110,20 +5352,20 @@ BRAIN_HOLDING_LINE = "I've passed this to the team — they'll reply to you here
 #     allergy holding reply: the safety advice plus a holding line;
 #   - anything else, including unusable model output: BRAIN_HOLDING_LINE.
 # (WhatsApp is unchanged: ESCALATE_FALLBACK_HOLDING_REPLY on fallback only.)
+# The safety advice is fixed for every brand; only the follow-up line after
+# it comes from the brand file (messages.allergy_holding_line).
 ALLERGY_SAFETY_TEXT = (
     "I'm really sorry to hear this. Please stop using the product immediately "
     "and consult a doctor."
 )
-ALLERGY_HOLDING_REPLY = (
-    ALLERGY_SAFETY_TEXT
-    + " Team The Glam Shelf will personally look into this and get back to you shortly 🤍"
-)
+ALLERGY_HOLDING_REPLY = ALLERGY_SAFETY_TEXT + " " + BRAND["messages"]["allergy_holding_line"]
 
 # Someone testing Twin, a brand owner, or anyone asking about the AI service
 # (audit T1-5): a friendly line, a Telegram LEAD notice and NO pause. Sent
 # verbatim when the model didn't write a reply of its own. Mirrors brain.md
-# RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS ASSISTANT.
-LEAD_REPLY = "Thanks for checking it out! Udit will message you personally 🤍"
+# RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS ASSISTANT. From the
+# brand file (messages.lead_reply) — keep it in step with that brand's brain.
+LEAD_REPLY = BRAND["messages"]["lead_reply"]
 
 # The optional "tag" field of the model's JSON (see build_user_message and
 # brain.md's Output Contract). Anything else parses as "".
@@ -5401,6 +5643,20 @@ def draft_reply_logic(
         classification = "ESCALATE"
 
     return classification, reply, raw
+
+
+@app.context_processor
+def _brand_template_vars() -> dict:
+    """Brand words for the HTML pages (login, drafter, control panel).
+    dashboard_api_base null -> the control panel calls its own server."""
+    api_base = BRAND["dashboard_api_base"] or ""
+    return {
+        "brand_name": BRAND["brand_name"],
+        "brand_short_name": BRAND["brand_short_name"],
+        "website_domain": BRAND["website_domain"],
+        "dashboard_api_base": api_base,
+        "dashboard_host": urlsplit(api_base).netloc if api_base else request.host,
+    }
 
 
 def login_required(view):
@@ -5958,6 +6214,17 @@ def healthz():
         "status": status,
         "brain_present": BRAIN_FILE.exists(),
         "brain_path": str(BRAIN_FILE),
+        "brand": BRAND["brand_name"],
+        "brand_config": str(BRAND_CONFIG_FILE),
+        "draft_only_mode": _draft_only_mode(),
+        "instagram_token_auto_refresh": (
+            "off (TOKEN_AUTO_REFRESH_DISABLED)" if _token_auto_refresh_disabled()
+            else (f"inactive: {_ig_token_store_problem()}" if _ig_token_store_problem() else "on")
+        ),
+        "instagram_token_expires_at": (
+            datetime.fromtimestamp(_ig_token_expires_at, timezone.utc).isoformat(timespec="seconds")
+            if _ig_token_expires_at else None
+        ),
         "model": DEEPSEEK_MODEL,
         "vision_model": CLAUDE_MODEL,
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
@@ -5995,7 +6262,7 @@ def inventory_debug():
         {
             "inventory": "<the formatted block, possibly empty>",
             "cached_age_seconds": <float, 0 on first call after restart>,
-            "shopify_products_url": "<string>"
+            "shopify_products_url": "<string, or null when the brand has no store feed>"
         }
     """
     if not _dashboard_key_param_ok():
@@ -6381,7 +6648,7 @@ def webhook(token=""):
                 if eye_shape:
                     text_body = (
                         f"I just sent a close-up photo of my eye — my eye shape looks "
-                        f"{eye_shape}. Can you recommend a lash for me?"
+                        f"{eye_shape}. Can you recommend a {_PRODUCT} for me?"
                     )
                     vision_summary = (
                         f"the customer sent a close-up photo of their eye "
@@ -6391,7 +6658,7 @@ def webhook(token=""):
                 else:
                     text_body = (
                         "I just sent a close-up photo of my eye — my eye shape was unclear. "
-                        "Can you recommend a lash for me?"
+                        f"Can you recommend a {_PRODUCT} for me?"
                     )
                     vision_summary = (
                         "the customer sent a close-up photo of their eye "
@@ -6420,12 +6687,12 @@ def webhook(token=""):
                 product = extracted.get("product")
                 if product:
                     vision_summary = (
-                        f"the customer sent a photo of lashes they're interested in "
+                        f"the customer sent a photo of {_PRODUCTS} they're interested in "
                         f"(looks like {product})"
                     )
                 else:
                     vision_summary = (
-                        "the customer sent a photo of lashes they're interested in "
+                        f"the customer sent a photo of {_PRODUCTS} they're interested in "
                         "(we couldn't identify which style)"
                     )
                 if product or caption_text:
@@ -6433,12 +6700,12 @@ def webhook(token=""):
                     # properly (product details, price, closest match).
                     if product:
                         text_body = (
-                            f"I just sent a photo of lashes I'm interested in — it looks "
+                            f"I just sent a photo of {_PRODUCTS} I'm interested in — it looks "
                             f"like {product}. Can you help me with this one?"
                         )
                     else:
                         text_body = (
-                            "I just sent a photo of lashes I'm interested in. "
+                            f"I just sent a photo of {_PRODUCTS} I'm interested in. "
                             "Can you help me with this one?"
                         )
                     print(f"[VISION] Product photo confidence=high product={product!r} — synthesized product query")
@@ -6586,6 +6853,15 @@ def webhook(token=""):
 
         sender_info = f"{sender_name} ({wa_id})" if sender_name else wa_id
 
+        # Draft-only mode (multi-brand task 4): the AUTO reply waits for the
+        # founder's approval like any DRAFT+APPROVE (Instagram does the same
+        # in _ig_output_guard). The customer gets nothing until then.
+        draft_note = ""
+        if classification == "AUTO" and _draft_only_mode():
+            print(f"[DRAFT-ONLY] Holding WhatsApp AUTO reply to {wa_id} for approval")
+            classification = "DRAFT+APPROVE"
+            draft_note = DRAFT_ONLY_NOTE
+
         if classification == "AUTO":
             # Same false-success guard as the Instagram AUTO branch: WATI
             # failures (including result=false on HTTP 200) must not log
@@ -6622,6 +6898,7 @@ def webhook(token=""):
                 customer_name=sender_name,
                 customer_message=text_body,
                 reply_text=reply,
+                guard_note=draft_note,
             )
             if not sent_with_buttons:
                 send_telegram_notification(
@@ -6894,6 +7171,9 @@ def _schedule_review_request(
     if order_id in _scheduled_reviews:
         print(f"[REVIEW] Already scheduled for order {order_number or order_id} — dedup skip")
         return
+    if REVIEW_REQUEST_TEMPLATE is None:
+        print(f"[REVIEW] Review requests are off for this brand — not scheduling for order {order_number or order_id}")
+        return
 
     now = time.time()
     _scheduled_reviews[order_id] = {
@@ -7049,7 +7329,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         else:
             tracking_message = (
                 f"Hi {greeting_name}! Here's your tracking link for order #{order_number} 🤍\n\n"
-                f"Track your order: https://shiprocket.in/tracking/{tracking_number}\n\n"
+                f"Track your order: {TRACKING_URL_PREFIX}{tracking_number}\n\n"
                 f"Feel free to reach out if you need anything!"
             )
             # Dedup key is written inside the helper, ONLY on confirmed
@@ -7115,15 +7395,15 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             )
             template_sent = send_whatsapp_template(
                 wa_id=wa_id,
-                template_name="shipping_notification_template",
+                template_name=SHIPPING_WATI_TEMPLATE,
                 parameters=[
                     {"name": "name", "value": greeting_name},
                     {"name": "order_number", "value": f"#{order_number}"},
                     {"name": "tracking_number", "value": tracking_number},
-                    {"name": "carrier", "value": tracking_company or "Shiprocket"},
+                    {"name": "carrier", "value": tracking_company or SHIPPING_DEFAULT_CARRIER},
                     # tracking_url variable is just the tracking number;
-                    # the template's button has the
-                    # https://shiprocket.in/tracking/ prefix baked in.
+                    # the template's button has the TRACKING_URL_PREFIX
+                    # (Glam Shelf: https://shiprocket.in/tracking/) baked in.
                     {"name": "tracking_url", "value": tracking_number},
                 ],
             )
@@ -7141,12 +7421,11 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         if not template_sent:
             estimated_delivery = (fulfillment.get("estimated_delivery_at") or "").strip()
             lines = [
-                f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-                f"has been shipped 🤍",
+                SHIPPED_INTRO_TEMPLATE.format(first_name=greeting_name, order_number=order_number),
                 "",
             ]
             if tracking_number:
-                lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+                lines.append(f"Tracking: {TRACKING_URL_PREFIX}{tracking_number}")
             if tracking_company:
                 lines.append(f"Carrier: {tracking_company}")
             if estimated_delivery:
@@ -7155,18 +7434,9 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             lines.append("Feel free to reach out if you need anything!")
             message = "\n".join(lines)
     elif event == "out_for_delivery":
-        message = (
-            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-            f"is out for delivery today 🤍\n\n"
-            f"Keep an eye out — it'll be at your door soon!"
-        )
+        message = OUT_FOR_DELIVERY_TEMPLATE.format(first_name=greeting_name, order_number=order_number)
     elif event == "delivered":
-        message = (
-            f"Hi {greeting_name}! Your order #{order_number} has been "
-            f"delivered 🤍\n\n"
-            f"Hope you love your lashes! If you have any questions about "
-            f"how to use them, just message us here."
-        )
+        message = DELIVERED_TEMPLATE.format(first_name=greeting_name, order_number=order_number)
     else:
         return  # Unreachable, but defensive.
 
@@ -7370,12 +7640,12 @@ def _process_order_update(payload: dict) -> None:
     if tracking_number:
         template_sent = send_whatsapp_template(
             wa_id=wa_id,
-            template_name="shipping_notification_template",
+            template_name=SHIPPING_WATI_TEMPLATE,
             parameters=[
                 {"name": "name", "value": greeting_name},
                 {"name": "order_number", "value": f"#{order_number}"},
                 {"name": "tracking_number", "value": tracking_number},
-                {"name": "carrier", "value": tracking_company or "Shiprocket"},
+                {"name": "carrier", "value": tracking_company or SHIPPING_DEFAULT_CARRIER},
                 {"name": "tracking_url", "value": tracking_number},
             ],
         )
@@ -7396,12 +7666,11 @@ def _process_order_update(payload: dict) -> None:
             _mark_shipping_sent(order_id, extra, phone=wa_id, order_number=order_number)
     else:
         lines = [
-            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-            f"has been shipped 🤍",
+            SHIPPED_INTRO_TEMPLATE.format(first_name=greeting_name, order_number=order_number),
             "",
         ]
         if tracking_number:
-            lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+            lines.append(f"Tracking: {TRACKING_URL_PREFIX}{tracking_number}")
         if tracking_company:
             lines.append(f"Carrier: {tracking_company}")
         lines.append("")
@@ -7593,6 +7862,21 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
+# Draft-only mode (multi-brand task 4): DRAFT_ONLY_MODE=1/true/yes sends
+# every AUTO reply — Instagram and WhatsApp — through the existing
+# DRAFT+APPROVE Telegram flow instead of straight to the customer. Meant for
+# a new brand's first days. Off by default; read per call, so flipping it on
+# Render takes effect on the restart. Instagram holds the reply in
+# _ig_output_guard (shared with graph.py); WhatsApp, which has no output
+# guard, flips the classification in the WATI webhook.
+DRAFT_ONLY_NOTE = "draft-only mode is on (DRAFT_ONLY_MODE) — every AUTO reply waits for approval"
+
+
+def _draft_only_mode() -> bool:
+    value = (os.environ.get("DRAFT_ONLY_MODE") or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
 def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     """Output guard for Instagram AUTO replies (audit T1-4): run the pure
     checks in output_guard.py before an AUTO reply is sent. Returns "" when
@@ -7610,15 +7894,26 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     Rollback: OUTPUT_GUARD_DISABLED=1/true/yes skips the guard, read per
     call like ESCALATION_PREFILTER_DISABLED.
 
+    Draft-only mode (multi-brand task 4): with DRAFT_ONLY_MODE on, EVERY
+    AUTO reply is held here, whatever the checks say — a new brand's first
+    days run on founder approval. Checked before the OUTPUT_GUARD_DISABLED
+    early return, so switching the guard off never switches draft-only off.
+
     Shared with graph.py's route node so the two stay in parity."""
     if classification != "AUTO" or not reply:
         return ""
-    if (os.environ.get("OUTPUT_GUARD_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+    draft_only = _draft_only_mode()
+    guard_off = (os.environ.get("OUTPUT_GUARD_DISABLED") or "").strip().lower() in ("1", "true", "yes")
+    if guard_off and not draft_only:
         return ""
-    prices = _inventory_cache.get("prices") or set()
-    if not prices:
-        print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
-    reasons = output_guard.check_reply(reply, prices)
+    reasons = []
+    if not guard_off:
+        prices = _inventory_cache.get("prices") or set()
+        if not prices:
+            print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
+        reasons = output_guard.check_reply(reply, prices)
+    if draft_only:
+        reasons.insert(0, DRAFT_ONLY_NOTE)
     if not reasons:
         return ""
     note = "; ".join(reasons)
@@ -7835,10 +8130,8 @@ def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> N
 # INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS: customers often send several photos
 # in a row, and one reply per burst reads better than the same line three
 # times. Extra photos in the window are logged, not answered.
-INSTAGRAM_PHOTO_REPLY = (
-    "I can't view photos here yet — tell me your eye shape or the occasion "
-    "and I'll suggest the right pair!"
-)
+# From the brand file (messages.instagram_photo_reply).
+INSTAGRAM_PHOTO_REPLY = BRAND["messages"]["instagram_photo_reply"]
 INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS = 10 * 60
 
 
@@ -7930,6 +8223,49 @@ def _handle_instagram_photo(sender_id: str, timestamp: str) -> None:
     })
 
 
+# Multi-brand task 3: each brand's copy answers only its own Instagram
+# account. A Meta app connected to more than one account delivers every
+# account's events to every copy's webhook, so without this check a copy
+# would reply to (and pause, and log) another brand's customers.
+#
+# Kill switch: INSTAGRAM_ACCOUNT_FILTER_DISABLED=1/true/yes, read per event
+# like OUTPUT_GUARD_DISABLED.
+_ig_other_accounts_logged: set[str] = set()
+
+
+def _ig_account_filter_disabled() -> bool:
+    value = (os.environ.get("INSTAGRAM_ACCOUNT_FILTER_DISABLED") or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
+def _ig_event_is_ours(sender_id: str, recipient_id: str) -> bool:
+    """Does this messaging event belong to this copy's Instagram account?
+    The same test the echo check below relies on: INSTAGRAM_PAGE_ID is the
+    recipient of a customer's DM to us and the sender of our own echoes.
+    Fails open — no INSTAGRAM_PAGE_ID configured, or the kill switch on,
+    means every event is processed, as before."""
+    if not INSTAGRAM_PAGE_ID or _ig_account_filter_disabled():
+        return True
+    return INSTAGRAM_PAGE_ID in (sender_id, recipient_id)
+
+
+def _ig_skip_other_account(event: dict, sender_id: str, recipient_id: str) -> None:
+    """Log a skipped other-account event: ids only, never the message, and
+    only the first time per other account (its echoes carry the account as
+    sender, everything else as recipient)."""
+    is_echo = bool((event.get("message") or {}).get("is_echo"))
+    account = (sender_id if is_echo else recipient_id) or "(no id)"
+    if account in _ig_other_accounts_logged:
+        return
+    _ig_other_accounts_logged.add(account)
+    print(
+        f"[IG-FILTER] Skipped an event for another Instagram account "
+        f"(sender {sender_id or '(none)'}, recipient {recipient_id or '(none)'}) — "
+        f"neither is INSTAGRAM_PAGE_ID. Further events for account {account} "
+        f"are skipped without logging."
+    )
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -7938,6 +8274,12 @@ def _process_instagram_event(event: dict) -> None:
         recipient_id = ((event.get("recipient") or {}).get("id") or "").strip()
         message = event.get("message") or {}
         text = (message.get("text") or "").strip()
+
+        # 0) ANOTHER ACCOUNT'S EVENT — skipped before anything else, so it
+        # can't be answered, paused or logged as ours (multi-brand task 3).
+        if not _ig_event_is_ours(sender_id, recipient_id):
+            _ig_skip_other_account(event, sender_id, recipient_id)
+            return
 
         # ===== ORDER MATTERS — see below =====
         #
