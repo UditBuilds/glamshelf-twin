@@ -1940,6 +1940,12 @@ def _init_db() -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS ig_sent_mids (mid TEXT PRIMARY KEY, sent_at REAL NOT NULL)"
         )
+        # Latest time of things the daily health message reports on: the
+        # last verified webhook event per channel ("webhook:instagram",
+        # "webhook:whatsapp") and the last DeepSeek 402 ("deepseek_402").
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS health_marks (key TEXT PRIMARY KEY, ts REAL NOT NULL)"
+        )
 
         conn.commit()
         conn.close()
@@ -3815,6 +3821,14 @@ def _handle_telegram_message(msg: dict) -> None:
         })
         return
 
+    # "/health" (or "/health@<bot>" in a group): the daily health message,
+    # now. Built on a thread — it calls DeepSeek and Meta, which mustn't
+    # hold up Telegram's webhook. Also before the edit flow, and works with
+    # DAILY_HEALTH_DISABLED set (that only stops the nightly send).
+    if re.match(r"^[#/]health(@\w+)?\s*$", text, re.IGNORECASE):
+        threading.Thread(target=_send_health_report, args=(chat_id,), daemon=True).start()
+        return
+
     # Find oldest awaiting-edit draft from this chat. If somehow there are
     # multiple, the oldest is the most likely one Udit meant — but in
     # practice there's at most one because hitting Edit removes buttons
@@ -4883,9 +4897,10 @@ def _meta_error(resp) -> dict:
         return {}
 
 
-def _ig_token_basic_check() -> bool | None:
+def _ig_token_basic_check(alert: bool = True) -> bool | None:
     """One cheap authenticated call. True = token works, False = Meta
-    rejected it (alert sent), None = couldn't tell (network / other error)."""
+    rejected it (alert sent, unless alert=False — the daily health
+    message's own probe), None = couldn't tell (network / other error)."""
     try:
         resp = requests.get(
             f"{INSTAGRAM_API_BASE}/me",
@@ -4901,21 +4916,23 @@ def _ig_token_basic_check() -> bool | None:
     err = _meta_error(resp)
     if resp.status_code == 401 or err.get("code") == 190 or err.get("type") == "OAuthException":
         print(f"[TOKEN-CHECK] Instagram token REJECTED: HTTP {resp.status_code} code={err.get('code')}")
-        _ig_token_alert(
-            "🚨 Instagram token REJECTED — Twin can't reply on Instagram\n"
-            f"Meta said: {(err.get('message') or resp.text)[:200]}\n"
-            "Generate a new token and update INSTAGRAM_PAGE_ACCESS_TOKEN on Render.\n"
-            "(Checked daily; this repeats until the token works.)"
-        )
+        if alert:
+            _ig_token_alert(
+                "🚨 Instagram token REJECTED — Twin can't reply on Instagram\n"
+                f"Meta said: {(err.get('message') or resp.text)[:200]}\n"
+                "Generate a new token and update INSTAGRAM_PAGE_ACCESS_TOKEN on Render.\n"
+                "(Checked daily; this repeats until the token works.)"
+            )
         return False
     print(f"[TOKEN-CHECK] Basic check inconclusive: HTTP {resp.status_code} {(err.get('message') or '')[:120]}")
     return None
 
 
-def _ig_token_debug_check(now: float) -> bool | None:
+def _ig_token_debug_check(now: float, alert: bool = True) -> bool | None:
     """Meta's debug_token (needs INSTAGRAM_APP_ID + INSTAGRAM_APP_SECRET).
     True/False as for the basic check; None when debug_token itself
-    couldn't answer — the caller falls back to the basic check."""
+    couldn't answer — the caller falls back to the basic check. alert=False
+    (the daily health message's probe) sends no Telegram alert."""
     try:
         resp = requests.get(
             META_DEBUG_TOKEN_URL,
@@ -4936,12 +4953,13 @@ def _ig_token_debug_check(now: float) -> bool | None:
     if not data.get("is_valid"):
         msg = ((data.get("error") or {}).get("message") or "Meta says the token is not valid")[:200]
         print("[TOKEN-CHECK] Instagram token INVALID per debug_token")
-        _ig_token_alert(
-            "🚨 Instagram token INVALID — Twin can't reply on Instagram\n"
-            f"Meta said: {msg}\n"
-            "Generate a new token and update INSTAGRAM_PAGE_ACCESS_TOKEN on Render.\n"
-            "(Checked daily; this repeats until the token works.)"
-        )
+        if alert:
+            _ig_token_alert(
+                "🚨 Instagram token INVALID — Twin can't reply on Instagram\n"
+                f"Meta said: {msg}\n"
+                "Generate a new token and update INSTAGRAM_PAGE_ACCESS_TOKEN on Render.\n"
+                "(Checked daily; this repeats until the token works.)"
+            )
         return False
     global _ig_token_expires_at
     expires_at = data.get("expires_at") or 0
@@ -4952,7 +4970,7 @@ def _ig_token_debug_check(now: float) -> bool | None:
     days_left = (expires_at - now) / 86400
     date = datetime.fromtimestamp(expires_at, timezone.utc).strftime("%d %b %Y")
     print(f"[TOKEN-CHECK] Instagram token valid, expires {date} ({days_left:.1f} days)")
-    if days_left <= IG_TOKEN_WARN_DAYS:
+    if alert and days_left <= IG_TOKEN_WARN_DAYS:
         _ig_token_alert(
             f"⏳ Instagram token expires in {max(0, int(days_left))} day(s) — {date} (UTC)\n"
             "Renew it and update INSTAGRAM_PAGE_ACCESS_TOKEN on Render before then, "
@@ -6019,11 +6037,18 @@ def ask_claude(
             all_messages.append({"role": "assistant", "content": turn["reply_text"]})
     all_messages.append({"role": "user", "content": user_text})
 
-    message = deepseek_client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=all_messages,
-    )
+    try:
+        message = deepseek_client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=all_messages,
+        )
+    except Exception as e:
+        # 402 = "Insufficient Balance": remembered for the daily health
+        # message, which flags it 🔴. The error still propagates as before.
+        if getattr(e, "status_code", None) == 402:
+            _health_mark("deepseek_402")
+        raise
 
     choice = message.choices[0]
     raw = (choice.message.content or "").strip()
@@ -6434,6 +6459,7 @@ def webhook(token=""):
     if not _verify_wati_token(token):
         print("[WEBHOOK] Rejected: bad or missing WATI token")
         return jsonify({"error": "unauthorized"}), 401
+    _note_webhook_event("whatsapp")
     print("\n" + "=" * 60)
     try:
         # Start timer here so latency_ms covers the entire handler — the
@@ -7020,6 +7046,7 @@ def wati_outbound(token=""):
     if not _verify_wati_token(token):
         print("[OUTBOUND] Rejected: bad or missing WATI token")
         return jsonify({"error": "unauthorized"}), 401
+    _note_webhook_event("whatsapp")
     print("\n" + "=" * 60)
     try:
         data = request.get_json(silent=True) or {}
@@ -7821,6 +7848,7 @@ def instagram_webhook():
     ):
         print("[INSTAGRAM] Rejected: bad or missing X-Hub-Signature-256")
         return jsonify({"error": "unauthorized"}), 401
+    _note_webhook_event("instagram")
     print("\n" + "=" * 60)
     try:
         data = json.loads(raw_body) if raw_body else {}
@@ -8822,6 +8850,586 @@ def dashboard_data():
         print(f"[DASHBOARD] error: {type(e).__name__}: {e}")
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+# ===== Daily health message (Telegram) =====
+#
+# From about 6 to 22 Sep real customers got no replies (expired Instagram
+# token) and nobody noticed; before that, WhatsApp replies died on DeepSeek
+# "402 Insufficient Balance". So every night at DAILY_HEALTH_HOUR_IST (IST,
+# default 22) the Telegram chat gets one short message: 🟢 / 🟡 / 🔴 with
+# the reasons, the brand, the last 24h per channel, when a customer last got
+# a reply, when any webhook event last arrived, the Instagram token and the
+# DeepSeek balance. "/health" in that chat sends the same thing on demand.
+#
+# Scheduling: its own daemon thread, ticking every DAILY_HEALTH_TICK_SECONDS
+# — timer-driven, never request-driven, because a day with zero traffic is
+# exactly the outage day. (It relies on the instance staying up when idle,
+# as the hourly backup loop already does; on a host that sleeps when idle no
+# in-process timer can fire.) A tick sends once the IST hour is reached and
+# today's message hasn't gone out: the day is claimed atomically in
+# scheduled_jobs, so a restart or a second worker can't send it twice, and
+# the claim is released if Telegram refuses the send, so the next tick
+# retries. Kill switch: DAILY_HEALTH_DISABLED=1 (nightly send only).
+#
+# Aggregate numbers only — never a customer name, id or message text.
+# TEST_SENDER_IDS (comma-separated Instagram ids / WhatsApp numbers) keeps
+# the founder's own test accounts out of every customer number.
+DAILY_HEALTH_JOB = "daily_health"
+DAILY_HEALTH_TICK_SECONDS = 5 * 60
+HEALTH_WINDOW_SECONDS = 24 * 60 * 60
+HEALTH_TOKEN_WARN_DAYS = 15
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+DEEPSEEK_BALANCE_TIMEOUT_SECONDS = 15
+DEEPSEEK_CRITICAL_BALANCE_USD = 0.50
+WEBHOOK_MARK_MIN_GAP_SECONDS = 60
+
+
+def _health_env_number(name: str, default, cast, valid):
+    """Optional numeric env var; a bad value logs and falls back to the
+    default instead of stopping the app."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        value = None
+    if value is None or not valid(value):
+        print(f"[HEALTH] {name}={raw!r} isn't valid — using {default}")
+        return default
+    return value
+
+
+DAILY_HEALTH_HOUR_IST = _health_env_number("DAILY_HEALTH_HOUR_IST", 22, int, lambda h: 0 <= h <= 23)
+DEEPSEEK_LOW_BALANCE_USD = _health_env_number(
+    "DEEPSEEK_LOW_BALANCE_USD", 2.0, float, lambda v: 0 <= v < 1_000_000
+)
+
+
+def _daily_health_disabled() -> bool:
+    return (os.environ.get("DAILY_HEALTH_DISABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _health_test_senders() -> tuple[set[str], set[str]]:
+    """TEST_SENDER_IDS as (exact ids, WhatsApp-normalised digits)."""
+    ids = {s.strip() for s in (os.environ.get("TEST_SENDER_IDS") or "").split(",") if s.strip()}
+    return ids, {normalize_wa(s) for s in ids if normalize_wa(s)}
+
+
+# ----- Marks: latest webhook event per channel, latest DeepSeek 402 -----
+_webhook_last_seen: dict[str, float] = {}
+
+
+def _health_mark(key: str, ts: float | None = None) -> None:
+    """Record the latest time of `key` in health_marks. Never raises."""
+    ts = time.time() if ts is None else ts
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO health_marks (key, ts) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET ts = MAX(ts, excluded.ts)",
+            (key, ts),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[HEALTH] Could not record {key}: {type(e).__name__}: {e}")
+
+
+def _health_mark_get(key: str) -> float | None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            row = conn.execute("SELECT ts FROM health_marks WHERE key = ?", (key,)).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[HEALTH] Could not read {key}: {type(e).__name__}: {e}")
+        return None
+
+
+def _note_webhook_event(channel: str) -> None:
+    """A verified webhook event of any kind (message, echo, read receipt,
+    status...) arrived on `channel` — what lets the health message tell "no
+    customers" apart from "webhook broken". Written to the DB at most once a
+    minute per channel. Never raises."""
+    now = time.time()
+    last = _webhook_last_seen.get(channel, 0.0)
+    _webhook_last_seen[channel] = now
+    if now - last >= WEBHOOK_MARK_MIN_GAP_SECONDS:
+        _health_mark(f"webhook:{channel}", now)
+
+
+def _last_webhook_event(channel: str) -> float | None:
+    seen = [t for t in (_health_mark_get(f"webhook:{channel}"), _webhook_last_seen.get(channel)) if t]
+    return max(seen) if seen else None
+
+
+# ----- Counting (last 24h, test senders left out) -----
+# Log rows by type, mirroring the _log_instagram / _log_message call sites.
+# "in": a customer message. "held": deliberately left for the founder
+# (draft, escalation, takeover, rate limit, repeat photo) — never counted as
+# a missed reply. "answer": a real reply the customer got — automatic, or a
+# draft the founder approved. Holding lines are NOT answers: a day of
+# pipeline failures that only sent holding lines must still show 🔴.
+_HEALTH_IG_IN = frozenset({
+    None, "AUTO_FAILED_IG", "DRAFT_PENDING_IG", "ESCALATE_IG", "ESCALATE_HOLDING_IG",
+    "ESCALATE_HOLDING_FAILED_IG", "PIPELINE_HOLDING_IG", "PIPELINE_HOLDING_FAILED_IG",
+    "RATE_LIMITED_IG", "PHOTO_IG", "PHOTO_IG_FAILED", "PHOTO_IG_REPEAT", "LEAD_IG", "LEAD_FAILED_IG",
+})
+_HEALTH_IG_HELD = frozenset({
+    "DRAFT_PENDING_IG", "ESCALATE_IG", "ESCALATE_HOLDING_IG", "ESCALATE_HOLDING_FAILED_IG",
+    "RATE_LIMITED_IG", "PHOTO_IG_REPEAT",
+})
+_HEALTH_IG_AUTO = frozenset({None, "LEAD_IG", "PHOTO_IG"})
+_HEALTH_IG_ESCALATION = frozenset({"ESCALATE_IG", "ESCALATE_HOLDING_IG", "ESCALATE_HOLDING_FAILED_IG"})
+_HEALTH_IG_HOLDING = frozenset({"ESCALATE_HOLDING_IG", "PIPELINE_HOLDING_IG", "DRAFT_HANDOFF_IG"})
+_HEALTH_IG_FAILED = frozenset({
+    "AUTO_FAILED_IG", "ESCALATE_HOLDING_FAILED_IG", "PIPELINE_HOLDING_FAILED_IG", "PHOTO_IG_FAILED",
+    "LEAD_FAILED_IG", "DRAFT_SEND_FAILED_IG", "DRAFT_HANDOFF_FAILED_IG",
+})
+_HEALTH_IG_ERROR = frozenset({"PIPELINE_HOLDING_IG", "PIPELINE_HOLDING_FAILED_IG"})
+_HEALTH_WA_IN = frozenset({
+    "AUTO", "AUTO_FAILED", "DRAFT", "ESCALATE", "ESCALATE_HOLDING_FAILED",
+    "PAUSED", "HUMAN_HANDLING", "ERROR", "RATE_LIMITED",
+})
+_HEALTH_WA_HELD = frozenset({
+    "DRAFT", "ESCALATE", "ESCALATE_HOLDING_FAILED", "PAUSED", "HUMAN_HANDLING", "RATE_LIMITED",
+})
+_HEALTH_WA_FAILED = frozenset({"AUTO_FAILED", "ESCALATE_HOLDING_FAILED", "DRAFT_SEND_FAILED"})
+_HEALTH_STAT_KEYS = ("in", "held", "auto", "approved", "escalations", "holding", "failed", "errors", "err402")
+
+
+def _sqlite_utc(ts: float) -> str:
+    """A unix time in SQLite CURRENT_TIMESTAMP form (instagram_logs.logged_at)."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _health_ig_stats(since: float, until: float, tests: tuple[set[str], set[str]]) -> dict:
+    ids = tests[0]
+    s = dict.fromkeys(_HEALTH_STAT_KEYS, 0)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT sender_id, source, reply_text FROM instagram_logs "
+            "WHERE logged_at >= ? AND logged_at <= ?",
+            (_sqlite_utc(since), _sqlite_utc(until)),
+        ).fetchall()
+    finally:
+        conn.close()
+    for sender, src, reply in rows:
+        if sender in ids:
+            continue
+        s["in"] += src in _HEALTH_IG_IN
+        s["held"] += src in _HEALTH_IG_HELD
+        s["auto"] += src in _HEALTH_IG_AUTO
+        s["approved"] += src == "DRAFT_SENT_IG"
+        s["escalations"] += src in _HEALTH_IG_ESCALATION
+        s["holding"] += src in _HEALTH_IG_HOLDING or (src == "RATE_LIMITED_IG" and bool(reply))
+        s["failed"] += src in _HEALTH_IG_FAILED
+        s["errors"] += src in _HEALTH_IG_ERROR
+    return s
+
+
+def _health_wa_stats(since: float, until: float, tests: tuple[set[str], set[str]]) -> dict:
+    numbers = tests[1]
+    s = dict.fromkeys(_HEALTH_STAT_KEYS, 0)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT wa_id, status, msg_text, reply_text, error FROM message_logs "
+            "WHERE ts >= ? AND ts <= ?",
+            (since, until),
+        ).fetchall()
+    finally:
+        conn.close()
+    for wa_id, status, msg, reply, error in rows:
+        if normalize_wa(wa_id) in numbers:
+            continue
+        # A HUMAN_UDIT row is either the founder's own reply (msg == reply)
+        # or a customer message skipped because the WATI scan found one.
+        skipped_for_founder = status == "HUMAN_UDIT" and (msg or "") != (reply or "")
+        s["in"] += status in _HEALTH_WA_IN or skipped_for_founder
+        s["held"] += status in _HEALTH_WA_HELD or skipped_for_founder
+        s["auto"] += status == "AUTO"
+        s["approved"] += status == "DRAFT_SENT"
+        s["escalations"] += status in ("ESCALATE", "ESCALATE_HOLDING_FAILED")
+        s["holding"] += (status == "ESCALATE" and reply == ESCALATE_FALLBACK_HOLDING_REPLY) or (
+            status == "RATE_LIMITED" and bool(reply)
+        )
+        s["failed"] += status in _HEALTH_WA_FAILED
+        s["errors"] += status == "ERROR"
+        s["err402"] += status == "ERROR" and bool(re.search(r"\b402\b", error or ""))
+    return s
+
+
+def _health_drafts_waiting(now: float, tests: tuple[set[str], set[str]]) -> dict[str, int]:
+    """Drafts still awaiting approval (inside the 24h TTL), per channel."""
+    ids, numbers = tests
+    out = {"instagram": 0, "whatsapp": 0}
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT data FROM pending_drafts WHERE created_at >= ?", (now - PENDING_DRAFT_TTL_SECONDS,)
+        ).fetchall()
+    finally:
+        conn.close()
+    for (data,) in rows:
+        try:
+            draft = json.loads(data)
+        except ValueError:
+            continue
+        who = str(draft.get("customer_number") or "")
+        if draft.get("channel") == "Instagram":
+            out["instagram"] += who not in ids
+        else:
+            out["whatsapp"] += normalize_wa(who) not in numbers
+    return out
+
+
+def _health_last_answer(until: float, tests: tuple[set[str], set[str]]) -> tuple[float | None, str]:
+    """When a customer last got a real reply (automatic, or an approved
+    draft — not a holding line), and on which channel."""
+    ids, numbers = tests
+    best, where = None, ""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        marks = ",".join("?" * len(ids))
+        row = conn.execute(
+            "SELECT MAX(logged_at) FROM instagram_logs "
+            "WHERE (source IS NULL OR source IN ('LEAD_IG', 'PHOTO_IG', 'DRAFT_SENT_IG')) "
+            "AND logged_at <= ?"
+            + (f" AND sender_id NOT IN ({marks})" if ids else ""),
+            (_sqlite_utc(until), *ids),
+        ).fetchone()
+        if row and row[0]:
+            best = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc).timestamp()
+            where = "Instagram"
+        for wa_id, ts in conn.execute(
+            "SELECT wa_id, ts FROM message_logs WHERE status IN ('AUTO', 'DRAFT_SENT') AND ts <= ? "
+            "ORDER BY ts DESC LIMIT 500",
+            (until,),
+        ):
+            if normalize_wa(wa_id) not in numbers:
+                if best is None or ts > best:
+                    best, where = ts, "WhatsApp"
+                break
+    finally:
+        conn.close()
+    return best, where
+
+
+# ----- Instagram token and DeepSeek balance -----
+def _ig_token_health(now: float) -> tuple[str, str]:
+    """("ok" | "warn" | "failed" | "unknown", line). Its own probe with
+    alert=False: the daily token check keeps sending its own alerts."""
+    result, how = None, "basic"
+    if INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET:
+        result, how = _ig_token_debug_check(now, alert=False), "debug"
+    if result is None:
+        result, how = _ig_token_basic_check(alert=False), "basic"
+    if result is False:
+        if how == "debug":
+            return "failed", "Instagram token: INVALID (Meta's token check FAILED)"
+        return "failed", "Instagram token: expiry unknown (basic check FAILED)"
+    if result is None:
+        return "unknown", "Instagram token: couldn't check (Meta didn't answer)"
+    if _ig_token_expires_at:
+        days = (_ig_token_expires_at - now) / 86400
+        date = datetime.fromtimestamp(_ig_token_expires_at, timezone.utc).strftime("%d %b %Y")
+        line = f"Instagram token: {max(0, int(days))} days left (expires {date})"
+        return ("warn" if days < HEALTH_TOKEN_WARN_DAYS else "ok"), line
+    if how == "debug":
+        return "ok", "Instagram token: valid, no expiry date"
+    return "ok", "Instagram token: expiry unknown (basic check OK)"
+
+
+def _deepseek_balance() -> tuple[str, str]:
+    """("ok" | "low" | "critical" | "unknown", line) from DeepSeek's
+    GET /user/balance (api-docs.deepseek.com/api/get-user-balance):
+    {"is_available": bool, "balance_infos": [{"currency": "USD"|"CNY",
+    "total_balance": "12.40", ...}]}. Never raises; never shows the key."""
+    key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not key:
+        return "unknown", "DeepSeek balance: check failed (DEEPSEEK_API_KEY not set)"
+    try:
+        resp = requests.get(
+            DEEPSEEK_BALANCE_URL,
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            timeout=DEEPSEEK_BALANCE_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as e:
+        return "unknown", f"DeepSeek balance: check failed (network error: {type(e).__name__})"
+    if not resp.ok:
+        return "unknown", f"DeepSeek balance: check failed (HTTP {resp.status_code})"
+    try:
+        data = resp.json()
+        infos = [i for i in (data.get("balance_infos") or []) if isinstance(i, dict)]
+        available = data.get("is_available")
+        usd = next((float(i["total_balance"]) for i in infos if i.get("currency") == "USD"), None)
+        others = ", ".join(f"{i.get('total_balance')} {i.get('currency')}" for i in infos)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return "unknown", "DeepSeek balance: check failed (unexpected answer)"
+    too_low = " — DeepSeek says it's too low for API calls" if available is False else ""
+    if usd is None:
+        line = f"DeepSeek balance: {others or 'none'} (no USD balance to compare)"
+        return ("critical" if available is False else "unknown"), line + too_low
+    line = f"DeepSeek balance: ${usd:.2f}" + too_low
+    if available is False or usd < DEEPSEEK_CRITICAL_BALANCE_USD:
+        return "critical", line
+    if usd < DEEPSEEK_LOW_BALANCE_USD:
+        return "low", line
+    return "ok", line
+
+
+# ----- The message -----
+def _health_count(n: int, one: str, many: str | None = None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def _health_ago(seconds: float | None) -> str:
+    if seconds is None:
+        return "none recorded yet"
+    if seconds < 3600:
+        return f"{max(0, int(seconds // 60))} min ago"
+    if seconds < 48 * 3600:
+        return f"{int(seconds // 3600)} h ago"
+    return f"{int(seconds // 86400)} days ago"
+
+
+def _build_health_report(now: float | None = None) -> tuple[str, str]:
+    """("red" | "yellow" | "green", message text).
+
+    🔴 a channel had messages Twin should have answered itself (not held
+       for the founder) and delivered no answer; any send failure; a
+       DeepSeek 402 in the last 24h; the Instagram token check failed; the
+       DeepSeek balance is under $0.50 (or DeepSeek says it's too low).
+    🟡 the token has under 15 days left; the balance is under
+       DEEPSEEK_LOW_BALANCE_USD; a connected channel had no webhook event
+       at all for 24h; reply errors (model trouble) on a channel.
+    A part that can't be read says so in its line instead of failing."""
+    now = time.time() if now is None else now
+    since = now - HEALTH_WINDOW_SECONDS
+    tests = _health_test_senders()
+    red: list[str] = []
+    yellow: list[str] = []
+    lines: list[str] = []
+
+    channels = []
+    if INSTAGRAM_PAGE_ACCESS_TOKEN:
+        channels.append(("instagram", "Instagram", _health_ig_stats))
+    if WATI_API_KEY and WATI_ENDPOINT:
+        channels.append(("whatsapp", "WhatsApp", _health_wa_stats))
+    if not channels:
+        yellow.append("No channel connected (no Instagram token, no WATI)")
+
+    try:
+        waiting = _health_drafts_waiting(now, tests)
+    except Exception as e:
+        print(f"[HEALTH] Pending drafts unreadable: {type(e).__name__}: {e}")
+        waiting = {}
+    err402 = 0
+    for key, name, stats in channels:
+        try:
+            s = stats(since, now, tests)
+        except Exception as e:
+            print(f"[HEALTH] {name} log unreadable: {type(e).__name__}: {e}")
+            lines.append(f"{name}, last 24h: couldn't read the log ({type(e).__name__})")
+            yellow.append(f"{name}: couldn't read the log")
+            continue
+        err402 += s["err402"]
+        unanswered = s["in"] - s["held"]
+        if unanswered > 0 and s["auto"] + s["approved"] == 0:
+            red.append(f"{name}: {_health_count(unanswered, 'message')} needed a reply — none delivered")
+        if s["failed"]:
+            red.append(f"{name}: {_health_count(s['failed'], 'send failure')}")
+        if s["errors"]:
+            yellow.append(f"{name}: {_health_count(s['errors'], 'reply error')} (model trouble)")
+        lines.append(
+            f"{name}, last 24h: {_health_count(s['in'], 'message')} in · "
+            f"{_health_count(s['auto'], 'auto reply', 'auto replies')} · "
+            f"{_health_count(waiting.get(key, 0), 'draft')} waiting · "
+            f"{_health_count(s['approved'], 'draft')} approved · "
+            f"{_health_count(s['escalations'], 'escalation')} · "
+            f"{_health_count(s['holding'], 'holding line')} · "
+            f"{_health_count(s['failed'], 'send failure')}"
+            + (f" · {_health_count(s['errors'], 'reply error')}" if s["errors"] else "")
+        )
+
+    try:
+        last_ts, last_where = _health_last_answer(now, tests)
+        lines.append(
+            "Last reply delivered to a customer: "
+            + (f"{_health_ago(now - last_ts)} ({last_where})" if last_ts else "none on record")
+        )
+    except Exception as e:
+        print(f"[HEALTH] Last reply unreadable: {type(e).__name__}: {e}")
+        lines.append("Last reply delivered to a customer: couldn't read the log")
+
+    if channels:
+        seen = []
+        for key, name, _ in channels:
+            last = _last_webhook_event(key)
+            age = None if last is None else now - last
+            seen.append(f"{name} {_health_ago(age)}")
+            if age is None or age >= HEALTH_WINDOW_SECONDS:
+                yellow.append(f"No {name} webhook event of any kind in 24h")
+        lines.append("Last webhook event of any kind: " + " · ".join(seen))
+
+    last_402 = _health_mark_get("deepseek_402")
+    if err402 or (last_402 and since <= last_402 <= now):
+        red.append('DeepSeek "402 Insufficient Balance" in the last 24h')
+
+    if INSTAGRAM_PAGE_ACCESS_TOKEN:
+        try:
+            state, line = _ig_token_health(now)
+        except Exception as e:
+            state, line = "unknown", f"Instagram token: couldn't check ({type(e).__name__})"
+        lines.append(line)
+        if state == "failed":
+            red.append("Instagram token check FAILED")
+        elif state == "warn":
+            yellow.append(f"Instagram token has under {HEALTH_TOKEN_WARN_DAYS} days left")
+
+    state, line = _deepseek_balance()
+    lines.append(line)
+    if state == "critical":
+        red.append(f"DeepSeek balance under ${DEEPSEEK_CRITICAL_BALANCE_USD:.2f} (or too low to call)")
+    elif state == "low":
+        yellow.append(f"DeepSeek balance under ${DEEPSEEK_LOW_BALANCE_USD:.2f}")
+
+    level = "red" if red else ("yellow" if yellow else "green")
+    icon, word = {"red": ("🔴", "Problem"), "yellow": ("🟡", "Warning"), "green": ("🟢", "All good")}[level]
+    date = datetime.fromtimestamp(now, IST).strftime("%a %d %b %Y")
+    head = [f"{icon} {word} — {BRAND['brand_name']} — {date}"] + [f"• {r}" for r in red + yellow]
+    return level, "\n".join(head + [""] + lines)
+
+
+def _send_health_report(chat_id=None, now: float | None = None) -> bool:
+    """Build and send the health message (to `chat_id`, default the
+    founder's chat). A crash while building still sends a short 🔴 note —
+    a health check that dies silently is the failure this exists to catch.
+    True when Telegram accepted it."""
+    chat = chat_id or TELEGRAM_CHAT_ID
+    if not chat:
+        print("[HEALTH] Not sent: TELEGRAM_CHAT_ID not set")
+        return False
+    try:
+        level, text = _build_health_report(now)
+    except Exception as e:
+        print(f"[HEALTH] Building the report crashed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        level = "red"
+        text = (f"🔴 Problem — {BRAND['brand_name']}\n"
+                f"• The health check itself crashed ({type(e).__name__}). Check the Render logs.")
+    sent = _telegram_api("sendMessage", {"chat_id": chat, "text": text}) is not None
+    print(f"[HEALTH] {level} report {'sent' if sent else 'NOT sent'}")
+    return sent
+
+
+# ----- The nightly schedule -----
+def _ist_date(ts: float):
+    return datetime.fromtimestamp(ts, IST).date()
+
+
+def _daily_health_claim(now: float) -> tuple[bool, float | None]:
+    """Atomically claim today's (IST) nightly message. (claimed, the
+    previous last_run) — not claimed when today's already went out."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.isolation_level = None  # manual transaction control
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT last_run FROM scheduled_jobs WHERE job = ?", (DAILY_HEALTH_JOB,)
+        ).fetchone()
+        prev = row[0] if row else None
+        if prev is not None and _ist_date(prev) == _ist_date(now):
+            conn.execute("ROLLBACK")
+            return False, prev
+        conn.execute(
+            "INSERT INTO scheduled_jobs (job, last_run) VALUES (?, ?) "
+            "ON CONFLICT(job) DO UPDATE SET last_run = excluded.last_run",
+            (DAILY_HEALTH_JOB, now),
+        )
+        conn.execute("COMMIT")
+        return True, prev
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _daily_health_release(now: float, prev: float | None) -> None:
+    """Undo our claim after a failed send, so the next tick retries."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        if prev is None:
+            conn.execute(
+                "DELETE FROM scheduled_jobs WHERE job = ? AND last_run = ?", (DAILY_HEALTH_JOB, now)
+            )
+        else:
+            conn.execute(
+                "UPDATE scheduled_jobs SET last_run = ? WHERE job = ? AND last_run = ?",
+                (prev, DAILY_HEALTH_JOB, now),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[HEALTH] Could not release today's claim: {type(e).__name__}: {e}")
+
+
+def _daily_health_if_due(now: float | None = None) -> bool:
+    """One scheduler tick: send tonight's message if the IST hour is reached
+    and it hasn't gone out today. True when sent. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        if _daily_health_disabled() or not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+            return False
+        if datetime.fromtimestamp(now, IST).hour < DAILY_HEALTH_HOUR_IST:
+            return False
+        claimed, prev = _daily_health_claim(now)
+        if not claimed:
+            return False
+        if not _send_health_report(now=now):
+            _daily_health_release(now, prev)
+            return False
+        # Without a persistent disk a restart restores the DB from the
+        # hourly GitHub backup — back up now so "sent today" survives it.
+        if _github_backup_configured():
+            _backup_db_to_github()
+        return True
+    except Exception as e:
+        print(f"[HEALTH] Daily tick failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _daily_health_loop() -> None:
+    while True:
+        time.sleep(DAILY_HEALTH_TICK_SECONDS)
+        try:
+            _daily_health_if_due()
+        except Exception as e:  # a dead scheduler thread would be a silent outage
+            print(f"[HEALTH] Scheduler tick crashed: {type(e).__name__}: {e}")
+
+
+def _start_daily_health_loop() -> None:
+    if _daily_health_disabled():
+        print("[HEALTH] Daily health message off (DAILY_HEALTH_DISABLED)")
+        return
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("[HEALTH] Daily health message off: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
+        return
+    threading.Thread(target=_daily_health_loop, daemon=True, name="daily-health").start()
+    print(f"[HEALTH] Daily health message at {DAILY_HEALTH_HOUR_IST:02d}:00 IST "
+          f"(checked every {DAILY_HEALTH_TICK_SECONDS // 60} min)")
+
+
+# Last thing at import, so every definition above exists before the first tick.
+_start_daily_health_loop()
 
 
 if __name__ == "__main__":

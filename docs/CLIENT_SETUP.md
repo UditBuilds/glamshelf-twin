@@ -243,6 +243,10 @@ Render restarts the service and replies go out automatically from then on.
 - [ ] Tap ✅ Send as-is: the reply arrives in the DM.
 - [ ] Log in at `https://<service>.onrender.com/` (APP_PASSWORD) and at
       `/dashboard?key=<DASHBOARD_KEY>`. Both pages should show the brand's name.
+- [ ] Send `/health` in the Telegram group: the health message arrives with
+      the brand's name. The boot log shows `[HEALTH] Daily health message at 22:00 IST`,
+      and the same message then arrives every night. Put your own test accounts
+      in `TEST_SENDER_IDS` so they aren't counted as customers.
 
 ---
 
@@ -277,6 +281,9 @@ Leave every kill switch unset unless you're rolling something back.
 | `WATI_BOT_OPERATOR_EMAIL` | WhatsApp only | default `Bot` |
 | `SHOPIFY_WEBHOOK_SECRET` | Optional | Shopify order / shipping webhooks |
 | `LLM_DAILY_CAP` | Optional | default 500 model calls a day |
+| `DAILY_HEALTH_HOUR_IST` | Optional | hour (0–23, IST) of the nightly health message in Telegram; default `22` |
+| `DEEPSEEK_LOW_BALANCE_USD` | Optional | health message turns 🟡 below this DeepSeek balance; default `2` (🔴 below $0.50) |
+| `TEST_SENDER_IDS` | Optional | your own test accounts (Instagram ids / WhatsApp numbers, comma-separated), left out of the health message's customer numbers |
 | `INSTAGRAM_API_BASE` | Leave unset | |
 | `DASHBOARD_DB_PATH` | Leave unset | old name for `DB_PATH` |
 | `OUTPUT_GUARD_DISABLED` | Kill switch | skips the automatic-reply checks (draft-only still holds) |
@@ -285,6 +292,7 @@ Leave every kill switch unset unless you're rolling something back.
 | `SHIPPING_RETRY_DISABLED` | Kill switch | shipping-message retries |
 | `INSTAGRAM_WEBHOOK_VERIFY_DISABLED`, `WATI_WEBHOOK_VERIFY_DISABLED`, `TELEGRAM_WEBHOOK_VERIFY_DISABLED` | Kill switch | webhook verification |
 | `INSTAGRAM_ACCOUNT_FILTER_DISABLED` | Kill switch | process other accounts' events again |
+| `DAILY_HEALTH_DISABLED` | Kill switch | stop the nightly health message (`/health` in Telegram still works) |
 | `TOKEN_AUTO_REFRESH_DISABLED` | Kill switch | stop refreshing the Instagram token (a token already saved from the current env token stays in use; paste a new env token to replace it) |
 
 ---
