@@ -102,6 +102,7 @@ class InstagramCustomerTest(unittest.TestCase):
                          lambda **k: (self.drafts.append(k), True)[1]),
             patch.object(glam, "_llm_admission", lambda *a, **k: None),
             patch.object(glam, "_lookup_recent_order", lambda s: ""),
+            patch.object(glam, "_persist_seen_id", lambda m: None),
             patch.object(glam, "send_telegram_notification", Mock()),
             patch.object(glam, "_alert_send_failure", Mock()),
         ):

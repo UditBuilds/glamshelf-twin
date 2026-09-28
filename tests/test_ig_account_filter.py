@@ -36,6 +36,9 @@ GLAM_ID = "17841400000000001"     # this copy's INSTAGRAM_PAGE_ID
 OTHER_ID = "17841400000000002"    # another brand's account on the same Meta app
 CUSTOMER = "1780000000000311"     # an Instagram-scoped customer id
 CUSTOMER_2 = "1780000000000312"
+# Message ids are made unique per run: app's dedup set persists to a file
+# in the OS temp folder, which outlives a test run.
+RUN = str(time.time_ns())
 
 
 def ts() -> int:
@@ -45,13 +48,13 @@ def ts() -> int:
 def dm(account, customer, text, mid):
     """A customer's DM to `account`."""
     return {"sender": {"id": customer}, "recipient": {"id": account}, "timestamp": ts(),
-            "message": {"mid": mid, "text": text}}
+            "message": {"mid": f"{mid}-{RUN}", "text": text}}
 
 
 def echo(account, customer, text, mid):
     """`account`'s own message to `customer`, echoed back."""
     return {"sender": {"id": account}, "recipient": {"id": customer}, "timestamp": ts(),
-            "message": {"mid": mid, "text": text, "is_echo": True}}
+            "message": {"mid": f"{mid}-{RUN}", "text": text, "is_echo": True}}
 
 
 def read(account, customer):
@@ -88,6 +91,7 @@ class AccountFilterTest(unittest.TestCase):
                          lambda sid, text: (self.sent.append((sid, text)), (True, ""))[1]),
             patch.object(glam, "_llm_admission", lambda *a, **k: None),
             patch.object(glam, "_lookup_recent_order", lambda s: ""),
+            patch.object(glam, "_persist_seen_id", lambda m: None),
             patch.object(glam, "_alert_send_failure", Mock()),
             patch.object(glam, "send_telegram_notification", Mock()),
             patch.object(glam, "_telegram_api", Mock()),
@@ -158,7 +162,7 @@ class AccountFilterTest(unittest.TestCase):
         self.assertIn("[IG-FILTER]", out)
         self.assertIn(OTHER_ID, out)
         self.assertNotIn("my secret order question", out)   # no content in the log
-        self.assertNotIn("m-other-1", glam._seen_ids)       # not even deduped as ours
+        self.assertNotIn(f"m-other-1-{RUN}", glam._seen_ids)   # not even deduped as ours
 
     def test_other_account_echo_does_not_pause_or_log(self):
         out = self.post(echo(OTHER_ID, CUSTOMER, "their founder typed this", "m-other-echo"),
