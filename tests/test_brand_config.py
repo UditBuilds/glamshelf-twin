@@ -6,8 +6,11 @@
     own domain / handle / email / amounts and REJECTS glamshelf.in,
     @glamshelfstore, the Glam Shelf email and Glam Shelf's ₹799;
   - a copy started with BRAND_CONFIG_PATH=brands/example.json uses the
-    example's values everywhere (checked in a fresh process, since the
-    settings are read once at import);
+    example's values everywhere, including its own RAG lookup words and
+    product names (checked in a fresh process, since the settings are read
+    once at import);
+  - a RAG trigger term that doesn't compile, or matches an empty message,
+    stops startup;
   - a broken or missing brand file stops startup — it never falls back to
     Glam Shelf's values;
   - "disabled" (null) review requests / Shopify feed really switch off.
@@ -153,6 +156,30 @@ class BadFileTest(unittest.TestCase):
         data["bot_text_signatures"] = ["hi"]
         self.assert_rejected(data, "too short")
 
+    def test_bad_rag_trigger_term(self):
+        for term, word in (
+            ("candle(s", "not a valid pattern"),
+            ("a)|(b", "not a valid pattern"),   # would break out of the \b(...)\b group
+            ("(s)?", "matches an empty message"),  # would fire a lookup on every message
+            ("", "non-empty text"),
+        ):
+            with self.subTest(term=term):
+                data = self.example()
+                data["rag"]["trigger_terms"] = ["wax", term]
+                self.assert_rejected(data, "rag.trigger_terms[1]", word)
+
+    def test_named_product_needs_terms(self):
+        data = self.example()
+        del data["rag"]["named_products"][0]["terms"]
+        self.assert_rejected(data, "rag.named_products[0].terms", "missing")
+
+    def test_named_products_are_lower_cased(self):
+        data = self.example()
+        data["rag"]["named_products"] = [{"product": "Amber-Woods", "terms": ["Amber Woods", "AW"]}]
+        brand = brand_config.load_brand_config(self.write(data))
+        self.assertEqual(brand["rag"]["named_products"],
+                         [{"product": "amber-woods", "terms": ["amber woods", "aw"]}])
+
     def test_app_refuses_to_start_on_a_missing_file(self):
         result = run_python("import brand_config", BRAND_CONFIG_PATH="brands/no-such-brand.json")
         self.assertNotEqual(result.returncode, 0)
@@ -253,6 +280,11 @@ class ExampleBrandProcessTest(unittest.TestCase):
                 "  'rag_policies': app._RAG_POLICY_SOURCES,\n"
                 "  'signatures': app._BOT_TEXT_SIGNATURES,\n"
                 "  'vision': app.VISION_SYSTEM_PROMPT, 'login': login,\n"
+                "  'rag_hits': {m: bool(app._RAG_TRIGGER_RE.search(m)) for m in (\n"
+                "      'Do the soy candles come in a tin?', 'burn time?', 'Amber Woods scent',\n"
+                "      'refund please', 'where is my shipping', 'hi', 'gs1 lashes', 'which tray')},\n"
+                "  'rag_named': {m: sorted(app._rag_named_products(m)) for m in (\n"
+                "      'Amber Woods or Sea Salt?', 'lavender', 'gs1 half lash', 'hi')},\n"
                 "}))",
                 BRAND_CONFIG_PATH="brands/example.json",
                 DB_PATH=os.path.join(tmp, "test.db"),
@@ -277,6 +309,17 @@ class ExampleBrandProcessTest(unittest.TestCase):
         self.assertIn("Amber Woods Jar Candle", out["vision"])
         self.assertIn("Example Candle Co", out["login"])
         self.assertIn("examplecandle.example", out["login"])
+        # Lookups fire on the candle brand's own words and the shared policy
+        # words — not on Glam Shelf's product words.
+        self.assertEqual(out["rag_hits"], {
+            "Do the soy candles come in a tin?": True, "burn time?": True,
+            "Amber Woods scent": True, "refund please": True,
+            "where is my shipping": True, "hi": False, "gs1 lashes": False, "which tray": False,
+        })
+        self.assertEqual(out["rag_named"], {
+            "Amber Woods or Sea Salt?": ["amber-woods", "sea-salt"], "lavender": ["lavender"],
+            "gs1 half lash": [], "hi": [],
+        })
         for text in (out["lead"], out["photo"], out["allergy"], out["escalate"], out["vision"], out["login"]):
             self.assertNotIn("glam", text.lower())
         # (The login page's logo SVG carries an "eye / lash mark" HTML comment.)

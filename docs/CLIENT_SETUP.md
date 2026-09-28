@@ -68,6 +68,8 @@ The brain is the rulebook Twin answers from.
 | `shopify.products_url` | `https://<store>/products.json`, or `null` if there's no Shopify store | `"https://acme.in/products.json"` |
 | `shopify.prompt_policy_pages` | Policy pages Twin reads live (title + URL), or `[]` | refund, shipping |
 | `shopify.rag_policy_pages` | Policy pages for product/policy lookups, or `[]` | refund, shipping, terms |
+| `rag.trigger_terms` | Product words that make Twin look up product facts before replying. Whole words, any case; `(s)?` makes the s optional. Shipping, refund, cancel and other policy words are built in — don't repeat them. | `["tray(s)?", "classic", "wispy", "glue"]` |
+| `rag.named_products` | When a customer names a product, lookups use only that product's facts. `product` is part of its Shopify handle; `terms` are the phrases customers use for it. `[]` = off. | `[{"product": "classic-tray", "terms": ["classic"]}]` |
 | `pricing.free_shipping_threshold_inr` | Free shipping above this | `999` |
 | `pricing.hard_money_threshold_inr` | Committed orders above this always go to the founder | `2000` |
 | `pricing.bulk_rate_inr`, `bulk_floor_inr`, `bulk_min_units` | Bulk price, lowest bulk price, bulk minimum. A "I'll take N" message with N at or above the minimum goes to the founder. | `699`, `649`, `20` |

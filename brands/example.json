@@ -48,6 +48,18 @@
     "default_carrier": "Example Courier",
     "wati_template_name": "example_shipping_template"
   },
+  "rag": {
+    "_comment": "trigger_terms: product words that make Twin look up product/policy facts before replying (shipping, refund, cancel and other policy words are built in for every brand). Each is a regex fragment matched as a whole word, case-insensitive: 'candle(s)?' = candle or candles. named_products: when a customer names a product, lookups use only that product's facts — 'product' is part of its Shopify handle, 'terms' the phrases that name it.",
+    "trigger_terms": [
+      "candle(s)?", "jar(s)?", "tin(s)?", "wick(s)?", "wax", "soy", "scent(s|ed)?",
+      "fragrance(s)?", "burn(s|ing|t)?", "amber woods", "sea salt", "lavender", "gift ?set(s)?"
+    ],
+    "named_products": [
+      {"product": "amber-woods", "terms": ["amber woods"]},
+      {"product": "sea-salt", "terms": ["sea salt"]},
+      {"product": "lavender", "terms": ["lavender"]}
+    ]
+  },
   "bot_text_signatures": [],
   "_storage_prefix": "Names this copy's files: <prefix>_logs.db (temp-folder DB and the default GITHUB_BACKUP_PATH), <prefix>_seen_ids.txt. Give every brand its own, so brands sharing one backup repo never overwrite each other.",
   "storage_prefix": "examplecandle"

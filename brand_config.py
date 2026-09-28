@@ -90,6 +90,10 @@ SCHEMA = {
         "default_carrier": STR,
         "wati_template_name": STR,
     },
+    "rag": {
+        "trigger_terms": [STR],
+        "named_products": [{"product": STR, "terms": [STR]}],
+    },
     "bot_text_signatures": [STR],
     "storage_prefix": STR,
 }
@@ -173,7 +177,27 @@ def _normalise(data: dict) -> dict:
     links["emails"] = [e.strip().lower() for e in links["emails"]]
     # Matched against lower-cased, whitespace-collapsed message text.
     data["bot_text_signatures"] = [" ".join(s.split()).lower() for s in data["bot_text_signatures"]]
+    # Terms are matched against the lower-cased message; the product part of
+    # a Shopify handle is always lower-case.
+    for entry in data["rag"]["named_products"]:
+        entry["product"] = entry["product"].strip().lower()
+        entry["terms"] = [t.lower() for t in entry["terms"]]
     return data
+
+
+def _check_rag_terms(terms: list) -> None:
+    """rag.trigger_terms are regex fragments joined into one \\b(...)\\b
+    alternation. Each must compile on its own (so its brackets balance and
+    it can't break out of the group) and must not match an empty message,
+    which would fire a lookup on every message."""
+    for i, term in enumerate(terms):
+        where = f"rag.trigger_terms[{i}] {term!r}"
+        try:
+            pattern = re.compile(term, re.IGNORECASE)
+        except re.error as e:
+            raise BrandConfigError(f"{where} is not a valid pattern ({e})") from None
+        if pattern.fullmatch(""):
+            raise BrandConfigError(f"{where} matches an empty message")
 
 
 def resolve_path(raw: str | os.PathLike | None, default: Path) -> Path:
@@ -202,6 +226,7 @@ def load_brand_config(path: str | os.PathLike | None = None) -> dict:
     try:
         _check(data, SCHEMA, "")
         _check_templates(data["messages"])
+        _check_rag_terms(data["rag"]["trigger_terms"])
     except BrandConfigError as e:
         raise BrandConfigError(f"brand settings file {file}: {e}") from None
     for sig in data["bot_text_signatures"]:

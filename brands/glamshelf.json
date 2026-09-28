@@ -53,6 +53,21 @@
     "default_carrier": "Shiprocket",
     "wati_template_name": "shipping_notification_template"
   },
+  "rag": {
+    "_comment": "trigger_terms: product words that make Twin look up product/policy facts before replying (shipping, refund, cancel and other policy words are built in for every brand). Each is a regex fragment matched as a whole word, case-insensitive: 'tray(s)?' = tray or trays. named_products: when a customer names a product, lookups use only that product's facts — 'product' is part of its Shopify handle, 'terms' the phrases that name it.",
+    "trigger_terms": [
+      "gs ?1", "gs ?2", "gs ?3", "kawaii", "clean girl", "mink", "duo", "trio", "tray(s)?", "lash(es)?",
+      "half ?lash(es)?", "band", "glue", "wear(s)?", "reusab\\w*", "material(s)?", "fiber(s)?",
+      "colou?r(s)?", "black", "brown", "shade(s)?"
+    ],
+    "named_products": [
+      {"product": "gs1", "terms": ["gs1", "gs 1"]},
+      {"product": "gs2", "terms": ["gs2", "gs 2"]},
+      {"product": "gs3", "terms": ["gs3", "gs 3", "half lash"]},
+      {"product": "kawaii", "terms": ["kawaii"]},
+      {"product": "clean-girl", "terms": ["clean girl"]}
+    ]
+  },
   "bot_text_signatures": ["glamshelf.in/pages/reviews"],
   "_storage_prefix": "Names this copy's files: <prefix>_logs.db (temp-folder DB and the default GITHUB_BACKUP_PATH), <prefix>_seen_ids.txt. Give every brand its own, so brands sharing one backup repo never overwrite each other.",
   "storage_prefix": "glamshelf"

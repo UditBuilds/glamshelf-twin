@@ -4506,26 +4506,27 @@ _rag_embedder = None  # fastembed TextEmbedding, loaded once at startup; None = 
 
 # Gate: retrieval only fires when the message plausibly overlaps the
 # product/policy corpus. A miss is a hard no-op (no embedding cost).
+# Product words come from the brand file (rag.trigger_terms); these policy
+# words are the same for every brand and always come after them.
+_RAG_POLICY_TRIGGER_TERMS = (
+    r"return(s|ed)?", r"refund(s|ed)?", r"exchange(s|d)?", r"ship(ping|ped|s)?",
+    r"deliver(y|ies|ed)?", r"polic(y|ies)", r"cancel(led|lation)?", r"cod", r"payment(s)?",
+    r"track(ing)?", r"courier", r"damaged?", r"broken", r"replace(ment)?", r"warranty",
+)
 _RAG_TRIGGER_RE = re.compile(
-    r"\b(gs ?1|gs ?2|gs ?3|kawaii|clean girl|mink|duo|trio|tray(s)?|lash(es)?|"
-    r"half ?lash(es)?|band|glue|wear(s)?|reusab\w*|material(s)?|fiber(s)?|"
-    r"colou?r(s)?|black|brown|shade(s)?|"
-    r"return(s|ed)?|refund(s|ed)?|exchange(s|d)?|ship(ping|ped|s)?|"
-    r"deliver(y|ies|ed)?|polic(y|ies)|cancel(led|lation)?|cod|payment(s)?|"
-    r"track(ing)?|courier|damaged?|broken|replace(ment)?|warranty)\b",
+    r"\b(" + "|".join((*BRAND["rag"]["trigger_terms"], *_RAG_POLICY_TRIGGER_TERMS)) + r")\b",
     re.IGNORECASE,
 )
 
 # Specific-product detection for the audit 5.3 wrong-SKU guard: when the
 # customer names a product, product-sourced chunks are restricted to that
-# product (policy chunks always allowed).
-_RAG_NAMED_PRODUCT_TERMS = (
-    ("gs1", "gs1"), ("gs 1", "gs1"),
-    ("gs2", "gs2"), ("gs 2", "gs2"),
-    ("gs3", "gs3"), ("gs 3", "gs3"),
-    ("half lash", "gs3"),
-    ("kawaii", "kawaii"),
-    ("clean girl", "clean-girl"),
+# product (policy chunks always allowed). From the brand file
+# (rag.named_products): (phrase, product) pairs, where product is part of
+# the Shopify handle — matched against the "product:<handle>" chunk source.
+_RAG_NAMED_PRODUCT_TERMS = tuple(
+    (term, entry["product"])
+    for entry in BRAND["rag"]["named_products"]
+    for term in entry["terms"]
 )
 
 
