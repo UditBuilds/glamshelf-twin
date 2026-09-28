@@ -500,9 +500,64 @@ def _clean_meta_token(raw: str) -> str:
     return s
 
 
-INSTAGRAM_PAGE_ACCESS_TOKEN = _clean_meta_token(
-    os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
-)
+_IG_ENV_TOKEN = _clean_meta_token(os.environ.get("INSTAGRAM_PAGE_ACCESS_TOKEN", ""))
+INSTAGRAM_PAGE_ACCESS_TOKEN = _IG_ENV_TOKEN
+
+# ----- Auto-refreshed Instagram token (multi-brand task 5) -----
+#
+# The daily token check refreshes the long-lived token when it has
+# IG_TOKEN_REFRESH_DAYS or fewer left (_ig_token_refresh_if_due). The new
+# token must outlive a restart, and the env var can't be rewritten from
+# here, so it's saved to IG_TOKEN_STORE_PATH: a file next to the SQLite DB
+# on the persistent disk (Glam Shelf: /var/data). NOT inside the DB — the
+# DB file is pushed to GitHub every hour, and a live token must never
+# land in a repo. Refreshing only happens when that folder is real
+# persistent storage (exists, not the temp folder); otherwise it's off.
+#
+# At boot the saved token is used only if it descends from the CURRENT
+# env token (a SHA-256 of the env token is stored beside it). A founder
+# who pastes a new INSTAGRAM_PAGE_ACCESS_TOKEN on Render always wins.
+#
+# Kill switch: TOKEN_AUTO_REFRESH_DISABLED=1 stops refreshing. A token
+# already saved from the current env token stays in use (it's the live
+# one); to stop using it, paste a fresh token into the env var.
+# The token is never printed or sent anywhere but Meta.
+IG_TOKEN_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "instagram_token.json")
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _load_stored_ig_token(env_token: str) -> tuple[str, float]:
+    """(token, expires_at) to use at boot: the saved refreshed token when
+    it was refreshed from `env_token`, else (env_token, 0.0). Never raises."""
+    if not env_token:
+        return env_token, 0.0
+    try:
+        with open(IG_TOKEN_STORE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return env_token, 0.0
+    except Exception as e:
+        print(f"[TOKEN-REFRESH] Saved token unreadable ({type(e).__name__}) — using INSTAGRAM_PAGE_ACCESS_TOKEN")
+        return env_token, 0.0
+    token = _clean_meta_token(str(data.get("access_token") or "")) if isinstance(data, dict) else ""
+    if not token or data.get("env_token_sha256") != _token_fingerprint(env_token):
+        print("[TOKEN-REFRESH] Saved token doesn't come from the current INSTAGRAM_PAGE_ACCESS_TOKEN — using the env token")
+        return env_token, 0.0
+    try:
+        expires_at = float(data.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    when = datetime.fromtimestamp(expires_at, timezone.utc).strftime("%d %b %Y") if expires_at else "unknown"
+    print(f"[TOKEN-REFRESH] Using the auto-refreshed Instagram token (expires {when})")
+    return token, expires_at
+
+
+# Expiry of the token in use, when known: from the saved file at boot,
+# then from each daily debug_token check.
+INSTAGRAM_PAGE_ACCESS_TOKEN, _ig_token_expires_at = _load_stored_ig_token(_IG_ENV_TOKEN)
 
 # Instagram-connected Account ID. Visible in Meta Business Suite under
 # the Instagram account → Account info, or by hitting the /me endpoint
@@ -2469,7 +2524,8 @@ def _redact_secrets(text) -> str:
     text = str(text)
     text = _ACCESS_TOKEN_RE.sub(r"\1<redacted>", text)
     text = _TELEGRAM_BOT_TOKEN_RE.sub(r"\1<redacted>", text)
-    for secret in (INSTAGRAM_PAGE_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN):
+    # The env token too: after an auto-refresh it's no longer the one in use.
+    for secret in (INSTAGRAM_PAGE_ACCESS_TOKEN, _IG_ENV_TOKEN, TELEGRAM_BOT_TOKEN):
         if secret and len(secret) >= 8:
             text = text.replace(secret, "<redacted>")
     return text
@@ -4877,7 +4933,9 @@ def _ig_token_debug_check(now: float) -> bool | None:
             "(Checked daily; this repeats until the token works.)"
         )
         return False
+    global _ig_token_expires_at
     expires_at = data.get("expires_at") or 0
+    _ig_token_expires_at = float(expires_at)   # for _ig_token_refresh_if_due
     if not expires_at:
         print("[TOKEN-CHECK] Instagram token valid, no expiry date")
         return True
@@ -4894,10 +4952,140 @@ def _ig_token_debug_check(now: float) -> bool | None:
     return True
 
 
+IG_TOKEN_REFRESH_URL = "https://graph.instagram.com/refresh_access_token"
+IG_TOKEN_REFRESH_DAYS = 15
+
+
+def _token_auto_refresh_disabled() -> bool:
+    value = (os.environ.get("TOKEN_AUTO_REFRESH_DISABLED") or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
+def _ig_token_store_problem() -> str:
+    """Why a refreshed token couldn't be kept across restarts, or "" when
+    IG_TOKEN_STORE_PATH's folder is real persistent storage."""
+    folder = os.path.dirname(IG_TOKEN_STORE_PATH)
+    if not os.path.isdir(folder):
+        return f"{folder} doesn't exist (no persistent disk?)"
+    real = os.path.normcase(os.path.realpath(folder))
+    temp = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+    if real == temp or real.startswith(temp + os.sep):
+        return f"{folder} is in the temp folder, which a restart wipes (DB_PATH isn't on a persistent disk)"
+    return ""
+
+
+def _save_ig_token(token: str, expires_at: float, now: float) -> bool:
+    """Write the refreshed token next to the DB: owner-only file, written
+    to a temp file and swapped in so a crash never leaves half a token."""
+    tmp = IG_TOKEN_STORE_PATH + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({
+                "access_token": token,
+                "expires_at": expires_at,
+                "refreshed_at": now,
+                "env_token_sha256": _token_fingerprint(_IG_ENV_TOKEN),
+            }, f)
+        os.replace(tmp, IG_TOKEN_STORE_PATH)
+        return True
+    except Exception as e:
+        print(f"[TOKEN-REFRESH] Could not save the refreshed token: {type(e).__name__}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _ig_token_refresh_if_due(now: float) -> None:
+    """Refresh the long-lived Instagram token with Meta's Instagram Login
+    refresh endpoint (GET graph.instagram.com/refresh_access_token,
+    grant_type=ig_refresh_token; the token must be 24h+ old and still
+    valid — always true this close to a 60-day expiry) when
+    IG_TOKEN_REFRESH_DAYS or fewer are left. Called by the daily check
+    right after it confirmed the token works. Telegram alert on success
+    and on failure; the token itself is never printed or alerted. Needs
+    the expiry date (debug_token, i.e. INSTAGRAM_APP_ID + _SECRET, or the
+    saved refresh) and persistent storage; otherwise logs why and skips."""
+    global INSTAGRAM_PAGE_ACCESS_TOKEN, _ig_token_expires_at
+    if _token_auto_refresh_disabled():
+        print("[TOKEN-REFRESH] Off (TOKEN_AUTO_REFRESH_DISABLED)")
+        return
+    if not _ig_token_expires_at:
+        print("[TOKEN-REFRESH] Skipped: expiry date unknown — set INSTAGRAM_APP_ID and "
+              "INSTAGRAM_APP_SECRET so the daily check can read it")
+        return
+    days_left = (_ig_token_expires_at - now) / 86400
+    if days_left > IG_TOKEN_REFRESH_DAYS:
+        return
+    problem = _ig_token_store_problem()
+    if problem:
+        print(f"[TOKEN-REFRESH] Not refreshing: {problem} — a new token wouldn't survive a restart")
+        return
+
+    print(f"[TOKEN-REFRESH] {days_left:.1f} days left — refreshing the Instagram token")
+    failure = ""
+    data: dict = {}
+    try:
+        resp = requests.get(
+            IG_TOKEN_REFRESH_URL,
+            params={"grant_type": "ig_refresh_token", "access_token": INSTAGRAM_PAGE_ACCESS_TOKEN},
+            timeout=INSTAGRAM_TIMEOUT_SECONDS,
+        )
+        try:
+            data = resp.json() or {}
+        except ValueError:
+            data = {}
+        if not resp.ok:
+            err = _meta_error(resp)
+            failure = f"HTTP {resp.status_code}: {(err.get('message') or resp.text or '')[:200]}"
+    except requests.RequestException as e:
+        failure = f"network error ({type(e).__name__})"
+    new_token = _clean_meta_token(str(data.get("access_token") or "")) if isinstance(data, dict) else ""
+    try:
+        expires_in = int(data.get("expires_in") or 0) if isinstance(data, dict) else 0
+    except (TypeError, ValueError):
+        expires_in = 0
+    if not failure and (not new_token or expires_in <= 0):
+        failure = "Meta's answer had no new token"
+    if failure:
+        failure = _redact_secrets(failure)
+        print(f"[TOKEN-REFRESH] FAILED: {failure}")
+        _ig_token_alert(
+            "⚠️ Instagram token auto-refresh FAILED\n"
+            f"{failure}\n"
+            f"The current token still works for about {max(0, int(days_left))} day(s). "
+            "Twin tries again tomorrow; if this keeps failing, generate a new token and "
+            "update INSTAGRAM_PAGE_ACCESS_TOKEN on Render."
+        )
+        return
+
+    new_expires_at = now + expires_in
+    saved = _save_ig_token(new_token, new_expires_at, now)
+    INSTAGRAM_PAGE_ACCESS_TOKEN = new_token
+    _ig_token_expires_at = new_expires_at
+    date = datetime.fromtimestamp(new_expires_at, timezone.utc).strftime("%d %b %Y")
+    print(f"[TOKEN-REFRESH] Refreshed — valid until {date}{'' if saved else ' (NOT saved to disk)'}")
+    if saved:
+        _ig_token_alert(
+            f"✅ Instagram token auto-refreshed — now valid until {date} (UTC).\n"
+            "Nothing to do. (INSTAGRAM_PAGE_ACCESS_TOKEN on Render keeps the old value; "
+            "Twin uses the refreshed one saved on its disk.)"
+        )
+    else:
+        _ig_token_alert(
+            f"⚠️ Instagram token refreshed (valid until {date} UTC) but it could NOT be saved "
+            "to disk. It works until the next restart; after that Twin falls back to "
+            "INSTAGRAM_PAGE_ACCESS_TOKEN. Generate a new token and update it on Render."
+        )
+
+
 def _ig_token_check_if_due(now: float | None = None) -> None:
     """Run the Instagram token check if 24h have passed since the last
     completed one. A check that couldn't reach Meta isn't recorded, so the
-    next hourly tick retries. Never raises."""
+    next hourly tick retries. A token confirmed working is then refreshed
+    if it's close to expiry (_ig_token_refresh_if_due). Never raises."""
     now = time.time() if now is None else now
     try:
         if not INSTAGRAM_PAGE_ACCESS_TOKEN:
@@ -4911,8 +5099,10 @@ def _ig_token_check_if_due(now: float | None = None) -> None:
             result = _ig_token_basic_check()
         if result is not None:
             _job_mark_run(IG_TOKEN_CHECK_JOB, now)
+        if result:
+            _ig_token_refresh_if_due(now)
     except Exception as e:
-        print(f"[TOKEN-CHECK] Check crashed: {type(e).__name__}: {e}")
+        print(f"[TOKEN-CHECK] Check crashed: {type(e).__name__}: {_redact_secrets(e)}")
 
 
 def _start_rag_reindex_loop() -> None:
@@ -6018,6 +6208,14 @@ def healthz():
         "brand": BRAND["brand_name"],
         "brand_config": str(BRAND_CONFIG_FILE),
         "draft_only_mode": _draft_only_mode(),
+        "instagram_token_auto_refresh": (
+            "off (TOKEN_AUTO_REFRESH_DISABLED)" if _token_auto_refresh_disabled()
+            else (f"inactive: {_ig_token_store_problem()}" if _ig_token_store_problem() else "on")
+        ),
+        "instagram_token_expires_at": (
+            datetime.fromtimestamp(_ig_token_expires_at, timezone.utc).isoformat(timespec="seconds")
+            if _ig_token_expires_at else None
+        ),
         "model": DEEPSEEK_MODEL,
         "vision_model": CLAUDE_MODEL,
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),
