@@ -175,12 +175,14 @@ def _normalise(data: dict) -> dict:
 
 
 def resolve_path(raw: str | os.PathLike | None, default: Path) -> Path:
-    """An env-var path: empty -> default; relative -> under the project folder."""
+    """An env-var path: empty -> default; relative -> under the project
+    folder. A path starting with / (e.g. Render's /etc/secrets/<file>)
+    counts as absolute on every OS."""
     text = str(raw or "").strip()
     if not text:
         return default
     path = Path(text)
-    return path if path.is_absolute() else PROJECT_DIR / path
+    return path if path.is_absolute() or path.anchor else PROJECT_DIR / path
 
 
 def load_brand_config(path: str | os.PathLike | None = None) -> dict:

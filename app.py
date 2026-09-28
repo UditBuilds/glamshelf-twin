@@ -38,7 +38,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 import output_guard
-from brand_config import BRAND, BRAND_CONFIG_FILE, BRAND_IS_DEFAULT
+from brand_config import BRAND, BRAND_CONFIG_FILE, BRAND_IS_DEFAULT, resolve_path
 from pricing_rules import (
     ACTION_ESCALATE,
     BULK_MIN_TRAYS,
@@ -110,7 +110,23 @@ app.secret_key = _require_env("SECRET_KEY")
 APP_PASSWORD = _require_env("APP_PASSWORD")
 
 PROJECT_DIR = Path(__file__).parent.resolve()
-BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
+# The brain (multi-brand task 2): BRAIN_FILE_PATH, default brain/brain.md.
+# A relative path is resolved against the project folder. A client brand's
+# brain is uploaded to Render as a Secret File, mounted at
+# /etc/secrets/<filename> — it never goes in this public repo.
+DEFAULT_BRAIN_FILE = PROJECT_DIR / "brain" / "brain.md"
+BRAIN_FILE = resolve_path(os.environ.get("BRAIN_FILE_PATH"), DEFAULT_BRAIN_FILE)
+print(f"[BRAIN] Brain file: {BRAIN_FILE}{'' if BRAIN_FILE.exists() else ' — NOT FOUND'}")
+# A brand's settings and its brain belong together. Half-configured copies
+# run, but say so loudly in the boot log: another brand answering from
+# Glam Shelf's brain (or Glam Shelf's settings with another brain) is the
+# mistake these catch.
+if not BRAND_IS_DEFAULT and BRAIN_FILE.resolve() == DEFAULT_BRAIN_FILE.resolve():
+    print(f"[BRAND] WARNING: settings are for {BRAND['brand_name']} but the brain is the "
+          f"default brain/brain.md (The Glam Shelf's) — set BRAIN_FILE_PATH")
+elif BRAND_IS_DEFAULT and BRAIN_FILE.resolve() != DEFAULT_BRAIN_FILE.resolve():
+    print("[BRAND] WARNING: BRAIN_FILE_PATH is set but BRAND_CONFIG_PATH isn't — replies use "
+          "The Glam Shelf's settings (links, prices, messages, store feed)")
 DEEPSEEK_MODEL = "deepseek-chat"        # all text replies
 CLAUDE_MODEL = "claude-sonnet-4-6"      # vision only (image extraction)
 # Reply output budget (audit T1-3), sized from real replies: the longest of
@@ -5999,6 +6015,8 @@ def healthz():
         "status": status,
         "brain_present": BRAIN_FILE.exists(),
         "brain_path": str(BRAIN_FILE),
+        "brand": BRAND["brand_name"],
+        "brand_config": str(BRAND_CONFIG_FILE),
         "model": DEEPSEEK_MODEL,
         "vision_model": CLAUDE_MODEL,
         "deepseek_api_key_set": bool(os.environ.get("DEEPSEEK_API_KEY", "")),

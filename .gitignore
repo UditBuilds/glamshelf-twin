@@ -32,3 +32,21 @@ diff-review-fastembed-rag-2026-07-05.md
 # Local trace / test report files (audit T2-20) — never commit
 *-trace*.md
 *-test*.md
+
+# Client brand copies (multi-brand) — a client's brain and brand settings
+# live in Render Secret Files, never in this public repo. Only The Glam
+# Shelf's (already public) files and the fake example brand are tracked;
+# `git add` refuses anything else in brands/ or brain/ without -f.
+brands/*
+!brands/glamshelf.json
+!brands/example.json
+brain/*
+!brain/brain.md
+!brain/history/
+*.brain.md
+*.brand.json
+/brain.md
+/brand.json
+secrets/
+# The auto-refreshed Instagram token (lives next to the DB on the disk).
+instagram_token*.json
