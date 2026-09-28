@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.resolve()
@@ -90,6 +91,7 @@ SCHEMA = {
         "wati_template_name": STR,
     },
     "bot_text_signatures": [STR],
+    "storage_prefix": STR,
 }
 
 # Placeholders each message template may use. Checked at load, so a typo
@@ -210,6 +212,13 @@ def load_brand_config(path: str | os.PathLike | None = None) -> dict:
                 f"brand settings file {file}: bot_text_signatures entry {sig!r} "
                 "is too short (8+ characters)"
             )
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", data["storage_prefix"]):
+        # It names files (<prefix>_logs.db, the GitHub backup, the dedup
+        # cache), so it must be a plain, short file-name fragment.
+        raise BrandConfigError(
+            f"brand settings file {file}: storage_prefix {data['storage_prefix']!r} must be "
+            "lower-case letters, digits, - or _ (up to 40)"
+        )
     data = _normalise(data)
     data["_file"] = str(file)
     return data

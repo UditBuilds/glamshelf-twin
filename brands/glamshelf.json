@@ -53,5 +53,7 @@
     "default_carrier": "Shiprocket",
     "wati_template_name": "shipping_notification_template"
   },
-  "bot_text_signatures": ["glamshelf.in/pages/reviews"]
+  "bot_text_signatures": ["glamshelf.in/pages/reviews"],
+  "_storage_prefix": "Names this copy's files: <prefix>_logs.db (temp-folder DB and the default GITHUB_BACKUP_PATH), <prefix>_seen_ids.txt. Give every brand its own, so brands sharing one backup repo never overwrite each other.",
+  "storage_prefix": "glamshelf"
 }

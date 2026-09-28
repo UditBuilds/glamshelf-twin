@@ -321,9 +321,15 @@ OWNER_NUMBER = os.environ.get("OWNER_NUMBER", "")
 # have allowed anyone to access the dashboard if env var were missing.
 DASHBOARD_KEY = _require_env("DASHBOARD_KEY")
 
+# This copy's file names come from the brand file's storage_prefix
+# (multi-brand task 6; Glam Shelf: "glamshelf"), so brands never share a
+# temp-folder DB, a dedup cache or a GitHub backup file.
+STORAGE_PREFIX = BRAND["storage_prefix"]
+BACKUP_FILE_NAME = f"{STORAGE_PREFIX}_logs.db"
+
 # SQLite path for ALL persistent state (message logs, Instagram logs,
 # orders, shipping dedup, paused senders, pending drafts).
-#   - Legacy/local default: <tempdir>/glamshelf_logs.db (ephemeral on Render).
+#   - Legacy/local default: <tempdir>/<prefix>_logs.db (ephemeral on Render).
 #   - Production on Render: set DB_PATH (preferred) or DASHBOARD_DB_PATH
 #     (legacy name, still honored) to a path on a mounted persistent disk,
 #     e.g. /var/data/glamshelf.db. The disk needs to be created in
@@ -333,18 +339,21 @@ DASHBOARD_KEY = _require_env("DASHBOARD_KEY")
 #   - On startup, if a legacy /tmp DB exists and the persistent path is
 #     empty, _init_db() copies the file across once so historical rows
 #     aren't lost when you flip on the persistent disk.
-_LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), "glamshelf_logs.db")
+_LEGACY_DB_PATH = os.path.join(tempfile.gettempdir(), BACKUP_FILE_NAME)
 DB_PATH = (
     os.environ.get("DB_PATH")
     or os.environ.get("DASHBOARD_DB_PATH")
     or _LEGACY_DB_PATH
 )
 
-# GitHub backup config — when all three env vars are set, the SQLite DB
-# is restored from GitHub on cold start (if no local copy) and backed up
-# every BACKUP_INTERVAL_SECONDS thereafter, plus once at startup.
+# GitHub backup config — when GITHUB_TOKEN and GITHUB_REPO are set, the
+# SQLite DB is restored from GitHub on cold start (if no local copy) and
+# backed up every BACKUP_INTERVAL_SECONDS thereafter, plus once at startup.
 # Use a private repo + a token scoped to repo (or "Contents: read/write"
-# on a fine-grained PAT). All three must be set; missing any → skip silently.
+# on a fine-grained PAT). Either one empty → restore, backup and the loop
+# are all skipped (no GitHub call at all). GITHUB_BACKUP_PATH (the file in
+# the repo) defaults to the brand's <prefix>_logs.db, so two brands can
+# share a backup repo without overwriting each other.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-backup
 # Tolerate someone pasting a full URL by mistake — strip the github.com
@@ -353,7 +362,7 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. Uditkumar05ai/glamshelf-
 # by the GitHub Contents API. This is the exact mistake that caused the
 # earlier 404s during initial setup.
 GITHUB_REPO = GITHUB_REPO.replace("https://github.com/", "").rstrip("/")
-GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", "glamshelf_logs.db")
+GITHUB_BACKUP_PATH = os.environ.get("GITHUB_BACKUP_PATH", BACKUP_FILE_NAME)
 BACKUP_INTERVAL_SECONDS = 60 * 60
 
 # Shopify webhook secret — used to HMAC-verify inbound order webhooks at
@@ -623,7 +632,7 @@ WATI_WEBHOOK_TOKEN = os.environ.get("WATI_WEBHOOK_TOKEN", "").strip()
 #   - Not synchronised across multiple gunicorn workers, but Render uses 1
 #     by default. With concurrent workers worst-case is occasional duplicate
 #     processing, not a true loop.
-DEDUP_CACHE_FILE = os.path.join(tempfile.gettempdir(), "glamshelf_seen_ids.txt")
+DEDUP_CACHE_FILE = os.path.join(tempfile.gettempdir(), f"{STORAGE_PREFIX}_seen_ids.txt")
 DEDUP_MAX_AGE_SECONDS = 60 * 60  # 1 hour — long enough to cover the loop window
 
 
@@ -2937,7 +2946,7 @@ def _github_headers() -> dict:
 
 
 def _github_contents_url() -> str:
-    # GITHUB_BACKUP_PATH is a path-within-repo (e.g. "glamshelf_logs.db").
+    # GITHUB_BACKUP_PATH is a path-within-repo (Glam Shelf: "glamshelf_logs.db").
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_BACKUP_PATH}"
 
 
@@ -3014,7 +3023,7 @@ def _backup_db_to_github() -> None:
             print(f"[BACKUP] SHA lookup error ({type(e).__name__}: {e}) — proceeding as create")
 
         payload = {
-            "message": f"auto-backup glamshelf_logs.db @ {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            "message": f"auto-backup {BACKUP_FILE_NAME} @ {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
             "content": content_b64,
         }
         if existing_sha:
