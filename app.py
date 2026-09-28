@@ -7979,6 +7979,49 @@ def _handle_instagram_photo(sender_id: str, timestamp: str) -> None:
     })
 
 
+# Multi-brand task 3: each brand's copy answers only its own Instagram
+# account. A Meta app connected to more than one account delivers every
+# account's events to every copy's webhook, so without this check a copy
+# would reply to (and pause, and log) another brand's customers.
+#
+# Kill switch: INSTAGRAM_ACCOUNT_FILTER_DISABLED=1/true/yes, read per event
+# like OUTPUT_GUARD_DISABLED.
+_ig_other_accounts_logged: set[str] = set()
+
+
+def _ig_account_filter_disabled() -> bool:
+    value = (os.environ.get("INSTAGRAM_ACCOUNT_FILTER_DISABLED") or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
+def _ig_event_is_ours(sender_id: str, recipient_id: str) -> bool:
+    """Does this messaging event belong to this copy's Instagram account?
+    The same test the echo check below relies on: INSTAGRAM_PAGE_ID is the
+    recipient of a customer's DM to us and the sender of our own echoes.
+    Fails open — no INSTAGRAM_PAGE_ID configured, or the kill switch on,
+    means every event is processed, as before."""
+    if not INSTAGRAM_PAGE_ID or _ig_account_filter_disabled():
+        return True
+    return INSTAGRAM_PAGE_ID in (sender_id, recipient_id)
+
+
+def _ig_skip_other_account(event: dict, sender_id: str, recipient_id: str) -> None:
+    """Log a skipped other-account event: ids only, never the message, and
+    only the first time per other account (its echoes carry the account as
+    sender, everything else as recipient)."""
+    is_echo = bool((event.get("message") or {}).get("is_echo"))
+    account = (sender_id if is_echo else recipient_id) or "(no id)"
+    if account in _ig_other_accounts_logged:
+        return
+    _ig_other_accounts_logged.add(account)
+    print(
+        f"[IG-FILTER] Skipped an event for another Instagram account "
+        f"(sender {sender_id or '(none)'}, recipient {recipient_id or '(none)'}) — "
+        f"neither is INSTAGRAM_PAGE_ID. Further events for account {account} "
+        f"are skipped without logging."
+    )
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -7987,6 +8030,12 @@ def _process_instagram_event(event: dict) -> None:
         recipient_id = ((event.get("recipient") or {}).get("id") or "").strip()
         message = event.get("message") or {}
         text = (message.get("text") or "").strip()
+
+        # 0) ANOTHER ACCOUNT'S EVENT — skipped before anything else, so it
+        # can't be answered, paused or logged as ours (multi-brand task 3).
+        if not _ig_event_is_ours(sender_id, recipient_id):
+            _ig_skip_other_account(event, sender_id, recipient_id)
+            return
 
         # ===== ORDER MATTERS — see below =====
         #

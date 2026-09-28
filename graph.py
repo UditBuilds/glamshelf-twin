@@ -18,10 +18,11 @@ routing skeleton; app.py remains the single source of behavior. Parity with
 _process_instagram_event (app.py) is enforced by tests/test_graph_parity.py.
 
 NOT YET WIRED INTO PRODUCTION. app.py does not import this module. To swap
-it in, _process_instagram_event would keep its transport-level steps 1-2
-(page-echo / HUMAN_UDIT_IG detection, is_echo drop, empty-text/sender
-checks) and then call handle_instagram_message() instead of the rest of its
-body. Until then the graph is exercised only by the parity test suite.
+it in, _process_instagram_event would keep its transport-level steps 0-2
+(other-account filter, page-echo / HUMAN_UDIT_IG detection, is_echo drop,
+empty-text/sender checks) and then call handle_instagram_message() instead
+of the rest of its body. Until then the graph is exercised only by the
+parity test suite.
 
 Design notes (full write-ups in the Obsidian vault,
 langgraph-glamshelf-twin.md):
