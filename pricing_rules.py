@@ -15,20 +15,25 @@ Founder-confirmed resolution (July 12, 2026, brain.md v1.10):
   - A commit signal for 20+ trays always escalates (Rule 3b-i — the founder
     finalises every bulk deal), independent of the threshold.
 
-This module is pure (no Flask, no env reads, no I/O) so it can be unit-tested
-in isolation. app.py wires it into the deterministic pre-filter stage of
+The functions are pure (no Flask, no env reads, no I/O) so they can be
+unit-tested in isolation; the three thresholds come from the brand settings
+file (brand_config, read once at import — Glam Shelf's are ₹749 / 20 trays /
+₹1,500). app.py wires it into the deterministic pre-filter stage of
 draft_reply_logic(), where — like the escalation phrase filter — it can only
 UPGRADE the LLM's classification to ESCALATE, never downgrade it.
 """
 
 import re
 
-# Pricing constants — keep in lockstep with brain.md Section 2.
-# ₹749 standard bulk quote (20+ trays); ₹1,500 Hard Money Threshold
-# (strictly above → escalate, per the worked examples in brain.md).
-BULK_RATE_INR = 749
-BULK_MIN_TRAYS = 20
-HARD_MONEY_THRESHOLD_INR = 1500
+from brand_config import BRAND
+
+# Pricing constants — keep the brand file in lockstep with its brain.md
+# Section 2. Glam Shelf: ₹749 standard bulk quote (20+ trays); ₹1,500 Hard
+# Money Threshold (strictly above → escalate, per the worked examples in
+# brain.md).
+BULK_RATE_INR = BRAND["pricing"]["bulk_rate_inr"]
+BULK_MIN_TRAYS = BRAND["pricing"]["bulk_min_units"]
+HARD_MONEY_THRESHOLD_INR = BRAND["pricing"]["hard_money_threshold_inr"]
 
 INTENT_ASK = "ask"
 INTENT_COMMIT = "commit"

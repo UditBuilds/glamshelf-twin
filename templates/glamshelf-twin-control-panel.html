@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GlamShelf Twin Control Panel</title>
+<title>{{ brand_short_name }} Twin Control Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -417,12 +417,12 @@ a, button, [role="button"] { transition: color var(--transition), background var
   <!-- ===== SIDEBAR ===== -->
   <aside class="sidebar">
     <div class="sidebar-logo">
-      <svg class="logo-mark" viewBox="0 0 28 28" fill="none" aria-label="GlamShelf logo">
+      <svg class="logo-mark" viewBox="0 0 28 28" fill="none" aria-label="{{ brand_short_name }} logo">
         <rect width="28" height="28" rx="7" fill="var(--color-primary)"/>
         <path d="M7 14.5 C7 11 9 8.5 13 8.5 L13 11.5 C11 11.5 10 12.5 10 14.5 C10 16.5 11 17.5 13 17.5 L13 20.5 C9 20.5 7 18 7 14.5Z" fill="white"/>
         <path d="M14.5 14.5 L14.5 17.5 L19 17.5 L19 14.5 L16.5 14.5 L16.5 11.5 L19 11.5 L19 8.5 L14.5 8.5 L14.5 11.5 L16.5 11.5 L16.5 14.5Z" fill="white" opacity="0.85"/>
       </svg>
-      <div class="logo-text">GlamShelf <span class="logo-sub">Twin Control Panel</span></div>
+      <div class="logo-text">{{ brand_short_name }} <span class="logo-sub">Twin Control Panel</span></div>
     </div>
 
     <div class="sidebar-section">
@@ -721,7 +721,7 @@ a, button, [role="button"] { transition: color var(--transition), background var
 
 <script>
 // ===== CONFIG =====
-const API_BASE = "https://glamshelf-twin.onrender.com";
+const API_BASE = {{ dashboard_api_base|tojson }};
 // Set your dashboard key here (same as DASHBOARD_KEY env var on Render)
 // In production, pass via URL: ?key=xxxx — read from URL param below
 const urlParams = new URLSearchParams(window.location.search);
@@ -1151,7 +1151,7 @@ function checkBulkSpike(spike) {
 
 // ===== OFFLINE STATE =====
 function renderOfflineState() {
-  document.getElementById("log-feed").innerHTML = `<div class="log-entry err"><span class="log-time">now</span><span class="log-msg">Could not reach glamshelf-twin.onrender.com — server may be sleeping (Render cold start ~30s)</span></div>`;
+  document.getElementById("log-feed").innerHTML = `<div class="log-entry err"><span class="log-time">now</span><span class="log-msg">Could not reach {{ dashboard_host }} — server may be sleeping (Render cold start ~30s)</span></div>`;
 }
 
 // ===== UTILS =====

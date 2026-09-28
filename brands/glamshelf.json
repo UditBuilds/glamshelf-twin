@@ -1,0 +1,57 @@
+{
+  "_comment": "The Glam Shelf — the default brand (used when BRAND_CONFIG_PATH is unset). Every value here is what Twin had hard-coded before multi-brand settings; tests/test_brand_golden.py fails if one drifts. Field guide: docs/CLIENT_SETUP.md.",
+  "brand_name": "The Glam Shelf",
+  "brand_short_name": "GlamShelf",
+  "instagram_handle": "glamshelfstore",
+  "email": "glamshelfstore@gmail.com",
+  "website_domain": "glamshelf.in",
+  "dashboard_api_base": "https://glamshelf-twin.onrender.com",
+  "allowed_links": {
+    "_comment": "Your own website_domain, instagram_handle and email are always allowed in replies. List only OTHER domains / Instagram handles / emails Twin may mention.",
+    "domains": [],
+    "instagram_handles": [],
+    "emails": []
+  },
+  "vision": {
+    "brand_description": "an Indian eyelash brand",
+    "product_singular": "lash",
+    "product_plural": "lashes",
+    "example_product": "GS1 Luxe Light Lash Tray"
+  },
+  "shopify": {
+    "products_url": "https://glamshelf.in/products.json",
+    "prompt_policy_pages": [
+      {"title": "Return & Refund Policy", "url": "https://glamshelf.in/policies/refund-policy"},
+      {"title": "Shipping Policy", "url": "https://glamshelf.in/policies/shipping-policy"}
+    ],
+    "rag_policy_pages": [
+      {"title": "Return & Refund Policy", "url": "https://glamshelf.in/policies/refund-policy"},
+      {"title": "Shipping Policy", "url": "https://glamshelf.in/policies/shipping-policy"},
+      {"title": "Terms of Service", "url": "https://glamshelf.in/policies/terms-of-service"}
+    ]
+  },
+  "pricing": {
+    "free_shipping_threshold_inr": 799,
+    "hard_money_threshold_inr": 1500,
+    "bulk_rate_inr": 749,
+    "bulk_floor_inr": 699,
+    "bulk_min_units": 20,
+    "extra_allowed_inr": [85, 12, 17, 50]
+  },
+  "messages": {
+    "review_request": "Hi {first_name}! Hope you're loving your lashes from The Glam Shelf 🤍\n\nIf you have a minute, a quick review on our website would mean so much to us — it helps other girls find us too!\n\n→ glamshelf.in/pages/reviews\n\nAnd if you've worn them, we'd love to see! Tag us @glamshelfstore on Instagram 🤍\n\n— Team The Glam Shelf",
+    "lead_reply": "Thanks for checking it out! Udit will message you personally 🤍",
+    "allergy_holding_line": "Team The Glam Shelf will personally look into this and get back to you shortly 🤍",
+    "escalate_fallback_holding_reply": "I hear you, and I want this handled properly — I'm bringing it straight to the GlamShelf team, who'll reach out to you personally within the next few hours.",
+    "instagram_photo_reply": "I can't view photos here yet — tell me your eye shape or the occasion and I'll suggest the right pair!",
+    "shipped_intro": "Hi {first_name}! Your The Glam Shelf order #{order_number} has been shipped 🤍",
+    "out_for_delivery": "Hi {first_name}! Your The Glam Shelf order #{order_number} is out for delivery today 🤍\n\nKeep an eye out — it'll be at your door soon!",
+    "delivered": "Hi {first_name}! Your order #{order_number} has been delivered 🤍\n\nHope you love your lashes! If you have any questions about how to use them, just message us here."
+  },
+  "shipping": {
+    "tracking_url_prefix": "https://shiprocket.in/tracking/",
+    "default_carrier": "Shiprocket",
+    "wati_template_name": "shipping_notification_template"
+  },
+  "bot_text_signatures": ["glamshelf.in/pages/reviews"]
+}

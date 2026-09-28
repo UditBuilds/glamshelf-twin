@@ -1,0 +1,603 @@
+{
+  "app": {
+    "VISION_SYSTEM_PROMPT": "You are analyzing a customer image for The Glam Shelf, an Indian eyelash brand. Identify what kind of image it is and extract whatever's useful.\n\nFIRST, classify the image into ONE of:\n- \"order_screenshot\" → screenshot of an order confirmation, payment receipt, tracking page, invoice, or anything order-related\n- \"eye_photo\" → a close-up of a customer's eye(s) or face showing eyes — they're asking for a lash recommendation based on their eye shape\n- \"product_photo\" → a photo of lashes (ours or competitor's), a swatch, or makeup look reference\n- \"other\" → anything else (selfie without eyes visible, food, random scene, blurry, etc.)\n\nTHEN extract the relevant fields based on image_type:\n\nFor order_screenshot: order_id, payment_status, amount, product, customer_name, date.\nFor eye_photo: eye_shape (one of: \"hooded\", \"monolid\", \"almond\", \"round\", \"downturned\", or null if unclear).\nFor product_photo: product — the lash style / product name if you can identify it (ours or a\ncompetitor's), else null. Leave the order fields null.\nFor other: leave extraction fields null.\n\nRespond ONLY in this JSON format (always include every key — use null when not applicable):\n{\n  \"image_type\": \"order_screenshot\" | \"eye_photo\" | \"product_photo\" | \"other\",\n  \"order_id\": \"1042\" or null,\n  \"payment_status\": \"paid\" or null,\n  \"amount\": \"849\" or null,\n  \"product\": \"GS1 Luxe Light Lash Tray\" or null,\n  \"customer_name\": \"Priya\" or null,\n  \"eye_shape\": \"hooded\" or null,\n  \"confidence\": \"high\" or \"low\"\n}\n\nConfidence is about image_type, NOT about how much you managed to extract. Use \"high\" whenever you're\ngenuinely sure what kind of image this is — a clear photo of lashes is high confidence even if you can't\nname the product, and a clear eye close-up is high confidence even if the eye shape is unreadable. Set\n\"low\" only when the image is too blurry/dark to make out or you genuinely can't tell which category it\nfalls into; then return your best guess for image_type and leave extraction fields null.",
+    "FALLBACK_VISION_REPLY": "Thanks for sharing! Could you tell me a little more about what you're looking for? 🤍",
+    "PRODUCT_PHOTO_REPLY": "Got your photo! 🤍 Could you tell me which style you're after, or where you spotted it, so I can help you order the right one?",
+    "SHOPIFY_PRODUCTS_URL": "https://glamshelf.in/products.json",
+    "REVIEW_REQUEST_TEMPLATE": "Hi {first_name}! Hope you're loving your lashes from The Glam Shelf 🤍\n\nIf you have a minute, a quick review on our website would mean so much to us — it helps other girls find us too!\n\n→ glamshelf.in/pages/reviews\n\nAnd if you've worn them, we'd love to see! Tag us @glamshelfstore on Instagram 🤍\n\n— Team The Glam Shelf",
+    "_BOT_TEXT_SIGNATURES": [
+      "shiprocket.in/tracking",
+      "here's your tracking link",
+      "glamshelf.in/pages/reviews"
+    ],
+    "ESCALATE_FALLBACK_HOLDING_REPLY": "I hear you, and I want this handled properly — I'm bringing it straight to the GlamShelf team, who'll reach out to you personally within the next few hours.",
+    "ALLERGY_SAFETY_TEXT": "I'm really sorry to hear this. Please stop using the product immediately and consult a doctor.",
+    "ALLERGY_HOLDING_REPLY": "I'm really sorry to hear this. Please stop using the product immediately and consult a doctor. Team The Glam Shelf will personally look into this and get back to you shortly 🤍",
+    "LEAD_REPLY": "Thanks for checking it out! Udit will message you personally 🤍",
+    "INSTAGRAM_PHOTO_REPLY": "I can't view photos here yet — tell me your eye shape or the occasion and I'll suggest the right pair!",
+    "BRAIN_HOLDING_LINE": "I've passed this to the team — they'll reply to you here 🤍",
+    "RATE_LIMIT_NOTICE": "Thanks! The team will reply to you here shortly.",
+    "_POLICY_PROMPT_PAGES": [
+      [
+        "Return & Refund Policy",
+        "https://glamshelf.in/policies/refund-policy"
+      ],
+      [
+        "Shipping Policy",
+        "https://glamshelf.in/policies/shipping-policy"
+      ]
+    ],
+    "_RAG_POLICY_SOURCES": [
+      [
+        "Return & Refund Policy",
+        "https://glamshelf.in/policies/refund-policy"
+      ],
+      [
+        "Shipping Policy",
+        "https://glamshelf.in/policies/shipping-policy"
+      ],
+      [
+        "Terms of Service",
+        "https://glamshelf.in/policies/terms-of-service"
+      ]
+    ],
+    "BRAIN_FILE": "brain/brain.md",
+    "DEDUP_CACHE_FILE": "glamshelf_seen_ids.txt",
+    "_LEGACY_DB_PATH": "glamshelf_logs.db",
+    "GITHUB_BACKUP_PATH": "glamshelf_logs.db",
+    "ALLOWED_PRICES_PATH": "/var/data/allowed_prices.json"
+  },
+  "output_guard": {
+    "FREE_SHIPPING_THRESHOLD_INR": 799,
+    "BULK_FLOOR_INR": 699,
+    "FIXED_ALLOWED_INR": [
+      12,
+      17,
+      50,
+      85,
+      699,
+      749,
+      799,
+      1500
+    ],
+    "BRAND_EMAIL": "glamshelfstore@gmail.com",
+    "BRAND_HANDLE": "glamshelfstore",
+    "MAX_ORDER_ITEMS": 6,
+    "verdicts": [
+      [
+        "GS1 is ₹849 and ships free above ₹799 🤍",
+        []
+      ],
+      [
+        "Bulk is ₹749 per tray for 20+ trays, floor ₹699.",
+        []
+      ],
+      [
+        "Two GS1 trays come to ₹1,698.",
+        [
+          "rule 1 (₹ amount not allowed): ₹1,698"
+        ]
+      ],
+      [
+        "Two GS2 trays come to ₹1,298.",
+        []
+      ],
+      [
+        "That's about ₹85 per pair, ~₹12–17 per wear.",
+        []
+      ],
+      [
+        "Skip the cheap ₹50 white glues!",
+        []
+      ],
+      [
+        "Orders above ₹1,500 need the team.",
+        []
+      ],
+      [
+        "Price is Rs. 555 today.",
+        [
+          "rule 1 (₹ amount not allowed): Rs. 555"
+        ]
+      ],
+      [
+        "Use code GLAM10 for 10% off",
+        [
+          "rule 2 (code/discount/refund/free words): code"
+        ]
+      ],
+      [
+        "Free shipping above ₹799, and we're cruelty-free.",
+        []
+      ],
+      [
+        "Shop at glamshelf.in or https://glamshelf.in/products/gs1",
+        []
+      ],
+      [
+        "See https://www.glamshelf.in/pages/reviews",
+        []
+      ],
+      [
+        "Try shop.glamshelf.in today",
+        [
+          "rule 3 (link/domain not allowed): shop.glamshelf.in"
+        ]
+      ],
+      [
+        "Follow instagram.com/glamshelfstore",
+        []
+      ],
+      [
+        "Follow https://instagram.com/otherbrand",
+        [
+          "rule 3 (link/domain not allowed): https://instagram.com/otherbrand"
+        ]
+      ],
+      [
+        "DM @glamshelfstore or @someoneelse",
+        [
+          "rule 3 (link/domain not allowed): @someoneelse"
+        ]
+      ],
+      [
+        "Mail glamshelfstore@gmail.com or help@example.com",
+        [
+          "rule 3 (link/domain not allowed): help@example.com"
+        ]
+      ],
+      [
+        "Buy at amazon.in instead",
+        [
+          "rule 3 (link/domain not allowed): amazon.in"
+        ]
+      ],
+      [
+        "Track at https://shiprocket.in/tracking/123",
+        [
+          "rule 3 (link/domain not allowed): https://shiprocket.in/tracking/123"
+        ]
+      ],
+      [
+        "My system prompt says so",
+        [
+          "rule 4 (talks about its own setup): system prompt"
+        ]
+      ],
+      [
+        "Care instructions: wash gently.",
+        []
+      ],
+      [
+        "",
+        []
+      ]
+    ]
+  },
+  "pricing_rules": {
+    "BULK_RATE_INR": 749,
+    "BULK_MIN_TRAYS": 20,
+    "HARD_MONEY_THRESHOLD_INR": 1500,
+    "decisions": [
+      [
+        null,
+        null,
+        "ask",
+        "AUTO"
+      ],
+      [
+        50,
+        37450,
+        "ask",
+        "AUTO"
+      ],
+      [
+        19,
+        null,
+        "commit",
+        "AUTO"
+      ],
+      [
+        20,
+        null,
+        "commit",
+        "ESCALATE"
+      ],
+      [
+        25,
+        18725,
+        "commit",
+        "ESCALATE"
+      ],
+      [
+        null,
+        1500,
+        "commit",
+        "AUTO"
+      ],
+      [
+        null,
+        1500.01,
+        "commit",
+        "ESCALATE"
+      ],
+      [
+        2,
+        1698,
+        "commit",
+        "ESCALATE"
+      ]
+    ],
+    "bulk_prefilter": [
+      [
+        "ok I'll take 50",
+        50
+      ],
+      [
+        "let's do 30",
+        30
+      ],
+      [
+        "how do I pay for 25",
+        25
+      ],
+      [
+        "I'll take 19",
+        null
+      ],
+      [
+        "I'll take 20",
+        20
+      ],
+      [
+        "how much for 40 trays",
+        null
+      ]
+    ]
+  },
+  "rendered": {
+    "review": [
+      {
+        "wa_id": "919876543210",
+        "text": "Hi Priya! Hope you're loving your lashes from The Glam Shelf 🤍\n\nIf you have a minute, a quick review on our website would mean so much to us — it helps other girls find us too!\n\n→ glamshelf.in/pages/reviews\n\nAnd if you've worn them, we'd love to see! Tag us @glamshelfstore on Instagram 🤍\n\n— Team The Glam Shelf"
+      },
+      {
+        "wa_id": "919876543210",
+        "text": "Hi there! Hope you're loving your lashes from The Glam Shelf 🤍\n\nIf you have a minute, a quick review on our website would mean so much to us — it helps other girls find us too!\n\n→ glamshelf.in/pages/reviews\n\nAnd if you've worn them, we'd love to see! Tag us @glamshelfstore on Instagram 🤍\n\n— Team The Glam Shelf"
+      }
+    ],
+    "shipping": [
+      {
+        "via": "template",
+        "wa_id": "919876543210",
+        "template_name": "shipping_notification_template",
+        "parameters": [
+          {
+            "name": "name",
+            "value": "Priya"
+          },
+          {
+            "name": "order_number",
+            "value": "#1042"
+          },
+          {
+            "name": "tracking_number",
+            "value": "TRK1"
+          },
+          {
+            "name": "carrier",
+            "value": "Shiprocket"
+          },
+          {
+            "name": "tracking_url",
+            "value": "TRK1"
+          }
+        ]
+      },
+      {
+        "via": "template",
+        "wa_id": "919876543210",
+        "template_name": "shipping_notification_template",
+        "parameters": [
+          {
+            "name": "name",
+            "value": "Priya"
+          },
+          {
+            "name": "order_number",
+            "value": "#1042"
+          },
+          {
+            "name": "tracking_number",
+            "value": "TRK2"
+          },
+          {
+            "name": "carrier",
+            "value": "Delhivery"
+          },
+          {
+            "name": "tracking_url",
+            "value": "TRK2"
+          }
+        ]
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "shipped",
+        "order_number": "1042",
+        "also_mark": [
+          "tracking"
+        ],
+        "message": "Hi Priya! Your The Glam Shelf order #1042 has been shipped 🤍\n\nTracking: https://shiprocket.in/tracking/TRK2\nCarrier: Delhivery\n\nFeel free to reach out if you need anything!"
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "shipped",
+        "order_number": "1042",
+        "also_mark": [],
+        "message": "Hi Priya! Your The Glam Shelf order #1042 has been shipped 🤍\n\nEstimated delivery: 2026-10-01\n\nFeel free to reach out if you need anything!"
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "tracking",
+        "order_number": "1042",
+        "also_mark": [],
+        "message": "Hi Priya! Here's your tracking link for order #1042 🤍\n\nTrack your order: https://shiprocket.in/tracking/TRK3\n\nFeel free to reach out if you need anything!"
+      },
+      {
+        "via": "template",
+        "wa_id": "919876543210",
+        "template_name": "shipping_notification_template",
+        "parameters": [
+          {
+            "name": "name",
+            "value": "Priya"
+          },
+          {
+            "name": "order_number",
+            "value": "#1042"
+          },
+          {
+            "name": "tracking_number",
+            "value": "TRK3"
+          },
+          {
+            "name": "carrier",
+            "value": "Shiprocket"
+          },
+          {
+            "name": "tracking_url",
+            "value": "TRK3"
+          }
+        ]
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "shipped",
+        "order_number": "1042",
+        "also_mark": [
+          "tracking"
+        ],
+        "message": "Hi Priya! Your The Glam Shelf order #1042 has been shipped 🤍\n\nTracking: https://shiprocket.in/tracking/TRK3\n\nFeel free to reach out if you need anything!"
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "out_for_delivery",
+        "order_number": "1042",
+        "also_mark": [],
+        "message": "Hi Priya! Your The Glam Shelf order #1042 is out for delivery today 🤍\n\nKeep an eye out — it'll be at your door soon!"
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "delivered",
+        "order_number": "1042",
+        "also_mark": [],
+        "message": "Hi Priya! Your order #1042 has been delivered 🤍\n\nHope you love your lashes! If you have any questions about how to use them, just message us here."
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "delivered",
+        "order_number": "1042",
+        "also_mark": [],
+        "message": "Hi there! Your order #1042 has been delivered 🤍\n\nHope you love your lashes! If you have any questions about how to use them, just message us here."
+      },
+      {
+        "via": "template",
+        "wa_id": "919876543210",
+        "template_name": "shipping_notification_template",
+        "parameters": [
+          {
+            "name": "name",
+            "value": "Asha"
+          },
+          {
+            "name": "order_number",
+            "value": "#1043"
+          },
+          {
+            "name": "tracking_number",
+            "value": "TRK9"
+          },
+          {
+            "name": "carrier",
+            "value": "Bluedart"
+          },
+          {
+            "name": "tracking_url",
+            "value": "TRK9"
+          }
+        ]
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "shipped",
+        "order_number": "1043",
+        "also_mark": [
+          "tracking"
+        ],
+        "message": "Hi Asha! Your The Glam Shelf order #1043 has been shipped 🤍\n\nTracking: https://shiprocket.in/tracking/TRK9\nCarrier: Bluedart\n\nFeel free to reach out if you need anything!"
+      },
+      {
+        "via": "template",
+        "wa_id": "919876543210",
+        "template_name": "shipping_notification_template",
+        "parameters": [
+          {
+            "name": "name",
+            "value": "Asha"
+          },
+          {
+            "name": "order_number",
+            "value": "#1043"
+          },
+          {
+            "name": "tracking_number",
+            "value": "TRK9"
+          },
+          {
+            "name": "carrier",
+            "value": "Bluedart"
+          },
+          {
+            "name": "tracking_url",
+            "value": "TRK9"
+          }
+        ]
+      },
+      {
+        "via": "session",
+        "wa_id": "919876543210",
+        "event": "shipped",
+        "order_number": "1043",
+        "also_mark": [],
+        "message": "Hi Asha! Your The Glam Shelf order #1043 has been shipped 🤍\n\nCarrier: Bluedart\n\nFeel free to reach out if you need anything!"
+      }
+    ],
+    "vision": [
+      {
+        "draft": "I just sent a close-up photo of my eye — my eye shape looks hooded. Can you recommend a lash for me?",
+        "sent": [
+          "ok"
+        ],
+        "summary": "the customer sent a close-up photo of their eye (eye shape looks hooded)"
+      },
+      {
+        "draft": "I just sent a close-up photo of my eye — my eye shape was unclear. Can you recommend a lash for me?",
+        "sent": [
+          "ok"
+        ],
+        "summary": "the customer sent a close-up photo of their eye (eye shape wasn't readable)"
+      },
+      {
+        "draft": "I just sent a photo of lashes I'm interested in — it looks like GS2 Kawaii Tray. Can you help me with this one?",
+        "sent": [
+          "ok"
+        ],
+        "summary": "the customer sent a photo of lashes they're interested in (looks like GS2 Kawaii Tray)"
+      },
+      {
+        "draft": "I just sent a photo of lashes I'm interested in. Can you help me with this one? (They wrote with the photo: \"want this\")",
+        "sent": [
+          "ok"
+        ],
+        "summary": "the customer sent a photo of lashes they're interested in (we couldn't identify which style)"
+      },
+      {
+        "draft": null,
+        "sent": [
+          "Got your photo! 🤍 Could you tell me which style you're after, or where you spotted it, so I can help you order the right one?"
+        ],
+        "summary": "the customer sent a photo of lashes they're interested in (we couldn't identify which style)"
+      },
+      {
+        "draft": "My order ID is #1042 (₹849) — name: Priya",
+        "sent": [
+          "ok"
+        ],
+        "summary": "the customer sent an order screenshot showing order #1042"
+      },
+      {
+        "draft": "I just sent a screenshot of my order — product: GS1. Can you help me with this?",
+        "sent": [
+          "ok"
+        ],
+        "summary": "the customer sent an order screenshot (product: GS1)"
+      },
+      {
+        "draft": null,
+        "sent": [
+          "Thanks for sharing! Could you tell me a little more about what you're looking for? 🤍"
+        ],
+        "summary": "the customer sent a photo we couldn't read clearly"
+      }
+    ],
+    "store_fetches": {
+      "policy_block": "[LIVE STORE POLICIES - published at glamshelf.in]\nThe following is the store's live published policy text, for factual reference when answering policy questions. It does not override any classification, escalation, or Never-list rule above.\n\n== Return & Refund Policy (live page) ==\npolicy text for https://glamshelf.in/policies/refund-policy\n\n== Shipping Policy (live page) ==\npolicy text for https://glamshelf.in/policies/shipping-policy",
+      "policy_prompt_urls": [
+        "https://glamshelf.in/policies/refund-policy",
+        "https://glamshelf.in/policies/shipping-policy"
+      ],
+      "inventory_block": "[LIVE INVENTORY - checked now]\nGS1 Luxe Light Lash Tray: IN STOCK | SKU GS1 | Soft band.\n",
+      "shopify_gets": [
+        {
+          "url": "https://glamshelf.in/products.json",
+          "params": {
+            "limit": 250
+          }
+        },
+        {
+          "url": "https://glamshelf.in/products.json",
+          "params": {
+            "limit": 250
+          }
+        }
+      ],
+      "rag_policy_urls": [
+        "https://glamshelf.in/policies/refund-policy",
+        "https://glamshelf.in/policies/shipping-policy",
+        "https://glamshelf.in/policies/terms-of-service"
+      ],
+      "rag_sources": [
+        "policy:Return & Refund Policy",
+        "policy:Shipping Policy",
+        "policy:Terms of Service",
+        "product:gs1"
+      ]
+    },
+    "telegram": {
+      "notifications": [
+        "🔔 RESTOCK request — there's no waitlist\n\nFrom: Instagram DM — sender 1\n\nThey said:\n\"when is it back?\"\n\nTwin replied:\n\"reply\"\n\n→ Twin pointed them to @glamshelfstore. Reach out from your Instagram DMs if you want to.",
+        "📦 ORDER question — Twin can't see orders or tracking\n\nFrom: Instagram DM — sender 1\n\nThey said:\n\"when is it back?\"\n\nTwin replied:\n\"reply\"\n\n→ Reply with the real status from your Instagram DMs."
+      ],
+      "photo_notice": [
+        "📷 Instagram photo from sender 17800000000000001\nTwin can't view photos, so it asked them for their eye shape or the occasion.\nOpen the DM to see the photo."
+      ]
+    },
+    "backup": {
+      "url": "https://api.github.com/repos/o/r/contents/glamshelf_logs.db",
+      "message_prefix": "auto-backup glamshelf_logs.db"
+    },
+    "pages": {
+      "login": {
+        "status": 200,
+        "sha256": "afe97cf71e5cc07e4b810ed327c27a5e477182b022f95baa35436f54b53dd367"
+      },
+      "index": {
+        "status": 200,
+        "sha256": "72044f69d1977dee627ae0bf5692ed8cbb563426726b95a166ba81a270f0b7d8"
+      },
+      "dashboard": {
+        "status": 200,
+        "sha256": "f3c93c23afcc974aa886e26e8abfcb85297213a8115f9ec8c00c9dcf50394703"
+      }
+    }
+  }
+}

@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from html import unescape
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from openai import OpenAI
@@ -37,6 +38,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 import output_guard
+from brand_config import BRAND, BRAND_CONFIG_FILE, BRAND_IS_DEFAULT
 from pricing_rules import (
     ACTION_ESCALATE,
     BULK_MIN_TRAYS,
@@ -70,6 +72,11 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 app = Flask(__name__)
+
+# Per-brand settings (brand_config.py): BRAND_CONFIG_PATH, default
+# brands/glamshelf.json. Logged so Render shows which brand this copy is.
+print(f"[BRAND] {BRAND['brand_name']} — settings from {BRAND_CONFIG_FILE}"
+      f"{'' if BRAND_IS_DEFAULT else ' (BRAND_CONFIG_PATH)'}")
 
 
 def _require_env(name: str) -> str:
@@ -130,36 +137,41 @@ MAX_TOKENS = 400
 VISION_MAX_TOKENS = 512                # extraction output is short JSON
 VISION_DOWNLOAD_TIMEOUT_SECONDS = 10   # per spec — give up fast on slow WATI media
 
-VISION_SYSTEM_PROMPT = """You are analyzing a customer image for The Glam Shelf, an Indian eyelash brand. Identify what kind of image it is and extract whatever's useful.
+# Brand words come from the brand file's "vision" block (Glam Shelf: "an
+# Indian eyelash brand", lash / lashes, "GS1 Luxe Light Lash Tray").
+_PRODUCT = BRAND["vision"]["product_singular"]
+_PRODUCTS = BRAND["vision"]["product_plural"]
+
+VISION_SYSTEM_PROMPT = f"""You are analyzing a customer image for {BRAND["brand_name"]}, {BRAND["vision"]["brand_description"]}. Identify what kind of image it is and extract whatever's useful.
 
 FIRST, classify the image into ONE of:
 - "order_screenshot" → screenshot of an order confirmation, payment receipt, tracking page, invoice, or anything order-related
-- "eye_photo" → a close-up of a customer's eye(s) or face showing eyes — they're asking for a lash recommendation based on their eye shape
-- "product_photo" → a photo of lashes (ours or competitor's), a swatch, or makeup look reference
+- "eye_photo" → a close-up of a customer's eye(s) or face showing eyes — they're asking for a {_PRODUCT} recommendation based on their eye shape
+- "product_photo" → a photo of {_PRODUCTS} (ours or competitor's), a swatch, or makeup look reference
 - "other" → anything else (selfie without eyes visible, food, random scene, blurry, etc.)
 
 THEN extract the relevant fields based on image_type:
 
 For order_screenshot: order_id, payment_status, amount, product, customer_name, date.
 For eye_photo: eye_shape (one of: "hooded", "monolid", "almond", "round", "downturned", or null if unclear).
-For product_photo: product — the lash style / product name if you can identify it (ours or a
+For product_photo: product — the {_PRODUCT} style / product name if you can identify it (ours or a
 competitor's), else null. Leave the order fields null.
 For other: leave extraction fields null.
 
 Respond ONLY in this JSON format (always include every key — use null when not applicable):
-{
+{{
   "image_type": "order_screenshot" | "eye_photo" | "product_photo" | "other",
   "order_id": "1042" or null,
   "payment_status": "paid" or null,
   "amount": "849" or null,
-  "product": "GS1 Luxe Light Lash Tray" or null,
+  "product": "{BRAND["vision"]["example_product"]}" or null,
   "customer_name": "Priya" or null,
   "eye_shape": "hooded" or null,
   "confidence": "high" or "low"
-}
+}}
 
 Confidence is about image_type, NOT about how much you managed to extract. Use "high" whenever you're
-genuinely sure what kind of image this is — a clear photo of lashes is high confidence even if you can't
+genuinely sure what kind of image this is — a clear photo of {_PRODUCTS} is high confidence even if you can't
 name the product, and a clear eye close-up is high confidence even if the eye shape is unreadable. Set
 "low" only when the image is too blurry/dark to make out or you genuinely can't tell which category it
 falls into; then return your best guess for image_type and leave extraction fields null."""
@@ -346,7 +358,11 @@ SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 # `available` boolean. We use that boolean to mark IN STOCK / SOLD OUT
 # — sufficient for Claude to decide when to use the out-of-stock script
 # without us having to manage a Shopify Admin App token.
-SHOPIFY_PRODUCTS_URL = "https://glamshelf.in/products.json"
+#
+# From the brand file (shopify.products_url). null = no store feed: no
+# live inventory block, no product chunks in RAG, and the output guard's
+# prices come from the saved file / brain.md's product table only.
+SHOPIFY_PRODUCTS_URL = BRAND["shopify"]["products_url"]
 SHOPIFY_PRODUCTS_LIMIT = 250  # the endpoint's max page size
 SHOPIFY_TIMEOUT_SECONDS = 8
 
@@ -657,15 +673,20 @@ HUMAN_HANDLING_WINDOW_SECONDS = 4 * 60 * 60
 REVIEW_DELAY_SECONDS = 10 * 24 * 60 * 60   # 864000s = 10 days
 _scheduled_reviews: dict[str, dict] = {}
 
-REVIEW_REQUEST_TEMPLATE = (
-    "Hi {first_name}! Hope you're loving your lashes from The Glam Shelf 🤍\n\n"
-    "If you have a minute, a quick review on our website would mean so much "
-    "to us — it helps other girls find us too!\n\n"
-    "→ glamshelf.in/pages/reviews\n\n"
-    "And if you've worn them, we'd love to see! Tag us @glamshelfstore on "
-    "Instagram 🤍\n\n"
-    "— Team The Glam Shelf"
-)
+# From the brand file (messages.review_request, {first_name} placeholder).
+# null = no review requests: _schedule_review_request skips them.
+REVIEW_REQUEST_TEMPLATE = BRAND["messages"]["review_request"]
+
+# WhatsApp shipping updates (_process_shipping_event / _process_order_update),
+# from the brand file. The message templates take {first_name} and
+# {order_number}; the tracking link is TRACKING_URL_PREFIX + number, and
+# the WATI template's button has that same prefix baked in.
+SHIPPED_INTRO_TEMPLATE = BRAND["messages"]["shipped_intro"]
+OUT_FOR_DELIVERY_TEMPLATE = BRAND["messages"]["out_for_delivery"]
+DELIVERED_TEMPLATE = BRAND["messages"]["delivered"]
+TRACKING_URL_PREFIX = BRAND["shipping"]["tracking_url_prefix"]
+SHIPPING_DEFAULT_CARRIER = BRAND["shipping"]["default_carrier"]
+SHIPPING_WATI_TEMPLATE = BRAND["shipping"]["wati_template_name"]
 
 # ----- Telegram DRAFT inline-button approval flow -----
 #
@@ -1308,11 +1329,14 @@ def _udit_replied_recently(wa_id: str, window_seconds: int = HUMAN_HANDLING_WIND
 # once the in-memory _bot_recent_replies TTL lapses we'd otherwise mistake
 # them for a human reply. Matching these signatures keeps them attributed
 # to the bot. Kept deliberately narrow (URLs / fixed template phrases) so a
-# message Udit actually types can't accidentally match.
+# message Udit actually types can't accidentally match. The tracking link
+# (brand file's shipping.tracking_url_prefix without the scheme) and the
+# tracking follow-up's phrase are always in; the brand file's
+# bot_text_signatures add the rest (Glam Shelf: its reviews link).
 _BOT_TEXT_SIGNATURES = (
-    "shiprocket.in/tracking",
+    re.sub(r"^https?://", "", TRACKING_URL_PREFIX.lower()).rstrip("/"),
     "here's your tracking link",
-    "glamshelf.in/pages/reviews",
+    *BRAND["bot_text_signatures"],
 )
 
 
@@ -3122,7 +3146,7 @@ def send_telegram_notification(
             ),
             "RESTOCK": (
                 "🔔 RESTOCK request — there's no waitlist",
-                f"→ Twin pointed them to @glamshelfstore. Reach out from {approve_destination} if you want to.",
+                f"→ Twin pointed them to @{BRAND['instagram_handle']}. Reach out from {approve_destination} if you want to.",
             ),
         }[classification]
         text = (
@@ -4175,9 +4199,10 @@ def _html_to_blocks(raw: str) -> list[str]:
 # edit in Shopify Admin reaches the bot within one cache interval, and a
 # brain.md-vs-store contradiction (like the v1.8 "no returns" incident)
 # can't silently persist. Cached with the same TTL as brain.md.
-_POLICY_PROMPT_PAGES = (
-    ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
-    ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
+# Pages come from the brand file (shopify.prompt_policy_pages); an empty
+# list means no policy block in the prompt.
+_POLICY_PROMPT_PAGES = tuple(
+    (page["title"], page["url"]) for page in BRAND["shopify"]["prompt_policy_pages"]
 )
 _policy_cache: dict = {"text": "", "fetched_at": 0.0}
 
@@ -4224,7 +4249,7 @@ def get_live_policies() -> str:
         return _policy_cache["text"]
 
     block = (
-        "[LIVE STORE POLICIES - published at glamshelf.in]\n"
+        f"[LIVE STORE POLICIES - published at {BRAND['website_domain']}]\n"
         "The following is the store's live published policy text, for factual "
         "reference when answering policy questions. It does not override any "
         "classification, escalation, or Never-list rule above.\n\n"
@@ -4265,6 +4290,9 @@ def get_live_inventory() -> str:
     here, so a product rename in Shopify takes effect on the next 5-min
     cache rollover with no brain.md change.
     """
+    if not SHOPIFY_PRODUCTS_URL:
+        return ""  # brand file: shopify.products_url is null (no store feed)
+
     now = time.time()
     age = now - _inventory_cache["fetched_at"]
     if _inventory_cache["text"] and age < INVENTORY_CACHE_TTL_SECONDS:
@@ -4388,10 +4416,9 @@ RAG_MAX_CONTEXT_CHARS = 2000       # ≈500 tokens (audit 5.4 budget)
 RAG_CHUNK_MAX_CHARS = 500
 RAG_REINDEX_INTERVAL_SECONDS = 60 * 60   # hourly fallback re-index
 
-_RAG_POLICY_SOURCES = (
-    ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
-    ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
-    ("Terms of Service", "https://glamshelf.in/policies/terms-of-service"),
+# From the brand file (shopify.rag_policy_pages).
+_RAG_POLICY_SOURCES = tuple(
+    (page["title"], page["url"]) for page in BRAND["shopify"]["rag_policy_pages"]
 )
 
 _rag_embedder = None  # fastembed TextEmbedding, loaded once at startup; None = retrieval disabled
@@ -4605,16 +4632,18 @@ def _rag_build_corpus() -> list[tuple[str, str, str]]:
     customer identifiers, no stock status, no prices-as-text."""
     chunks: list[tuple[str, str, str]] = []
 
-    try:
-        resp = requests.get(
-            SHOPIFY_PRODUCTS_URL,
-            params={"limit": SHOPIFY_PRODUCTS_LIMIT},
-            timeout=SHOPIFY_TIMEOUT_SECONDS,
-        )
-        products = (resp.json() or {}).get("products") or [] if resp.ok else []
-    except Exception as e:
-        print(f"[RAG] Product fetch failed: {type(e).__name__}: {e}")
-        products = []
+    products = []
+    if SHOPIFY_PRODUCTS_URL:  # null in the brand file = no store feed
+        try:
+            resp = requests.get(
+                SHOPIFY_PRODUCTS_URL,
+                params={"limit": SHOPIFY_PRODUCTS_LIMIT},
+                timeout=SHOPIFY_TIMEOUT_SECONDS,
+            )
+            products = (resp.json() or {}).get("products") or [] if resp.ok else []
+        except Exception as e:
+            print(f"[RAG] Product fetch failed: {type(e).__name__}: {e}")
+            products = []
 
     for p in products:
         title = (p.get("title") or "").strip()
@@ -5090,10 +5119,8 @@ def _parse_twin_reply(raw: str) -> tuple[str, str]:
     )
 
 
-ESCALATE_FALLBACK_HOLDING_REPLY = (
-    "I hear you, and I want this handled properly — I'm bringing it straight to "
-    "the GlamShelf team, who'll reach out to you personally within the next few hours."
-)
+# From the brand file (messages.escalate_fallback_holding_reply).
+ESCALATE_FALLBACK_HOLDING_REPLY = BRAND["messages"]["escalate_fallback_holding_reply"]
 
 # brain.md's Default Handoff Line (INTERNAL NOTES), sent verbatim when the
 # reply pipeline itself fails on Instagram — DeepSeek down or timing out,
@@ -5110,20 +5137,20 @@ BRAIN_HOLDING_LINE = "I've passed this to the team — they'll reply to you here
 #     allergy holding reply: the safety advice plus a holding line;
 #   - anything else, including unusable model output: BRAIN_HOLDING_LINE.
 # (WhatsApp is unchanged: ESCALATE_FALLBACK_HOLDING_REPLY on fallback only.)
+# The safety advice is fixed for every brand; only the follow-up line after
+# it comes from the brand file (messages.allergy_holding_line).
 ALLERGY_SAFETY_TEXT = (
     "I'm really sorry to hear this. Please stop using the product immediately "
     "and consult a doctor."
 )
-ALLERGY_HOLDING_REPLY = (
-    ALLERGY_SAFETY_TEXT
-    + " Team The Glam Shelf will personally look into this and get back to you shortly 🤍"
-)
+ALLERGY_HOLDING_REPLY = ALLERGY_SAFETY_TEXT + " " + BRAND["messages"]["allergy_holding_line"]
 
 # Someone testing Twin, a brand owner, or anyone asking about the AI service
 # (audit T1-5): a friendly line, a Telegram LEAD notice and NO pause. Sent
 # verbatim when the model didn't write a reply of its own. Mirrors brain.md
-# RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS ASSISTANT.
-LEAD_REPLY = "Thanks for checking it out! Udit will message you personally 🤍"
+# RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS ASSISTANT. From the
+# brand file (messages.lead_reply) — keep it in step with that brand's brain.
+LEAD_REPLY = BRAND["messages"]["lead_reply"]
 
 # The optional "tag" field of the model's JSON (see build_user_message and
 # brain.md's Output Contract). Anything else parses as "".
@@ -5401,6 +5428,20 @@ def draft_reply_logic(
         classification = "ESCALATE"
 
     return classification, reply, raw
+
+
+@app.context_processor
+def _brand_template_vars() -> dict:
+    """Brand words for the HTML pages (login, drafter, control panel).
+    dashboard_api_base null -> the control panel calls its own server."""
+    api_base = BRAND["dashboard_api_base"] or ""
+    return {
+        "brand_name": BRAND["brand_name"],
+        "brand_short_name": BRAND["brand_short_name"],
+        "website_domain": BRAND["website_domain"],
+        "dashboard_api_base": api_base,
+        "dashboard_host": urlsplit(api_base).netloc if api_base else request.host,
+    }
 
 
 def login_required(view):
@@ -5995,7 +6036,7 @@ def inventory_debug():
         {
             "inventory": "<the formatted block, possibly empty>",
             "cached_age_seconds": <float, 0 on first call after restart>,
-            "shopify_products_url": "<string>"
+            "shopify_products_url": "<string, or null when the brand has no store feed>"
         }
     """
     if not _dashboard_key_param_ok():
@@ -6381,7 +6422,7 @@ def webhook(token=""):
                 if eye_shape:
                     text_body = (
                         f"I just sent a close-up photo of my eye — my eye shape looks "
-                        f"{eye_shape}. Can you recommend a lash for me?"
+                        f"{eye_shape}. Can you recommend a {_PRODUCT} for me?"
                     )
                     vision_summary = (
                         f"the customer sent a close-up photo of their eye "
@@ -6391,7 +6432,7 @@ def webhook(token=""):
                 else:
                     text_body = (
                         "I just sent a close-up photo of my eye — my eye shape was unclear. "
-                        "Can you recommend a lash for me?"
+                        f"Can you recommend a {_PRODUCT} for me?"
                     )
                     vision_summary = (
                         "the customer sent a close-up photo of their eye "
@@ -6420,12 +6461,12 @@ def webhook(token=""):
                 product = extracted.get("product")
                 if product:
                     vision_summary = (
-                        f"the customer sent a photo of lashes they're interested in "
+                        f"the customer sent a photo of {_PRODUCTS} they're interested in "
                         f"(looks like {product})"
                     )
                 else:
                     vision_summary = (
-                        "the customer sent a photo of lashes they're interested in "
+                        f"the customer sent a photo of {_PRODUCTS} they're interested in "
                         "(we couldn't identify which style)"
                     )
                 if product or caption_text:
@@ -6433,12 +6474,12 @@ def webhook(token=""):
                     # properly (product details, price, closest match).
                     if product:
                         text_body = (
-                            f"I just sent a photo of lashes I'm interested in — it looks "
+                            f"I just sent a photo of {_PRODUCTS} I'm interested in — it looks "
                             f"like {product}. Can you help me with this one?"
                         )
                     else:
                         text_body = (
-                            "I just sent a photo of lashes I'm interested in. "
+                            f"I just sent a photo of {_PRODUCTS} I'm interested in. "
                             "Can you help me with this one?"
                         )
                     print(f"[VISION] Product photo confidence=high product={product!r} — synthesized product query")
@@ -6894,6 +6935,9 @@ def _schedule_review_request(
     if order_id in _scheduled_reviews:
         print(f"[REVIEW] Already scheduled for order {order_number or order_id} — dedup skip")
         return
+    if REVIEW_REQUEST_TEMPLATE is None:
+        print(f"[REVIEW] Review requests are off for this brand — not scheduling for order {order_number or order_id}")
+        return
 
     now = time.time()
     _scheduled_reviews[order_id] = {
@@ -7049,7 +7093,7 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         else:
             tracking_message = (
                 f"Hi {greeting_name}! Here's your tracking link for order #{order_number} 🤍\n\n"
-                f"Track your order: https://shiprocket.in/tracking/{tracking_number}\n\n"
+                f"Track your order: {TRACKING_URL_PREFIX}{tracking_number}\n\n"
                 f"Feel free to reach out if you need anything!"
             )
             # Dedup key is written inside the helper, ONLY on confirmed
@@ -7115,15 +7159,15 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             )
             template_sent = send_whatsapp_template(
                 wa_id=wa_id,
-                template_name="shipping_notification_template",
+                template_name=SHIPPING_WATI_TEMPLATE,
                 parameters=[
                     {"name": "name", "value": greeting_name},
                     {"name": "order_number", "value": f"#{order_number}"},
                     {"name": "tracking_number", "value": tracking_number},
-                    {"name": "carrier", "value": tracking_company or "Shiprocket"},
+                    {"name": "carrier", "value": tracking_company or SHIPPING_DEFAULT_CARRIER},
                     # tracking_url variable is just the tracking number;
-                    # the template's button has the
-                    # https://shiprocket.in/tracking/ prefix baked in.
+                    # the template's button has the TRACKING_URL_PREFIX
+                    # (Glam Shelf: https://shiprocket.in/tracking/) baked in.
                     {"name": "tracking_url", "value": tracking_number},
                 ],
             )
@@ -7141,12 +7185,11 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
         if not template_sent:
             estimated_delivery = (fulfillment.get("estimated_delivery_at") or "").strip()
             lines = [
-                f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-                f"has been shipped 🤍",
+                SHIPPED_INTRO_TEMPLATE.format(first_name=greeting_name, order_number=order_number),
                 "",
             ]
             if tracking_number:
-                lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+                lines.append(f"Tracking: {TRACKING_URL_PREFIX}{tracking_number}")
             if tracking_company:
                 lines.append(f"Carrier: {tracking_company}")
             if estimated_delivery:
@@ -7155,18 +7198,9 @@ def _process_shipping_event(topic: str, fulfillment: dict) -> None:
             lines.append("Feel free to reach out if you need anything!")
             message = "\n".join(lines)
     elif event == "out_for_delivery":
-        message = (
-            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-            f"is out for delivery today 🤍\n\n"
-            f"Keep an eye out — it'll be at your door soon!"
-        )
+        message = OUT_FOR_DELIVERY_TEMPLATE.format(first_name=greeting_name, order_number=order_number)
     elif event == "delivered":
-        message = (
-            f"Hi {greeting_name}! Your order #{order_number} has been "
-            f"delivered 🤍\n\n"
-            f"Hope you love your lashes! If you have any questions about "
-            f"how to use them, just message us here."
-        )
+        message = DELIVERED_TEMPLATE.format(first_name=greeting_name, order_number=order_number)
     else:
         return  # Unreachable, but defensive.
 
@@ -7370,12 +7404,12 @@ def _process_order_update(payload: dict) -> None:
     if tracking_number:
         template_sent = send_whatsapp_template(
             wa_id=wa_id,
-            template_name="shipping_notification_template",
+            template_name=SHIPPING_WATI_TEMPLATE,
             parameters=[
                 {"name": "name", "value": greeting_name},
                 {"name": "order_number", "value": f"#{order_number}"},
                 {"name": "tracking_number", "value": tracking_number},
-                {"name": "carrier", "value": tracking_company or "Shiprocket"},
+                {"name": "carrier", "value": tracking_company or SHIPPING_DEFAULT_CARRIER},
                 {"name": "tracking_url", "value": tracking_number},
             ],
         )
@@ -7396,12 +7430,11 @@ def _process_order_update(payload: dict) -> None:
             _mark_shipping_sent(order_id, extra, phone=wa_id, order_number=order_number)
     else:
         lines = [
-            f"Hi {greeting_name}! Your The Glam Shelf order #{order_number} "
-            f"has been shipped 🤍",
+            SHIPPED_INTRO_TEMPLATE.format(first_name=greeting_name, order_number=order_number),
             "",
         ]
         if tracking_number:
-            lines.append(f"Tracking: https://shiprocket.in/tracking/{tracking_number}")
+            lines.append(f"Tracking: {TRACKING_URL_PREFIX}{tracking_number}")
         if tracking_company:
             lines.append(f"Carrier: {tracking_company}")
         lines.append("")
@@ -7835,10 +7868,8 @@ def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> N
 # INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS: customers often send several photos
 # in a row, and one reply per burst reads better than the same line three
 # times. Extra photos in the window are logged, not answered.
-INSTAGRAM_PHOTO_REPLY = (
-    "I can't view photos here yet — tell me your eye shape or the occasion "
-    "and I'll suggest the right pair!"
-)
+# From the brand file (messages.instagram_photo_reply).
+INSTAGRAM_PHOTO_REPLY = BRAND["messages"]["instagram_photo_reply"]
 INSTAGRAM_PHOTO_REPLY_WINDOW_SECONDS = 10 * 60
 
 
