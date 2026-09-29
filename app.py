@@ -3295,7 +3295,10 @@ def send_draft_for_approval(
     customer_number carries the IG sender_id and ig_timestamp carries the
     original event timestamp (used when logging the delivered exchange).
     `guard_note`, when set, is the output-guard rule that held an AUTO
-    reply back (audit T1-4) and is shown under the header.
+    reply back (audit T1-4) and is shown under the header. An empty
+    `reply_text` — the model wrote nothing, and the Instagram handler routed
+    the message here rather than stay silent (audit finding 1) — says so and
+    offers only ✏️ Edit and ⛔ Skip: there's nothing to send as-is.
 
     Returns True if the buttoned message was sent and state was registered;
     False on any failure (caller may fall back to plain-text notification).
@@ -3312,13 +3315,15 @@ def send_draft_for_approval(
     if guard_note:
         # Twin classified this AUTO; the output guard held it (audit T1-4).
         header += f"\n🛡️ Output guard held Twin's AUTO reply — {guard_note}"
+    if not reply_text:
+        header += "\n⚠️ Twin wrote no reply — tap ✏️ Edit to answer, or ⛔ Skip."
     text = (
         f"{header}\n\n"
         f"From: {sender_block}\n\n"
         "Customer said:\n"
         f'"{customer_message}"\n\n'
         "Drafted reply:\n"
-        f'"{reply_text}"'
+        + (f'"{reply_text}"' if reply_text else "(none)")
     )
     if channel == "Instagram":
         text += f"\n\n{IG_APPROVAL_DEADLINE_LINE}"
@@ -3327,13 +3332,14 @@ def send_draft_for_approval(
     #   "action:<verb>|num:<wa_id-or-ig-sender-id>|id:<8-hex>"
     # Worst case: action:send (11) + |num: (5) + 17-digit IG sender_id
     # + |id: (4) + 8 = 45 bytes (12-digit wa_id: 40 bytes).
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Send as-is", "callback_data": f"action:send|num:{customer_number}|id:{draft_id}"},
-            {"text": "✏️ Edit",       "callback_data": f"action:edit|num:{customer_number}|id:{draft_id}"},
-            {"text": "⛔ Skip",        "callback_data": f"action:skip|num:{customer_number}|id:{draft_id}"},
-        ]]
-    }
+    buttons = [
+        {"text": "✅ Send as-is", "callback_data": f"action:send|num:{customer_number}|id:{draft_id}"},
+        {"text": "✏️ Edit",       "callback_data": f"action:edit|num:{customer_number}|id:{draft_id}"},
+        {"text": "⛔ Skip",        "callback_data": f"action:skip|num:{customer_number}|id:{draft_id}"},
+    ]
+    if not reply_text:
+        buttons = buttons[1:]  # no draft to send as-is
+    keyboard = {"inline_keyboard": [buttons]}
 
     # Register the draft BEFORE sending the buttoned message: if the DB
     # write fails, we return False so the caller falls back to the plain
@@ -8231,13 +8237,17 @@ def _process_instagram_event(event: dict) -> None:
                 print("[ESCALATE] Verdict with no usable reply — escalating instead of dropping")
                 fallback_escalation = True
             elif classification in ("AUTO", "DRAFT+APPROVE"):
-                # A deliberately empty reply — e.g. brain.md's "stay silent
-                # after a holding message" rule. Nothing to send.
+                # Never silence (audit finding 1): an empty reply goes to the
+                # founder as a draft, the same way an output-guard hold does,
+                # and the customer gets the handoff line (or, inside its
+                # window, the one-time acknowledgement) — see
+                # _ig_draft_handoff. Instagram handler only: graph.py's
+                # triage still drops it.
                 print(
-                    f"[INSTAGRAM] Twin returned empty result "
-                    f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                    f"[INSTAGRAM] Twin returned an empty {classification} reply for "
+                    f"{sender_id} — sending the message to the founder as a draft"
                 )
-                return
+                classification = "DRAFT+APPROVE"
             else:
                 print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
                 _ig_pipeline_failure(

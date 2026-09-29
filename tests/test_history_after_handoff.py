@@ -19,6 +19,9 @@ once per window; after that nothing new, while the founder still gets every
 draft (founder decision). The acknowledgement goes through the output guard
 and into history like the handoff line.
 
+An empty model reply (AUTO or DRAFT+APPROVE) is no longer dropped either: it
+goes to the founder as a draft, like an output-guard hold.
+
 The model is a fake DeepSeek client that records the exact `messages` array,
 so "what history the model was given" is asserted directly. Instagram sends,
 Telegram and the Shopify / RAG context are stubbed; log rows are real, in a
@@ -361,6 +364,86 @@ class AcknowledgementTest(HandlerTestCase):
         glam._log_instagram(SENDER, "hi", HANDOFF, "1", source="PIPELINE_HOLDING_IG")
         self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
         self.assertEqual(self.sends, [ACK])
+
+
+class EmptyReplyTest(HandlerTestCase):
+    """An empty model reply is never silence (decision 4, and by founder
+    decision an empty DRAFT+APPROVE too): it goes to the founder as a draft
+    and the customer gets the handoff line — or, inside the window, the
+    one-time acknowledgement, then nothing — the same way a guard hold works."""
+
+    def test_an_empty_auto_reply_sends_the_handoff_line_and_a_draft(self):
+        out = self.dm(FOLLOW_UP, model_output("AUTO", ""))
+        self.assertEqual(self.sends, [HANDOFF])
+        (draft,) = self.drafts()
+        self.assertIn(f'"{FOLLOW_UP}"', draft["text"])
+        self.assertIn("Twin wrote no reply", draft["text"])
+        self.assertEqual(draft["buttons"], ["✏️ Edit", "⛔ Skip"])   # nothing to send as-is
+        self.assertIn("sending the message to the founder as a draft", out)
+        self.assertEqual(self.sources(), ["DRAFT_HANDOFF_IG", "DRAFT_PENDING_IG"])
+
+    def test_an_empty_draft_reply_is_covered_the_same_way(self):
+        self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", ""))
+        self.assertEqual(self.sends, [HANDOFF])
+        (draft,) = self.drafts()
+        self.assertEqual(draft["buttons"], ["✏️ Edit", "⛔ Skip"])
+
+    def test_the_audit_g3_sequence_never_goes_silent(self):
+        # Audit G3, main run: turn 1 drafted, turn 2 came back AUTO "".
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm(FOLLOW_UP, model_output("AUTO", ""))
+        self.assertEqual(self.sends, [HANDOFF, ACK])
+        self.assertEqual(len(self.drafts()), 2)
+        self.dm("hello??", model_output("AUTO", "The team has your request and will reply here 🤍"))
+        self.assertEqual(self.history_for_last_call(), [
+            (wrap(RETURN_MSG), HANDOFF),
+            (wrap(FOLLOW_UP), ACK),
+        ])
+
+    def test_empty_replies_follow_the_window_like_any_draft(self):
+        self.dm("hi", model_output("AUTO", ""))
+        self.dm("hello?", model_output("AUTO", ""))
+        self.dm("anyone?", model_output("AUTO", ""))
+        self.assertEqual(self.sends, [HANDOFF, ACK])     # the third: nothing new...
+        self.assertEqual(len(self.drafts()), 3)          # ...but the founder has all three
+
+    def test_the_founder_answers_an_empty_draft_with_edit(self):
+        answer = "Email glamshelfstore@gmail.com with your order ID and we'll sort it 🤍"
+        self.dm(FOLLOW_UP, model_output("AUTO", ""))
+        (draft,) = self.drafts()
+        self.tap("edit", draft)
+        self.send_edit(answer)
+        self.assertEqual(self.sends, [HANDOFF, answer])
+        with redirect_stdout(io.StringIO()):
+            history = glam._load_instagram_history(SENDER)
+        self.assertEqual([(h["msg_text"], h["reply_text"]) for h in history],
+                         [(FOLLOW_UP, HANDOFF), (FOLLOW_UP, answer)])
+
+    def test_a_normal_draft_keeps_all_three_buttons(self):
+        for channel in ("Instagram", "WhatsApp"):
+            with self.subTest(channel=channel), redirect_stdout(io.StringIO()):
+                self.telegram.reset_mock()
+                self.assertTrue(glam.send_draft_for_approval(
+                    customer_number="c1", customer_name="", customer_message="hi",
+                    reply_text="the draft", channel=channel))
+                (draft,) = self.drafts()
+                self.assertEqual(draft["buttons"], ["✅ Send as-is", "✏️ Edit", "⛔ Skip"])
+                self.assertIn('Drafted reply:\n"the draft"', draft["text"])
+                self.assertNotIn("Twin wrote no reply", draft["text"])
+
+    def test_a_lead_tagged_empty_reply_still_takes_the_lead_path(self):
+        # Unchanged: the LEAD check runs before the empty-reply gate.
+        self.dm("udit asked me to test this", model_output("AUTO", "", "LEAD"))
+        self.assertEqual(self.sends, [glam.LEAD_REPLY])
+        self.assertEqual(self.drafts(), [])
+
+    def test_an_empty_escalation_still_escalates(self):
+        # Unchanged: an ESCALATE verdict with no reply escalates as before.
+        self.dm("my order came damaged and i want my money back", model_output("ESCALATE", ""))
+        self.assertEqual(self.sends, [HANDOFF])
+        self.assertEqual(self.drafts(), [])
+        self.assertEqual([n[0] for n in self.notices], ["ESCALATE"])
+        self.assertTrue(glam._is_paused(SENDER))
 
 
 class LoaderPairingTest(unittest.TestCase):
