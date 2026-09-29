@@ -13,6 +13,12 @@ Now history holds what the customer actually received:
     (so the customer's message shows twice — founder decision);
   - nothing for a message that got no line (window, failed send).
 
+And a follow-up that goes to a draft inside the 30-minute handoff window no
+longer gets silence: it gets one different short acknowledgement, at most
+once per window; after that nothing new, while the founder still gets every
+draft (founder decision). The acknowledgement goes through the output guard
+and into history like the handoff line.
+
 The model is a fake DeepSeek client that records the exact `messages` array,
 so "what history the model was given" is asserted directly. Instagram sends,
 Telegram and the Shopify / RAG context are stubbed; log rows are real, in a
@@ -38,6 +44,7 @@ import app as glam
 SENDER = "17800000000000555"
 CHAT_ID = 777005
 HANDOFF = "I've passed this to the team — they'll reply to you here 🤍"
+ACK = "Got it — I've added this to your request, the team will reply here 🤍"
 LIVE_PRICES = {249, 299, 499, 599, 849}
 
 RETURN_MSG = "hi i want to return my GS2 tray, didnt like how it looks on me"
@@ -180,6 +187,18 @@ class HandlerTestCase(unittest.TestCase):
     def last_prompt(self):
         return json.dumps(self.model.calls[-1], ensure_ascii=False)
 
+    def sources(self):
+        return [r[0] for r in db_rows(
+            "SELECT source FROM instagram_logs WHERE sender_id = ? ORDER BY id", (SENDER,))]
+
+    def age_rows(self, minutes):
+        conn = sqlite3.connect(glam.DB_PATH)
+        try:
+            conn.execute("UPDATE instagram_logs SET logged_at = datetime('now', ?)", (f"-{minutes} minutes",))
+            conn.commit()
+        finally:
+            conn.close()
+
 
 class HistoryAfterDraftTest(HandlerTestCase):
     def test_after_a_draft_history_has_the_message_and_the_handoff_line(self):
@@ -255,6 +274,95 @@ class HistoryAfterDraftTest(HandlerTestCase):
         self.assertEqual(glam._load_instagram_history(SENDER), [])
 
 
+class AcknowledgementTest(HandlerTestCase):
+    """A follow-up that goes to DRAFT+APPROVE inside the 30-minute window
+    gets ONE different short line, then nothing; the founder gets every
+    draft (founder decision, finding 1)."""
+
+    def test_the_line_is_the_founders_wording(self):
+        self.assertEqual(glam.IG_DRAFT_ACK_LINE, ACK)
+
+    def test_handoff_line_then_acknowledgement_then_silence_with_every_draft_to_the_founder(self):
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
+        self.dm("hello??", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
+        self.assertEqual(self.sends, [HANDOFF, ACK])               # msg 3: nothing new
+        drafts = self.drafts()
+        self.assertEqual(len(drafts), 3)                           # but the founder gets all three
+        self.assertIn('"hello??"', drafts[2]["text"])
+        self.assertEqual(self.sources(), [
+            "DRAFT_HANDOFF_IG", "DRAFT_PENDING_IG",
+            "DRAFT_ACK_IG", "DRAFT_PENDING_IG",
+            "DRAFT_PENDING_IG",
+        ])
+
+    def test_the_acknowledgement_goes_into_history_like_the_handoff_line(self):
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
+        self.dm("hello??", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
+        self.dm("ok thanks", model_output("AUTO", "You're welcome 🤍"))
+        # "hello??" got nothing, so it isn't an exchange.
+        self.assertEqual(self.history_for_last_call(), [
+            (wrap(RETURN_MSG), HANDOFF),
+            (wrap(FOLLOW_UP), ACK),
+        ])
+
+    def test_an_output_guard_hold_inside_the_window_gets_the_acknowledgement(self):
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm("any discount code?", model_output("AUTO", "Use code FREE100 for 10% off 🤍"))
+        self.assertEqual(self.sends, [HANDOFF, ACK])
+        self.assertIn("Output guard held", self.drafts()[1]["text"])
+
+    def test_the_acknowledgement_goes_through_the_output_guard(self):
+        self.assertEqual(glam.output_guard.check_reply(ACK, set(LIVE_PRICES)), [])
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        real_check = glam.output_guard.check_reply
+        hold_the_ack = lambda reply, prices: ["rule 9 (test)"] if reply == ACK else real_check(reply, prices)
+        with patch.object(glam.output_guard, "check_reply", hold_the_ack):
+            out = self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
+        self.assertEqual(self.sends, [HANDOFF])                    # held: nothing new sent
+        self.assertIn("held by the output guard", out)
+        self.assertEqual(len(self.drafts()), 2)                    # the founder still gets it
+        self.dm("hello??", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
+        self.assertEqual(self.sends, [HANDOFF, ACK])               # none went out, so it's still due
+
+    def test_an_auto_reply_inside_the_window_is_untouched(self):
+        price = "GS1 is ₹849 for 10 pairs 🤍"
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm("whats the price of GS1?", model_output("AUTO", price))
+        self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
+        self.assertEqual(self.sends, [HANDOFF, price, ACK])
+        self.assertEqual(len(self.drafts()), 2)
+
+    def test_after_the_window_the_handoff_line_comes_back(self):
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
+        self.age_rows(31)
+        self.dm("any update?", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
+        self.dm("hello??", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
+        self.assertEqual(self.sends, [HANDOFF, ACK, HANDOFF, ACK])
+
+    def test_a_failed_acknowledgement_is_tried_again_on_the_next_draft(self):
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.send_result = (False, "HTTP 500: boom")
+        self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
+        self.send_result = (True, "")
+        self.dm("hello??", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
+        self.assertEqual(self.sends, [HANDOFF, ACK, ACK])
+        self.assertEqual(self.sources()[2:], [
+            "DRAFT_ACK_FAILED_IG", "DRAFT_PENDING_IG", "DRAFT_ACK_IG", "DRAFT_PENDING_IG",
+        ])
+        with redirect_stdout(io.StringIO()):
+            history = glam._load_instagram_history(SENDER)
+        self.assertEqual([(h["msg_text"], h["reply_text"]) for h in history],
+                         [(RETURN_MSG, HANDOFF), ("hello??", ACK)])
+
+    def test_the_holding_line_from_a_pipeline_failure_counts_for_the_window(self):
+        glam._log_instagram(SENDER, "hi", HANDOFF, "1", source="PIPELINE_HOLDING_IG")
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.assertEqual(self.sends, [ACK])
+
+
 class LoaderPairingTest(unittest.TestCase):
     """_load_instagram_history on hand-written rows: the shapes the handler
     writes, including drafts logged before this fix was deployed."""
@@ -283,6 +391,12 @@ class LoaderPairingTest(unittest.TestCase):
     def test_a_failed_line_is_never_paired(self):
         self.rows(("", HANDOFF, "DRAFT_HANDOFF_FAILED_IG"), ("can i return it?", None, "DRAFT_PENDING_IG"))
         self.assertEqual(self.history(), [])
+
+    def test_the_acknowledgement_pairs_like_the_handoff_line(self):
+        self.rows(("", HANDOFF, "DRAFT_HANDOFF_IG"), ("can i return it?", None, "DRAFT_PENDING_IG"),
+                  ("", ACK, "DRAFT_ACK_IG"), ("hello??", None, "DRAFT_PENDING_IG"),
+                  ("", ACK, "DRAFT_ACK_FAILED_IG"), ("anyone?", None, "DRAFT_PENDING_IG"))
+        self.assertEqual(self.history(), [("can i return it?", HANDOFF), ("hello??", ACK)])
 
     def test_a_line_pairs_only_with_the_row_right_after_it(self):
         self.rows(("", HANDOFF, "DRAFT_HANDOFF_IG"),

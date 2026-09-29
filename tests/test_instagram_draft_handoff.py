@@ -140,7 +140,9 @@ class DraftHandoffTest(ResetDb):
     def test_second_draft_inside_30_minutes_does_not_repeat_it(self):
         self.dm()
         out = self.dm("also can I exchange it?")
-        self.assertEqual(self.sends, [(SENDER, HANDOFF)])
+        # Not the line again: the one-time acknowledgement instead (audit
+        # finding 1, see tests.test_history_after_handoff).
+        self.assertEqual(self.sends, [(SENDER, HANDOFF), (SENDER, glam.IG_DRAFT_ACK_LINE)])
         self.assertEqual(len(self.drafts), 2)
         self.assertIn("not repeating", out)
 
@@ -160,7 +162,7 @@ class DraftHandoffTest(ResetDb):
             (SENDER, HANDOFF),
         )
         self.dm()
-        self.assertEqual(self.sends, [])
+        self.assertEqual(self.sends, [(SENDER, glam.IG_DRAFT_ACK_LINE)])  # not the line again
         self.assertEqual(len(self.drafts), 1)
 
     def test_other_senders_are_not_affected(self):
