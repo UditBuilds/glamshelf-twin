@@ -191,6 +191,16 @@ class ProspectHandler(unittest.TestCase):
         self.assertEqual(first["reply"], HANDOFF)
         self.assertIn("nothing new", second["reply"])
 
+    def test_notice_says_so_when_the_handoff_line_failed_to_send(self):
+        self.model = ("DRAFT+APPROVE", "We accept returns within 14 days of delivery 🤍", "LEAD")
+        with patch.object(glam, "_send_instagram_reply", lambda s, t: (False, "HTTP 400: token expired")):
+            self.dm("udit asked me to test this. can i return a tray i didnt like?")
+        self.assertEqual(len(self.drafts), 1)              # the draft still waits for approval
+        (notice,) = self.lead_notices()
+        self.assertIn("failed to send", notice["reply"])
+        self.assertNotIn("recently", notice["reply"])
+        self.assertFalse(glam._is_paused(SENDER))
+
     def test_ordinary_customer_draft_gets_no_lead_notice(self):
         self.model = ("DRAFT+APPROVE", "So sorry about the mix-up 🤍", "")
         self.dm("i ordered GS1 but got GS2 in the box")

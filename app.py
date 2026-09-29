@@ -7802,10 +7802,14 @@ def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: boo
         return
     if _ig_escalation_reply(text, tag)[0] != "other":
         return
-    shown = (
-        BRAIN_HOLDING_LINE if handoff_sent
-        else "(nothing new — they got the handoff line recently)"
-    )
+    # _ig_draft_handoff returns False both when the line went out inside the
+    # window already and when the send failed; only the first counts as sent.
+    if handoff_sent:
+        shown = BRAIN_HOLDING_LINE
+    elif _ig_handoff_sent_recently(sender_id):
+        shown = "(nothing new — they got the handoff line recently)"
+    else:
+        shown = "(nothing — the handoff line failed to send)"
     try:
         send_telegram_notification(
             "LEAD", text, shown,
