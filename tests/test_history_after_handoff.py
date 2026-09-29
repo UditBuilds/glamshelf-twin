@@ -226,9 +226,10 @@ class HistoryAfterDraftTest(HandlerTestCase):
         self.dm("any offers?", model_output("AUTO", held))
         self.assertEqual(self.sends, [HANDOFF])
         self.assertIn("Output guard held", self.drafts()[0]["text"])
-        self.dm("ok", model_output("AUTO", "You're welcome 🤍"))
+        self.dm("ok", model_output("AUTO", ""))       # brain.md: "" after a holding line
         self.assertEqual(self.history_for_last_call(), [(wrap("any offers?"), HANDOFF)])
         self.assertNotIn(held, self.last_prompt())
+        self.assertEqual(self.sends, [HANDOFF, ACK])  # the empty-reply fallback
 
     def test_after_approval_history_has_the_text_actually_sent(self):
         self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
@@ -306,12 +307,14 @@ class AcknowledgementTest(HandlerTestCase):
         self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
         self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
         self.dm("hello??", model_output("DRAFT+APPROVE", "The team will reply shortly 🤍"))
-        self.dm("ok thanks", model_output("AUTO", "You're welcome 🤍"))
+        self.dm("ok thanks", model_output("AUTO", ""))    # brain.md: "" after a holding line
         # "hello??" got nothing, so it isn't an exchange.
         self.assertEqual(self.history_for_last_call(), [
             (wrap(RETURN_MSG), HANDOFF),
             (wrap(FOLLOW_UP), ACK),
         ])
+        self.assertEqual(self.sends, [HANDOFF, ACK])      # "ok thanks": nothing new...
+        self.assertEqual(len(self.drafts()), 4)           # ...but it reached the founder
 
     def test_an_output_guard_hold_inside_the_window_gets_the_acknowledgement(self):
         self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
@@ -384,6 +387,23 @@ class EmptyReplyTest(HandlerTestCase):
         self.assertEqual(draft["buttons"], ["✏️ Edit", "⛔ Skip"])   # nothing to send as-is
         self.assertIn("sending the message to the founder as a draft", out)
         self.assertEqual(self.sources(), ["DRAFT_HANDOFF_IG", "DRAFT_PENDING_IG"])
+
+    def test_ok_thanks_after_a_handoff_follows_the_empty_reply_fallback(self):
+        # brain.md (NO REPETITIVE HOLDING MESSAGES) has the model return ""
+        # for a bare acknowledgment right after a holding line. That is no
+        # longer silence with nobody told: the first one inside the window
+        # gets the acknowledgement, later ones get nothing, and the founder
+        # gets each as a draft (founder decision, after the "You're welcome"
+        # rule was reverted).
+        self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
+        self.dm("ok thanks", model_output("AUTO", ""))
+        self.dm("thank you!", model_output("AUTO", ""))
+        self.assertEqual(self.sends, [HANDOFF, ACK])
+        drafts = self.drafts()
+        self.assertEqual(len(drafts), 3)
+        for draft in drafts[1:]:
+            self.assertIn("Twin wrote no reply", draft["text"])
+            self.assertEqual(draft["buttons"], ["✏️ Edit", "⛔ Skip"])
 
     def test_an_empty_draft_reply_is_covered_the_same_way(self):
         self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", ""))
