@@ -444,6 +444,7 @@ COD pushback reply (if customer insists):
 - Bank/UPI reflection: 5–7 working days
 - Card reflection: 7–10 working days
 - Always share Razorpay refund reference ID with customer
+- Shipping charges (if paid) are non-refundable
 
 ### 3.5 Cancellations
 
