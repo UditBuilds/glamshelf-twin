@@ -11,7 +11,7 @@ is one of brain.md's approved policy statements.
 
 The texts below are the brief's required cases, the store's refund policy
 page, and real model drafts from the audit, PR #46's verification and this
-fix's BEFORE runs (quoted, since those files aren't in the repo).
+fix's verification runs (quoted, since those files aren't in the repo).
 
 No live API call anywhere here.
 
@@ -64,6 +64,8 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             "Once approved, refunds are initiated within 24–48 hours 🤍",
             "Refunds take 5–7 business days for UPI/bank and 7–10 business days for cards 🤍",
             "Refunds take 7–10 working days for cards 🤍",
+            "Approved refunds are initiated within 24–48 hours, then reach UPI/bank in 5–7 working days "
+            "and cards in 7–10 working days 🤍",
         ])
 
     def test_store_refund_policy_page_sentences(self):
@@ -72,6 +74,7 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             "If approved: Your refund is initiated within 24–48 hours of approval.",
             "It reaches UPI/bank accounts in 5–7 working days and cards in 7–10 working days.",
             "Shipping charges (if paid) are non-refundable.",
+            "Shipping charges, if paid, aren't refundable.",
         ])
 
     def test_real_drafts_that_used_to_be_held(self):
@@ -89,7 +92,7 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             # PR #46 verification, P2 run 2
             "GS1 is our soft, natural everyday tray — 10 pairs for ₹849, and shipping's free since it's "
             "above ₹799. You can order it here: glamshelf.in/products/gs1-luxe-light-lash-tray 🤍",
-            # this fix's BEFORE runs: "how long does a refund take?"
+            # BEFORE runs: "how long does a refund take?"
             "Refunds are initiated within 24–48 hours of approval, then take 5–7 working days to reflect "
             "for UPI/bank and 7–10 working days for cards. If you share your order ID, I'll pass it to "
             "the team so they can check yours 🤍",
@@ -98,7 +101,7 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             "Refunds are initiated within 24–48 hours of approval, and it then reflects in your bank or "
             "UPI in 5–7 working days, or on card in 7–10 working days. If you share your order ID, I'll "
             "pass it to the team so they can check the status for you 🤍",
-            # this fix's BEFORE runs: "koi coupon code hai?"
+            # BEFORE runs: "koi coupon code hai?"
             "No coupon codes running at the moment — our prices are already reduced from MRP. Free "
             "shipping does apply on orders above ₹799 though 🤍",
             "No coupon codes running at the moment — our prices are already reduced, and shipping is "
@@ -107,9 +110,35 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             "shipping applies on orders above ₹799 🤍",
         ])
 
-    def test_real_drafts_that_were_already_sent_still_are(self):
+    def test_first_after_run_phrasings(self):
         self.assertSent([
-            # this fix's BEFORE runs: "can i get a discount if i buy 2 trays?"
+            # refund timing and the tester's refund question
+            "Sure thing — refunds are initiated within 24–48 hours once a return is received and "
+            "approved, and reach UPI or bank accounts in 5–7 working days. Email glamshelfstore@gmail.com "
+            "with your order ID and we'll get it started 🤍",
+            "We accept returns within 14 days of delivery, as long as the lashes are unused and in their "
+            "original packaging — refunds are initiated within 24–48 hours once we receive and approve "
+            "the return. Just email glamshelfstore@gmail.com with your order ID and the team will take it "
+            "from there 🤍",
+            "Once a refund is approved, we initiate it within 24–48 hours — it reaches UPI/bank accounts "
+            "in 5–7 working days and cards in 7–10 working days. If you share your order ID, I'll pass it "
+            "to the team to check on yours 🤍",
+            "Once your refund is approved, it's initiated within 24–48 hours — it reaches UPI/bank "
+            "accounts in 5–7 working days and cards in 7–10 working days. Shipping charges, if paid, "
+            "aren't refundable 🤍",
+            # the free-shipping threshold, said the other way round (brain.md:923)
+            "Since Kawaii is ₹299, it's under our ₹799 free-shipping threshold — the exact delivery "
+            "charge will show at checkout 🤍",
+        ])
+
+    def test_replies_the_old_guard_sent_are_still_sent(self):
+        self.assertSent([
+            # this fix's first AFTER run, 2-tray discount: the old guard sent it, the first
+            # version of this fix held it
+            "Our prices are already reduced from the original MRP, so there's no additional discount on "
+            "retail orders — but free shipping applies on orders above ₹799, which two trays would "
+            "qualify for 🤍",
+            # BEFORE runs: "can i get a discount if i buy 2 trays?"
             "Our prices are already reduced from the original MRP — there's no additional discount "
             "available at the moment. Bulk pricing at ₹749/tray applies to orders of 20+ trays, and "
             "free shipping does apply on orders above ₹799 🤍",
@@ -160,6 +189,12 @@ class FalsePromisesStayHeld(unittest.TestCase):
             # audit G2 turn 3, the finding 12 case
             "Kawaii is ₹299, so shipping would fall under the ₹799 free-shipping threshold — the exact "
             "charge shows at checkout. If you add a tray or a set, it ships free 🤍",
+            # first AFTER run: honest, but no threshold in the sentence (decision 2)
+            "Hey! GS1 Luxe Light Lash Tray is ₹849 for 10 pairs — soft, natural finish, great for "
+            "everyday and light bridal looks. You can order it here → "
+            "glamshelf.in/products/gs1-luxe-light-lash-tray, and shipping's free on this one 🤍",
+            "Shipping cost is calculated and shown at checkout — Kawaii at ₹299 alone falls just under "
+            "our free shipping threshold of ₹799. If you'd like, I can suggest a combo that ships free 🤍",
         ])
 
     def test_free_shipping_claim_with_wrong_maths_stays_held(self):
@@ -183,9 +218,17 @@ class FalsePromisesStayHeld(unittest.TestCase):
             # the right timeline followed by a wrong one in the same sentence
             "Once approved, refunds are initiated within 24–48 hours, and processed within 7 business days 🤍",
             "Refunds are initiated within 24–48 hours of approval and reach you instantly 🤍",
-            # a promise to this customer (brain.md:878), not the policy
+            "Refunds are initiated within 24–48 hours once a return is approved, and reach you in "
+            "7 business days 🤍",
+            # no approval condition: a promise to this customer (brain.md:878), not the policy
             "Your refund will be initiated within 24–48 hours 🤍",
+            "We'll initiate your refund within 24–48 hours 🤍",
             "Shipping charges (if paid) are refundable 🤍",
+            # returns start by email (brain.md:396), not in the DM
+            "Great to have you testing it! Refunds are handled by our team: approved refunds are "
+            "initiated within 24–48 hours, then reach UPI/bank in 5–7 working days and cards in 7–10 "
+            "working days. Any refund request just needs your order ID shared here, and I'll pass it to "
+            "the team 🤍",
         ])
 
     def test_brain_refund_promise_templates_stay_held(self):

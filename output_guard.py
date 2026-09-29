@@ -16,9 +16,9 @@ Rules (each returns a short reason naming the rule and what matched):
      sentence by sentence (_rule2_words): a clause with one of these words
      passes only when it is one of brain.md's approved policy statements —
      free shipping above ₹799, no discount / no codes, the refund
-     timeline, shipping charges being non-refundable. "cruelty-free" is a
-     product fact and always passes. Any other clause with one of the
-     words holds the whole reply.
+     timeline, shipping charges being non-refundable. "cruelty-free" and
+     the discount decline pass wherever they appear, as before. Any other
+     clause with one of the words holds the whole reply.
   3. A link, domain, email or @handle other than glamshelf.in,
      instagram.com/glamshelfstore, @glamshelfstore and the brand email.
   4. Prompt-injection phrasing: "system prompt", "my/your instructions",
@@ -62,8 +62,15 @@ _PROMO_WORDS_RE = re.compile(
     r"\b(codes?|coupons?|promos?|promo[- ]?codes?|discount\w*|refund\w*|cashbacks?|free\w*)\b",
     re.IGNORECASE,
 )
-# A product fact, not an offer: exempt wherever it appears.
-_CRUELTY_FREE_RE = re.compile(r"cruelty[- ]free", re.IGNORECASE)
+# Exempt wherever they appear, as since T1-4: cruelty-free (a product fact)
+# and the discount decline — neither promises anything. Free shipping used
+# to be here too; it now needs the ₹799 threshold (_FREE_SHIPPING_RULE).
+_EXEMPT_PHRASES_RE = re.compile(
+    r"cruelty[- ]free"
+    r"|no (?:additional|extra|other) discounts?(?: (?:available|at the moment|right now))?"
+    r"|no active discount codes?",
+    re.IGNORECASE,
+)
 
 # Rule 2 is judged per sentence, and within a sentence per clause. A
 # sentence ends at . ! ? before a space or a capital ("₹849.Free shipping"
@@ -74,9 +81,9 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=[.!?])(?=[A-Z])|\n+")
 _CLAUSE_SPLIT_RE = re.compile(r"\s+[—–-]\s+|;\s+|,\s+(?=(?:and|but|so|plus|though|with)\b)", re.IGNORECASE)
 
 # Rule 2 approved statements (audit finding 7). Each pattern is matched
-# against a whole clause, lower-cased, with dashes as "-" and ₹799 written
-# out (_normalize). They come from brain.md's own templates plus a few
-# common phrasings; anything else with a trigger word is held.
+# against a clause lower-cased, with dashes as "-" and ₹799 written out
+# (_normalize). They come from brain.md's own templates plus a few common
+# phrasings; anything else with a trigger word is held.
 _T = r"₹799"
 _LEAD = r"(?:(?:and|but|plus|also|so|with) )?"
 _FREE_SHIPPING = r"(?:free shipping|shipping(?:'s| is)(?: also)? free|(?:it |this |your order |the order )?ships (?:for )?free)"
@@ -100,6 +107,11 @@ _FREE_SHIPPING_THIS_ORDER = (
 _FREE_SHIPPING_BULK = (
     rf"{_LEAD}shipping is free,? since an order that size is well above {_T}",
 )
+# Below the threshold — says shipping ISN'T free, brain.md:923.
+_UNDER_THRESHOLD = (
+    rf"(?:is|it's|it is|falls|fall|would fall|comes to|comes in)(?: just)? (?:under|below) (?:our |the )?"
+    rf"(?:{_T} free[- ]shipping threshold|free[- ]shipping threshold of {_T})",
+)
 
 # No discount / no codes — brain.md:606 ("there's no additional discount
 # available at the moment") and its code variants.
@@ -116,18 +128,21 @@ _NO_DISCOUNT = (
 # Shipping charges aren't refunded — brain.md's refund notes and the
 # store's refund policy page.
 _NON_REFUNDABLE = (
-    rf"{_LEAD}(?:the )?shipping (?:charges?|fees?|costs?)(?: \(if (?:paid|any)\))? "
+    rf"{_LEAD}(?:the )?shipping (?:charges?|fees?|costs?)(?: \((?:if paid|if any)\)|,? (?:if paid|if any),?)? "
     r"(?:(?:are|is) (?:non-refundable|not refundable)|(?:aren't|isn't) refundable)",
 )
 
 # The refund timeline — brain.md:442-445 and the store's refund policy
 # page: initiated within 24-48 hours of approval, then 5-7 working days to
 # UPI/bank and 7-10 working days to cards ("business days" = "working
-# days"). Always conditional on approval: "your refund will be initiated
-# in 24-48 hours" (a promise, brain.md:878) matches nothing.
+# days"). Every form carries an approval condition: "your refund will be
+# initiated in 24-48 hours" (a promise, brain.md:878) matches nothing.
 _COND = r"(?:(?:once|if|after) (?:(?:a |the |your )?(?:return|refund|it)(?: is|'s)? )?approved[,:]? )"
+_COND_AFTER = (r"(?:(?:once|after|when) (?:(?:a |the |your )?(?:return|refund|it)(?: is|'s)? (?:received and )?approved"
+               r"|we (?:receive and )?approve (?:the |your )?(?:return|refund|it)))")
 _SUBJ = r"(?:(?:the |your )?refunds? (?:is |are |gets? )?)"
 _INIT = r"initiated within 24-48 (?:hours|hrs)"
+_WE_INIT = r"we initiate (?:it|the refund|your refund|refunds) within 24-48 (?:hours|hrs)"
 _UPI_DAYS = r"5-7 (?:working|business) days"
 _CARD_DAYS = r"7-10 (?:working|business) days"
 _DEST = (r"(?:(?:your |the )?(?:original payment method|upi/bank(?: accounts?)?|bank/upi(?: accounts?)?"
@@ -141,8 +156,11 @@ _REFLECT = (
 )
 _THEN = r"(?:,? (?:and |then |and then )?(?:it )?(?:then )?)"
 _REFUND_TIMELINE = (
-    rf"{_LEAD}{_COND}{_SUBJ}{_INIT}(?: of approval)?(?:{_THEN}{_REFLECT})?",
+    rf"{_LEAD}{_COND}(?:{_SUBJ}|it's |it is |it gets ){_INIT}(?: of approval)?(?:{_THEN}{_REFLECT})?",
+    rf"{_LEAD}{_COND}{_WE_INIT}(?:{_THEN}{_REFLECT})?",
     rf"{_LEAD}{_SUBJ}{_INIT} of approval(?:{_THEN}{_REFLECT})?",
+    rf"{_LEAD}approved refunds (?:are |get )?{_INIT}(?:{_THEN}{_REFLECT})?",
+    rf"{_LEAD}{_SUBJ}{_INIT} {_COND_AFTER}(?:{_THEN}{_REFLECT})?",
     rf"{_LEAD}(?:refunds?|the refund) (?:then )?{_REFLECT}",
     rf"{_LEAD}(?:refunds?|the refund) (?:then )?takes? (?:{_UPI_DAYS}(?: (?:for|on) {_DEST})?"
     rf"(?:,? (?:and|or) {_CARD_DAYS} (?:for|on) {_CARD})?|{_CARD_DAYS} (?:for|on) {_CARD})",
@@ -156,16 +174,19 @@ _DURATION_RE = re.compile(
 _TIMELINE_DURATION_RE = re.compile(rf"24-48 (?:hours|hrs)|{_UPI_DAYS}|{_CARD_DAYS}")
 
 
-def _ends_clause(patterns) -> tuple:
-    """Compile statements that must end their clause; whatever comes before
-    them in the clause is checked for trigger words separately."""
-    return tuple(re.compile(r"(?:^|(?<=\s))(?:" + p + r")$") for p in patterns)
+def _compile(patterns, at_end: bool) -> tuple:
+    """A statement starts at a word; it must end the clause (at_end) or be
+    followed by a space or punctuation."""
+    tail = r"$" if at_end else r"(?=$|[\s,.;:!?])"
+    return tuple(re.compile(r"(?:^|(?<=\s))(?:" + p + r")" + tail) for p in patterns)
 
 
-_ENDS_CLAUSE_STATEMENTS = _ends_clause(
-    _FREE_SHIPPING_RULE + _FREE_SHIPPING_BULK + _NO_DISCOUNT + _NON_REFUNDABLE)
-_THIS_ORDER_STATEMENTS = _ends_clause(_FREE_SHIPPING_THIS_ORDER)
-_WHOLE_CLAUSE_STATEMENTS = tuple(re.compile(p) for p in _REFUND_TIMELINE)
+# Free shipping with the threshold may be followed by more words ("…above
+# ₹799, which two trays would qualify for"); the others must end the clause.
+_FREE_SHIPPING_STATEMENTS = _compile(_FREE_SHIPPING_RULE + _FREE_SHIPPING_BULK, at_end=False)
+_THIS_ORDER_STATEMENTS = _compile(_FREE_SHIPPING_THIS_ORDER, at_end=False)
+_CLAUSE_END_STATEMENTS = _compile(_NO_DISCOUNT + _NON_REFUNDABLE + _UNDER_THRESHOLD, at_end=True)
+_REFUND_STATEMENTS = tuple(re.compile(p) for p in _REFUND_TIMELINE)
 
 # Per-unit prices ("₹749/tray", "₹85 per pair") aren't order amounts.
 _PER_UNIT_RE = re.compile(
@@ -229,22 +250,21 @@ def _order_amounts(text: str) -> list[float]:
             if not _PER_UNIT_RE.match(text, m.end())]
 
 
-def _ends_with_statement(clause: str, statements) -> bool:
-    """The clause ends with an approved statement and has no trigger word
-    before it."""
+def _covered(clause: str, statements) -> bool:
+    """One approved statement in the clause, and no trigger word outside it."""
     for pat in statements:
-        m = pat.search(clause)
-        if m and not _PROMO_WORDS_RE.search(_CRUELTY_FREE_RE.sub(" ", clause[:m.start()])):
-            return True
+        for m in pat.finditer(clause):
+            if not _PROMO_WORDS_RE.search(clause[:m.start()] + " " + clause[m.end():]):
+                return True
     return False
 
 
 def _approved(clause: str, rest_of_sentence: str, under_threshold_amount: bool) -> bool:
-    if _ends_with_statement(clause, _ENDS_CLAUSE_STATEMENTS):
+    if _covered(clause, _FREE_SHIPPING_STATEMENTS) or _covered(clause, _CLAUSE_END_STATEMENTS):
         return True
-    if _ends_with_statement(clause, _THIS_ORDER_STATEMENTS) and not under_threshold_amount:
+    if _covered(clause, _THIS_ORDER_STATEMENTS) and not under_threshold_amount:
         return True
-    if any(p.fullmatch(clause) for p in _WHOLE_CLAUSE_STATEMENTS):
+    if any(p.fullmatch(clause) for p in _REFUND_STATEMENTS):
         return all(_TIMELINE_DURATION_RE.fullmatch(d)
                    for d in _DURATION_RE.findall(rest_of_sentence))
     return False
@@ -256,10 +276,10 @@ def _rule2_words(text: str) -> list[str]:
     under_threshold = any(a < FREE_SHIPPING_THRESHOLD_INR for a in _order_amounts(text))
     left: list[str] = []
     for sentence in _SENTENCE_SPLIT_RE.split(text or ""):
-        clauses = _CLAUSE_SPLIT_RE.split(sentence)
+        clauses = [_EXEMPT_PHRASES_RE.sub(" ", c) for c in _CLAUSE_SPLIT_RE.split(sentence)]
         normalized = [_normalize(c) for c in clauses]
         for i, clause in enumerate(clauses):
-            words = [m.group(0) for m in _PROMO_WORDS_RE.finditer(_CRUELTY_FREE_RE.sub(" ", clause))]
+            words = [m.group(0) for m in _PROMO_WORDS_RE.finditer(clause)]
             if words and not _approved(normalized[i], " ".join(normalized[i:]), under_threshold):
                 left.extend(words)
     return left
