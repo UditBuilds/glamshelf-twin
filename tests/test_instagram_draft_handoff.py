@@ -130,7 +130,8 @@ class DraftHandoffTest(ResetDb):
         self.assertEqual(draft["reply_text"], DRAFT_REPLY)
         self.assertEqual(draft["channel"], "Instagram")
         self.assertEqual(self.sources(), ["DRAFT_HANDOFF_IG", "DRAFT_PENDING_IG"])
-        # The audit row has no customer text, so it never enters history.
+        # The handoff row keeps an empty message_text; history pairs it with
+        # the pending-draft row that follows (tests.test_history_after_handoff).
         (row,) = db_rows(
             "SELECT message_text, reply_text FROM instagram_logs WHERE source = 'DRAFT_HANDOFF_IG'"
         )
