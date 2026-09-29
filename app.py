@@ -5119,10 +5119,13 @@ ALLERGY_HOLDING_REPLY = (
     + " Team The Glam Shelf will personally look into this and get back to you shortly 🤍"
 )
 
-# Someone testing Twin, a brand owner, or anyone asking about the AI service
-# (audit T1-5): a friendly line, a Telegram LEAD notice and NO pause. Sent
-# verbatim when the model didn't write a reply of its own. Mirrors brain.md
-# RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS ASSISTANT.
+# brain.md's line for someone asking to get this assistant for their own
+# brand, or how it works (RULE: TESTERS, BRAND OWNERS & QUESTIONS ABOUT THIS
+# ASSISTANT). A tester's question gets a normal answer, and a tester with no
+# question gets brain.md's invite line — both written by the model. Code
+# sends this line verbatim only when the model wrote no reply of its own,
+# e.g. it escalated a tester and tagged it LEAD. Every LEAD also gets a
+# Telegram LEAD notice and NO pause (audit T1-5).
 LEAD_REPLY = "Thanks for checking it out! Udit will message you personally 🤍"
 
 # The optional "tag" field of the model's JSON (see build_user_message and
@@ -5153,12 +5156,14 @@ _SAFETY_RE = re.compile(
     re.IGNORECASE,
 )
 # Testers / brand owners whose reply came back without the LEAD tag. Only
-# ever adds a LEAD notice to an AUTO reply — it can't turn an escalation
-# into a lead.
+# ever adds a LEAD notice — to an AUTO reply, or next to a draft that waits
+# for approval — it can't turn an escalation into a lead. "Udit sent me"
+# must be the next words, so "udit, you sent me the wrong pair" isn't one.
 _LEAD_RE = re.compile(
     r"\budit\b.{0,40}\b(test\w*|tr(y|ying|ied|ies)|check\w*)"
+    r"|\budit (sent|referred|recommended) (me|us)\b(?! (a|an|the|my|wrong)\b)"
     r"|\b(test\w*|tr(y|ying|ied|ies)|check\w*)\b.{0,40}\b(ai|bot|chat ?bot|assistant|twin|automation)\b"
-    r"|\b(ai|chat ?bot|assistant|automation)\b.{0,40}\bfor (my|our) (brand|business|store|company)\b"
+    r"|\b(ai|bot|chat ?bot|assistant|automation)\b.{0,40}\bfor (my|our) (brand|business|store|company)\b"
     r"|\bbrand owner\b",
     re.IGNORECASE,
 )
@@ -7752,10 +7757,11 @@ def _ig_escalate(
 def _ig_lead(sender_id: str, text: str, timestamp: str, reply: str) -> bool:
     """LEAD path (audit T1-5): someone testing Twin, a brand owner, or
     anyone asking about the AI service. Sends the model's reply when it
-    wrote one (brain.md tells it to use the LEAD line, after a short answer
-    if they also asked something), else LEAD_REPLY verbatim; pages the
-    founder with a LEAD notice; and does NOT pause — the tester keeps
-    chatting with Twin like a customer would.
+    wrote one (per brain.md: a tester's question answered like any
+    customer's, an invite line when they asked nothing, the LEAD line for
+    someone who wants this assistant for their brand), else LEAD_REPLY
+    verbatim; pages the founder with a LEAD notice; and does NOT pause —
+    the tester keeps chatting with Twin like a customer would.
 
     Shared with graph.py's dispatch_lead so the two stay in parity."""
     customer_text = reply or LEAD_REPLY
@@ -7779,6 +7785,37 @@ def _ig_lead(sender_id: str, text: str, timestamp: str, reply: str) -> bool:
         f"founder notified, no pause"
     )
     return sent
+
+
+def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: bool) -> None:
+    """A tester's answer that went to DRAFT+APPROVE — brain.md drafts that
+    question for every customer, or the output guard held the AUTO answer
+    (audit finding #4). The draft still waits for approval as usual; this
+    only adds the LEAD notice _ig_lead sends on the AUTO path, showing what
+    the customer actually got. Same signals as _ig_is_lead (the LEAD tag or
+    the _LEAD_RE backstop), and the same serious signals outrank it.
+
+    Instagram handler only — graph.py's dispatch_draft doesn't call it."""
+    if tag != "LEAD" and not _LEAD_RE.search(text or ""):
+        return
+    if _escalation_prefilter_hit(text) or _bulk_commit_prefilter_hit(text) is not None:
+        return
+    if _ig_escalation_reply(text, tag)[0] != "other":
+        return
+    shown = (
+        BRAIN_HOLDING_LINE if handoff_sent
+        else "(nothing new — they got the handoff line recently)"
+    )
+    try:
+        send_telegram_notification(
+            "LEAD", text, shown,
+            sender_info=f"Instagram DM — sender {sender_id}",
+            channel="Instagram",
+            customer_id=sender_id,
+        )
+    except Exception as tg_err:
+        print(f"[INSTAGRAM-TG] LEAD notice failed: {type(tg_err).__name__}: {tg_err}")
+    print(f"[INSTAGRAM-LEAD] {sender_id}'s answer waits for approval; founder notified, no pause")
 
 
 def _ig_fyi_topic(message: str, tag: str) -> str:
@@ -8086,15 +8123,16 @@ def _process_instagram_event(event: dict) -> None:
 
         # Output guard (audit T1-4): an AUTO reply that trips a rule is held
         # for approval instead of sent — before the LEAD check, so a
-        # tester's AUTO reply is guarded too.
+        # tester's AUTO reply is guarded too (the draft branch below still
+        # sends their LEAD notice).
         guard_note = _ig_output_guard(sender_id, classification, reply)
         if guard_note:
             classification = "DRAFT+APPROVE"
 
         # Testers, brand owners and people asking about the AI service get
-        # a friendly reply, a LEAD notice and no 4h lockout (audit T1-5) —
-        # unless something more serious (legal, press, health, a
-        # prefilter hit) is going on; see _ig_is_lead.
+        # their answer (or brain.md's invite / LEAD line), a LEAD notice and
+        # no 4h lockout (audit T1-5) — unless something more serious (legal,
+        # press, health, a prefilter hit) is going on; see _ig_is_lead.
         tag = _parse_twin_tag(_raw)
         if _ig_is_lead(text, classification, reply, tag):
             _ig_lead(sender_id, text, timestamp, reply if classification == "AUTO" else "")
@@ -8162,7 +8200,7 @@ def _process_instagram_event(event: dict) -> None:
             # line (audit T2-14). Falls back to a plain-text notification
             # if the buttoned send fails so Udit always gets *some*
             # heads-up about the pending draft.
-            _ig_draft_handoff(sender_id, timestamp)
+            handoff_sent = _ig_draft_handoff(sender_id, timestamp)
             sent_with_buttons = send_draft_for_approval(
                 customer_number=sender_id,
                 customer_name="",
@@ -8183,6 +8221,9 @@ def _process_instagram_event(event: dict) -> None:
                         f"[INSTAGRAM-TG] Fallback notification failed: "
                         f"{type(tg_err).__name__}: {tg_err}"
                     )
+            # A tester whose answer waits for approval is still a LEAD: the
+            # founder gets the LEAD notice too (audit finding #4).
+            _ig_lead_draft_notice(sender_id, text, tag, handoff_sent)
             # Log the pending draft with a NULL reply: _load_instagram_history
             # filters on reply_text IS NOT NULL, so an un-approved draft never
             # appears in conversation context as if the customer received it.
