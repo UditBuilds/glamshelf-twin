@@ -186,7 +186,10 @@ class ProspectHandler(unittest.TestCase):
         self.model = ("DRAFT+APPROVE", "We accept returns within 14 days of delivery 🤍", "LEAD")
         self.dm("udit asked me to test this. can i return a tray i didnt like?")
         self.dm("and if it arrives damaged?")
-        self.assertEqual(self.sends, [HANDOFF])            # handoff line once per window
+        # Handoff line once per window; the second draft gets the one-time
+        # acknowledgement instead (audit finding 1). Known gap — the lead path
+        # was out of scope there: this notice doesn't mention it yet.
+        self.assertEqual(self.sends, [HANDOFF, glam.IG_DRAFT_ACK_LINE])
         first, second = self.lead_notices()
         self.assertEqual(first["reply"], HANDOFF)
         self.assertIn("nothing new", second["reply"])

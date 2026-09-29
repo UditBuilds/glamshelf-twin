@@ -2765,6 +2765,18 @@ def _resume_sender(sender_id: str) -> bool:
     return was_paused
 
 
+# Sources whose row keeps a reply the customer never received (the send
+# failed): kept for audit, never replayed as history.
+_IG_HISTORY_EXCLUDED_SOURCES = frozenset({
+    "AUTO_FAILED_IG", "DRAFT_SEND_FAILED_IG", "ESCALATE_HOLDING_FAILED_IG",
+    "PIPELINE_HOLDING_FAILED_IG", "PHOTO_IG_FAILED", "LEAD_FAILED_IG",
+})
+# A delivered line a DRAFT+APPROVE turn logs with an empty message_text, right
+# before the turn's DRAFT_PENDING_IG row (see _ig_draft_handoff): the handoff
+# line, or inside its window the one-time acknowledgement.
+_IG_DRAFT_LINE_SOURCES = frozenset({"DRAFT_HANDOFF_IG", "DRAFT_ACK_IG"})
+
+
 def _load_instagram_history(sender_id: str) -> list[dict]:
     """Pull up to 30 recent (DM, reply) exchanges with this Instagram
     sender from the last 7 days, oldest first.
@@ -2780,10 +2792,25 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
     msg_text / reply_text / ts. ts is a placeholder (0) here since we
     don't need it for the prompt construction.
 
-    HUMAN_UDIT_INSTAGRAM rows (Udit's manual IG-app replies) are
-    excluded via the `message_text IS NOT NULL` filter because those
-    rows are written with empty message_text — they're for the safety-net
-    check, not the conversation context Claude should reply to.
+    Only text the customer actually received counts as a reply:
+      - failed sends (_IG_HISTORY_EXCLUDED_SOURCES) are left out;
+      - a DRAFT+APPROVE turn (the model's draft, or an AUTO reply the output
+        guard held) logs the line the customer got — DRAFT_HANDOFF_IG, or
+        DRAFT_ACK_IG for the one-time acknowledgement inside the handoff
+        window — with an empty message_text, and right after it the pending
+        draft, DRAFT_PENDING_IG, with the customer's message and a NULL
+        reply. The two are paired here into one exchange, so the next turn
+        knows the customer was told the team will reply (audit finding 1). A
+        pending draft with no delivered line right before it got nothing
+        (both lines went out recently, or the send failed), so it's left
+        out. The draft text itself is never in this table; once the founder
+        approves it, the text actually sent is logged as DRAFT_SENT_IG, its
+        own exchange;
+      - HUMAN_UDIT_INSTAGRAM and RESUME_IG rows have an empty message_text —
+        they're for the safety-net checks, not the conversation context.
+
+    Rows are read in insertion (id) order: logged_at has one-second
+    resolution, so it can't order rows written in the same second.
 
     Failures return [] silently so the call falls back to single-turn
     behavior, identical to a brand-new sender.
@@ -2792,33 +2819,33 @@ def _load_instagram_history(sender_id: str) -> list[dict]:
         return []
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT message_text, reply_text
-            FROM instagram_logs
-            WHERE sender_id = ?
-              AND message_text IS NOT NULL
-              AND message_text != ''
-              AND reply_text IS NOT NULL
-              AND (source IS NULL
-                   OR source NOT IN ('AUTO_FAILED_IG', 'DRAFT_SEND_FAILED_IG',
-                                     'ESCALATE_HOLDING_FAILED_IG',
-                                     'PIPELINE_HOLDING_FAILED_IG',
-                                     'PHOTO_IG_FAILED',
-                                     'LEAD_FAILED_IG'))
-              AND logged_at >= datetime('now', '-7 days')
-            ORDER BY logged_at DESC
-            LIMIT 30
-            """,
-            (sender_id,),
-        )
-        rows = cur.fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                """
+                SELECT message_text, reply_text, source
+                FROM instagram_logs
+                WHERE sender_id = ?
+                  AND logged_at >= datetime('now', '-7 days')
+                ORDER BY id DESC
+                LIMIT 500
+                """,
+                (sender_id,),
+            ).fetchall()
+        finally:
+            conn.close()
         rows.reverse()  # oldest first
-        history = [
-            {"ts": 0, "msg_text": r[0], "reply_text": r[1]} for r in rows
-        ]
+        history = []
+        line = None  # a delivered draft line waiting for its pending-draft row
+        for message_text, reply_text, source in rows:
+            if source in _IG_DRAFT_LINE_SOURCES:
+                line = reply_text
+                continue
+            if source == "DRAFT_PENDING_IG":
+                reply_text = line
+            line = None
+            if message_text and reply_text is not None and source not in _IG_HISTORY_EXCLUDED_SOURCES:
+                history.append({"ts": 0, "msg_text": message_text, "reply_text": reply_text})
+        history = history[-30:]
         print(f"[INSTAGRAM] Loaded {len(history)} history turns for {sender_id}")
         return history
     except Exception as e:
@@ -3268,7 +3295,10 @@ def send_draft_for_approval(
     customer_number carries the IG sender_id and ig_timestamp carries the
     original event timestamp (used when logging the delivered exchange).
     `guard_note`, when set, is the output-guard rule that held an AUTO
-    reply back (audit T1-4) and is shown under the header.
+    reply back (audit T1-4) and is shown under the header. An empty
+    `reply_text` — the model wrote nothing, and the Instagram handler routed
+    the message here rather than stay silent (audit finding 1) — says so and
+    offers only ✏️ Edit and ⛔ Skip: there's nothing to send as-is.
 
     Returns True if the buttoned message was sent and state was registered;
     False on any failure (caller may fall back to plain-text notification).
@@ -3285,13 +3315,15 @@ def send_draft_for_approval(
     if guard_note:
         # Twin classified this AUTO; the output guard held it (audit T1-4).
         header += f"\n🛡️ Output guard held Twin's AUTO reply — {guard_note}"
+    if not reply_text:
+        header += "\n⚠️ Twin wrote no reply — tap ✏️ Edit to answer, or ⛔ Skip."
     text = (
         f"{header}\n\n"
         f"From: {sender_block}\n\n"
         "Customer said:\n"
         f'"{customer_message}"\n\n'
         "Drafted reply:\n"
-        f'"{reply_text}"'
+        + (f'"{reply_text}"' if reply_text else "(none)")
     )
     if channel == "Instagram":
         text += f"\n\n{IG_APPROVAL_DEADLINE_LINE}"
@@ -3300,13 +3332,14 @@ def send_draft_for_approval(
     #   "action:<verb>|num:<wa_id-or-ig-sender-id>|id:<8-hex>"
     # Worst case: action:send (11) + |num: (5) + 17-digit IG sender_id
     # + |id: (4) + 8 = 45 bytes (12-digit wa_id: 40 bytes).
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Send as-is", "callback_data": f"action:send|num:{customer_number}|id:{draft_id}"},
-            {"text": "✏️ Edit",       "callback_data": f"action:edit|num:{customer_number}|id:{draft_id}"},
-            {"text": "⛔ Skip",        "callback_data": f"action:skip|num:{customer_number}|id:{draft_id}"},
-        ]]
-    }
+    buttons = [
+        {"text": "✅ Send as-is", "callback_data": f"action:send|num:{customer_number}|id:{draft_id}"},
+        {"text": "✏️ Edit",       "callback_data": f"action:edit|num:{customer_number}|id:{draft_id}"},
+        {"text": "⛔ Skip",        "callback_data": f"action:skip|num:{customer_number}|id:{draft_id}"},
+    ]
+    if not reply_text:
+        buttons = buttons[1:]  # no draft to send as-is
+    keyboard = {"inline_keyboard": [buttons]}
 
     # Register the draft BEFORE sending the buttoned message: if the DB
     # write fails, we return False so the caller falls back to the plain
@@ -3558,7 +3591,8 @@ def _handle_telegram_callback(cb: dict) -> None:
             # IG draft: customer_number holds the IG sender_id. Deliver via
             # the Graph API and record the exchange in instagram_logs so
             # _load_instagram_history sees this turn (the pending-draft row
-            # was written with a NULL reply and is invisible to history).
+            # never holds the draft — history only shows it with the handoff
+            # line the customer got at the time).
             # Failed sends get DRAFT_SEND_FAILED_IG, which the history
             # loader excludes. No _reassign_to_bot — WATI-only concept.
             sent, send_err = _send_instagram_reply(
@@ -7638,6 +7672,13 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
 # escalation paths, so a burst of drafts doesn't repeat it.
 IG_DRAFT_HANDOFF_WINDOW_SECONDS = 30 * 60
 
+# A follow-up that goes to DRAFT+APPROVE inside that window used to get
+# nothing at all (audit finding 1). It now gets this once — a different,
+# shorter line, never the handoff line again — at most once per sender per
+# window. After that the customer gets nothing new until the team replies;
+# the founder still gets every draft. The founder's wording.
+IG_DRAFT_ACK_LINE = "Got it — I've added this to your request, the team will reply here 🤍"
+
 
 def _ig_handoff_sent_recently(sender_id: str) -> bool:
     """Did this sender get BRAIN_HOLDING_LINE inside the window? Read from
@@ -7660,29 +7701,74 @@ def _ig_handoff_sent_recently(sender_id: str) -> bool:
         return False
 
 
-def _ig_draft_handoff(sender_id: str, timestamp: str) -> bool:
-    """Send the Default Handoff Line when an Instagram message goes to
-    DRAFT+APPROVE, unless this sender already got it inside the window.
-    Logged with an empty message_text — the customer's message belongs to
-    the pending draft row, and the delivered exchange is logged on
-    approval — so the row is audit-only and never enters history. A failed
-    send is logged under DRAFT_HANDOFF_FAILED_IG and the next draft tries
-    again. Returns whether the line was sent now.
-
-    Shared with graph.py's dispatch_draft so the two stay in parity."""
-    if _ig_handoff_sent_recently(sender_id):
-        print(f"[INSTAGRAM-DRAFT] {sender_id} already got the handoff line recently — not repeating it")
+def _ig_ack_sent_recently(sender_id: str) -> bool:
+    """Did this sender get IG_DRAFT_ACK_LINE inside the window? Read from
+    instagram_logs, so it survives restarts. Fails open (False)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM instagram_logs "
+                "WHERE sender_id = ? AND source = 'DRAFT_ACK_IG' "
+                "AND logged_at >= datetime('now', ?) LIMIT 1",
+                (sender_id, f"-{IG_DRAFT_HANDOFF_WINDOW_SECONDS} seconds"),
+            ).fetchone()
+        finally:
+            conn.close()
+        return hit is not None
+    except Exception as e:
+        print(f"[INSTAGRAM] Acknowledgement window check failed for {sender_id}: {type(e).__name__}: {e}")
         return False
-    sent, send_err = _send_instagram_reply(sender_id, BRAIN_HOLDING_LINE)
+
+
+def _ig_send_draft_line(sender_id: str, timestamp: str, line: str, source: str, label: str) -> bool:
+    """Send one of _ig_draft_handoff's lines and log it with an empty
+    message_text under `source` + "_IG", or + "_FAILED_IG" when the send
+    failed. Returns whether it was delivered."""
+    sent, send_err = _send_instagram_reply(sender_id, line)
     _log_instagram(
-        sender_id, "", BRAIN_HOLDING_LINE, timestamp,
-        source="DRAFT_HANDOFF_IG" if sent else "DRAFT_HANDOFF_FAILED_IG",
+        sender_id, "", line, timestamp,
+        source=f"{source}_IG" if sent else f"{source}_FAILED_IG",
     )
     if sent:
-        print(f"[INSTAGRAM-DRAFT] Handoff line sent to {sender_id}")
+        print(f"[INSTAGRAM-DRAFT] {label} sent to {sender_id}")
     else:
-        print(f"[INSTAGRAM-DRAFT] Handoff line to {sender_id} FAILED: {send_err}")
+        print(f"[INSTAGRAM-DRAFT] {label} to {sender_id} FAILED: {send_err}")
     return sent
+
+
+def _ig_draft_handoff(sender_id: str, timestamp: str) -> bool:
+    """What the customer gets while their Instagram message waits as a
+    DRAFT+APPROVE for the founder:
+      - the Default Handoff Line, unless this sender got it inside the
+        window (audit T2-14);
+      - inside the window, IG_DRAFT_ACK_LINE instead — at most once per
+        window, and only if the output guard passes it (audit finding 1);
+      - after that, nothing new. The founder still gets every draft.
+    Each line is logged with an empty message_text: the caller's
+    DRAFT_PENDING_IG row, written right after, carries the customer's
+    message, and _load_instagram_history pairs the two into one exchange. A
+    failed send is logged under DRAFT_HANDOFF_FAILED_IG / DRAFT_ACK_FAILED_IG,
+    which are never paired nor counted by the window checks, so the next
+    draft tries again. Returns whether the handoff line itself was sent now
+    (the LEAD notice on a draft reads it; an acknowledgement returns False).
+
+    Shared with graph.py's dispatch_draft so the two stay in parity."""
+    if not _ig_handoff_sent_recently(sender_id):
+        return _ig_send_draft_line(
+            sender_id, timestamp, BRAIN_HOLDING_LINE, "DRAFT_HANDOFF", "Handoff line")
+    if _ig_ack_sent_recently(sender_id):
+        print(
+            f"[INSTAGRAM-DRAFT] {sender_id} already got the handoff line and the "
+            f"acknowledgement recently — not repeating either"
+        )
+        return False
+    print(f"[INSTAGRAM-DRAFT] {sender_id} already got the handoff line recently — not repeating it")
+    if _ig_output_guard(sender_id, "AUTO", IG_DRAFT_ACK_LINE):
+        print(f"[INSTAGRAM-DRAFT] Acknowledgement to {sender_id} held by the output guard — nothing sent")
+        return False
+    _ig_send_draft_line(sender_id, timestamp, IG_DRAFT_ACK_LINE, "DRAFT_ACK", "Acknowledgement")
+    return False
 
 
 def _ig_escalate(
@@ -8151,13 +8237,17 @@ def _process_instagram_event(event: dict) -> None:
                 print("[ESCALATE] Verdict with no usable reply — escalating instead of dropping")
                 fallback_escalation = True
             elif classification in ("AUTO", "DRAFT+APPROVE"):
-                # A deliberately empty reply — e.g. brain.md's "stay silent
-                # after a holding message" rule. Nothing to send.
+                # Never silence (audit finding 1): an empty reply goes to the
+                # founder as a draft, the same way an output-guard hold does,
+                # and the customer gets the handoff line (or, inside its
+                # window, the one-time acknowledgement) — see
+                # _ig_draft_handoff. Instagram handler only: graph.py's
+                # triage still drops it.
                 print(
-                    f"[INSTAGRAM] Twin returned empty result "
-                    f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                    f"[INSTAGRAM] Twin returned an empty {classification} reply for "
+                    f"{sender_id} — sending the message to the founder as a draft"
                 )
-                return
+                classification = "DRAFT+APPROVE"
             else:
                 print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
                 _ig_pipeline_failure(
@@ -8201,9 +8291,10 @@ def _process_instagram_event(event: dict) -> None:
             # sender_id via the shared pending_drafts table. The drafted
             # reply ships from /telegram-callback when Udit taps Send (or
             # completes an Edit); meanwhile the customer gets the handoff
-            # line (audit T2-14). Falls back to a plain-text notification
-            # if the buttoned send fails so Udit always gets *some*
-            # heads-up about the pending draft.
+            # line (audit T2-14), or inside its window a one-time
+            # acknowledgement (finding 1). Falls back to a plain-text
+            # notification if the buttoned send fails so Udit always gets
+            # *some* heads-up about the pending draft.
             handoff_sent = _ig_draft_handoff(sender_id, timestamp)
             sent_with_buttons = send_draft_for_approval(
                 customer_number=sender_id,
@@ -8228,10 +8319,12 @@ def _process_instagram_event(event: dict) -> None:
             # A tester whose answer waits for approval is still a LEAD: the
             # founder gets the LEAD notice too (audit finding #4).
             _ig_lead_draft_notice(sender_id, text, tag, handoff_sent)
-            # Log the pending draft with a NULL reply: _load_instagram_history
-            # filters on reply_text IS NOT NULL, so an un-approved draft never
-            # appears in conversation context as if the customer received it.
-            # The delivered exchange is logged (DRAFT_SENT_IG) on approval.
+            # Log the pending draft with a NULL reply — the draft text is never
+            # stored here, so an un-approved draft can't appear in conversation
+            # context as if the customer received it. _load_instagram_history
+            # pairs this row with the line _ig_draft_handoff logged just before
+            # it, i.e. what the customer actually got. The approved text is
+            # logged (DRAFT_SENT_IG) on approval.
             _log_instagram(sender_id, text, None, timestamp, source="DRAFT_PENDING_IG")
             print(f"[INSTAGRAM-DRAFT] Notified founder for {sender_id} (buttons={sent_with_buttons})")
 
