@@ -16,7 +16,7 @@ Every incoming message on WhatsApp or Instagram is classified into one of three 
 
 **ESCALATE** — Situations that need human judgment: refund disputes, damage claims, angry customers, legal threats, bulk negotiations. The founder is paged on Telegram and the twin pauses itself for that customer for 4 hours (lift it early from Telegram with ▶️ Resume bot or `#resume <id>`). On Instagram the customer gets the same handoff line — or, for an allergic reaction, advice to stop using the product and see a doctor — except legal threats and press enquiries, which get no automated reply. On WhatsApp a normal escalation sends nothing; a stock holding reply goes out only when the model's output was unusable.
 
-People testing the assistant, or asking about it, get a friendly one-liner and the founder a LEAD notice on Telegram — no pause.
+People testing the assistant get their question answered like any customer's, or a one-line invite to ask one; anyone asking to get it for their own brand gets a friendly one-liner. Either way the founder gets a LEAD notice on Telegram, even when the answer waits for approval — and there's no pause.
 
 ---
 
