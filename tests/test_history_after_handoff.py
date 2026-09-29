@@ -22,6 +22,9 @@ and into history like the handoff line.
 An empty model reply (AUTO or DRAFT+APPROVE) is no longer dropped either: it
 goes to the founder as a draft, like an output-guard hold.
 
+ContextBleedTest pins the May 5 defences: a past draft or escalation must not
+make an unrelated next message get drafted or escalated.
+
 The model is a fake DeepSeek client that records the exact `messages` array,
 so "what history the model was given" is asserted directly. Instagram sends,
 Telegram and the Shopify / RAG context are stubbed; log rows are real, in a
@@ -444,6 +447,64 @@ class EmptyReplyTest(HandlerTestCase):
         self.assertEqual(self.drafts(), [])
         self.assertEqual([n[0] for n in self.notices], ["ESCALATE"])
         self.assertTrue(glam._is_paused(SENDER))
+
+
+class ContextBleedTest(HandlerTestCase):
+    """The May 5 pattern (decision 3): a past escalation fed back into
+    history made an unrelated bestseller question escalate. The model now
+    sees more of the past (the handoff line after a draft), so pin the
+    defences: history carries only text the customer received — never the
+    model's own draft or escalation text, never a route label — and no code
+    path routes a new message by what came before it. Whether the MODEL
+    stays on topic is checked by the live runner, not here."""
+
+    DAMAGED = "my order came damaged"
+    PRICE_Q = "whats the price of GS1?"
+    PRICE_A = "GS1 is ₹849 for a tray of 10 pairs 🤍"
+    ESCALATION_DRAFT = "I'm flagging this for our team to sort out for you personally 🤍"
+
+    def assert_answered_normally(self):
+        self.assertEqual(self.sends[-1], self.PRICE_A)
+        self.assertFalse(glam._is_paused(SENDER))
+        self.assertEqual(self.sources()[-1], None)      # a plain delivered AUTO exchange
+
+    def assert_history_is_only_delivered_text(self, expected):
+        self.assertEqual(self.history_for_last_call(), expected)
+        history_text = json.dumps(self.model.calls[-1][1:-1], ensure_ascii=False)
+        for leak in ("DRAFT", "ESCALATE", "classification", self.ESCALATION_DRAFT):
+            self.assertNotIn(leak, history_text)
+
+    def test_after_a_draft_an_unrelated_question_stays_auto(self):
+        self.dm(self.DAMAGED, model_output("DRAFT+APPROVE", "So sorry — could you send photos of the damage? 🤍"))
+        self.dm(self.PRICE_Q, model_output("AUTO", self.PRICE_A))
+        self.assert_answered_normally()
+        self.assertEqual(len(self.drafts()), 1)             # only the damage claim
+        self.assertEqual(self.sends, [HANDOFF, self.PRICE_A])  # no acknowledgement for an AUTO reply
+        self.assert_history_is_only_delivered_text([(wrap(self.DAMAGED), HANDOFF)])
+        self.assertNotIn("could you send photos", self.last_prompt())
+
+    def test_after_an_escalation_and_a_resume_an_unrelated_question_stays_auto(self):
+        self.dm(self.DAMAGED, model_output("ESCALATE", self.ESCALATION_DRAFT))
+        self.assertEqual(self.sends, [HANDOFF])             # the holding line, not the draft
+        self.assertTrue(glam._is_paused(SENDER))
+        with redirect_stdout(io.StringIO()):
+            glam._resume_sender(SENDER)                      # the founder taps ▶️ Resume bot
+        self.dm("whats your bestseller?", model_output("AUTO", self.PRICE_A))
+        self.assert_answered_normally()
+        self.assertEqual([n[0] for n in self.notices], ["ESCALATE"])  # paged once, for the first message
+        self.assert_history_is_only_delivered_text([(wrap(self.DAMAGED), HANDOFF)])
+
+    def test_a_prefilter_hit_on_an_earlier_message_does_not_carry_over(self):
+        threat = "sort this out or i'll post this on social media"
+        self.assertTrue(glam._escalation_prefilter_hit(threat))
+        self.dm(threat, model_output("AUTO", "So sorry about this 🤍"))   # the prefilter forces ESCALATE
+        self.assertTrue(glam._is_paused(SENDER))
+        with redirect_stdout(io.StringIO()):
+            glam._resume_sender(SENDER)
+        self.assertIsNone(glam._escalation_prefilter_hit(self.PRICE_Q))
+        self.dm(self.PRICE_Q, model_output("AUTO", self.PRICE_A))
+        self.assert_answered_normally()
+        self.assert_history_is_only_delivered_text([(wrap(threat), HANDOFF)])
 
 
 class LoaderPairingTest(unittest.TestCase):
