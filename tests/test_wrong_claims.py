@@ -256,5 +256,79 @@ class DamagePhotosGoByEmail(unittest.TestCase):
                 self.assertIn("glamshelfstore@gmail.com", quoted, quoted)
 
 
+class GuardHoldsReplacementPromises(unittest.TestCase):
+    """Output guard rule 5: an AUTO reply that promises a replacement,
+    reshipment or exchange is held for the founder. Refund promises were
+    already held by rule 2 (finding 7). Only the store policy's own
+    statements pass."""
+
+    def held(self, text):
+        return " ".join(guard(text))
+
+    def test_the_audits_live_promises_are_held(self):
+        for text in (
+            # PR 48's live run: a damaged follow-up went AUTO with this.
+            "I'm really sorry about this. Could you send clear photos of the product, "
+            "packaging, and the courier label? We'll arrange a replacement for you right away 🤍",
+            "So sorry! We'll send you a new tray as soon as possible 🤍",
+            "No worries, we'll reship it today 🤍",
+            "We'll resend the right pair — could you share your order ID? 🤍",
+            "Happy to exchange it for GS1 🤍",
+            "We can replace them for you 🤍",
+            "The team will ship you the correct lashes 🤍",
+        ):
+            self.assertIn("rule 5 (replacement/reshipment promise)", self.held(text), text)
+
+    def test_hinglish_promises_are_held(self):
+        for text in (
+            "Sorry! Hum replace kar denge 🤍",
+            "Hum aapko naya tray bhej denge 🤍",
+            "Hum dobara bhej denge 🤍",
+            "Hum product badal denge 🤍",
+        ):
+            self.assertIn("rule 5", self.held(text), text)
+
+    def test_refund_promises_are_still_held_by_rule_2(self):
+        self.assertIn("rule 2", self.held("We'll refund you right away 🤍"))
+        self.assertIn("rule 2", self.held("Your refund will be initiated in 24–48 hours 🤍"))
+
+    def test_the_store_policy_sentence_passes_both_rules(self):
+        for text in (
+            "Once verified, we will arrange a replacement or refund at no additional cost.",
+            "Once verified, we'll arrange a replacement or refund at no additional cost 🤍",
+            "Please email the photos to glamshelfstore@gmail.com with your order number. "
+            "Once verified, we'll arrange a replacement or refund 🤍",
+        ):
+            self.assertEqual(guard(text), [], text)
+
+    def test_the_damage_template_passes(self):
+        # A draft (Rule 8), but if the model ever sends it AUTO it's the policy.
+        self.assertEqual(guard(DAMAGE_TEMPLATE), [])
+
+    def test_the_exchange_offer_passes(self):
+        self.assertEqual(guard("We do offer exchanges on eligible products, subject to availability 🤍"), [])
+
+    def test_extra_promise_next_to_the_policy_is_held(self):
+        text = "Once verified, we'll arrange a replacement or refund, and we'll reship it the same day 🤍"
+        self.assertIn("rule 5", self.held(text))
+
+    def test_approved_lines_and_plain_answers_still_pass(self):
+        for text in (
+            glam.BRAIN_HOLDING_LINE,
+            glam.IG_DRAFT_ACK_LINE,
+            SensitiveEyes.TEMPLATE,
+            "With proper care, you'll get 5–7 wears per pair 🤍",
+            "Could you share your order ID? I can't see tracking myself, but I've passed "
+            "this to the team and they'll reply to you here 🤍",
+            "Each tray has 10 pairs of lashes 🤍",
+        ):
+            self.assertEqual(guard(text), [], text)
+
+    def test_every_changed_template_passes_the_guard(self):
+        for heading in (SensitiveEyes.HEADING, CleanGirlIsSynthetic.HEADING,
+                        CountryOfOrigin.HEADING, "Reply for damaged/wrong item:"):
+            self.assertEqual(guard(template_after(heading)), [], heading)
+
+
 if __name__ == "__main__":
     unittest.main()
