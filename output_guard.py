@@ -32,6 +32,11 @@ Rules (each returns a short reason naming the rule and what matched):
      statements pass: "Once verified, we'll arrange a replacement or refund
      at no additional cost" and the exchange offer. Refund promises were
      already held by rule 2; that policy sentence now passes rule 2 too.
+  6. A reply that mentions free shipping (or ₹799) and also suggests
+     adding or combining products to reach it — "if you add a set", "the
+     Duo or a tray would get you there", "have you considered the Mink
+     Duo" (audit finding 12: Twin states the threshold only, and its
+     combination maths was wrong).
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -103,6 +108,11 @@ _APPLIES = r"(?: (?:does |also )?appl(?:y|ies))?"
 _FREE_SHIPPING_RULE = (
     rf"{_LEAD}(?:we (?:do )?offer |you get )?{_FREE_SHIPPING}{_APPLIES}(?: on (?:all |any )?orders)? (?:above|over) {_T}(?: though)?",
     rf"{_LEAD}if (?:your|the) (?:order|total|cart) is (?:above|over) {_T},? (?:it ships (?:for )?free|shipping is free|you get free shipping)",
+    # The threshold said other ways (finding 12: "state the threshold only";
+    # main held "Orders above ₹799 ship free" and "Free shipping kicks in
+    # above ₹799").
+    rf"{_LEAD}(?:all |any )?(?:orders|anything) (?:above|over) {_T} (?:ships?|get|gets) (?:for )?free(?: shipping)?",
+    rf"{_LEAD}free shipping (?:kicks in|starts) (?:above|over|from|on orders above|on orders over) {_T}",
 )
 # Free shipping because THIS order is above ₹799 — brain.md:921-923, and
 # the 20+ tray bulk quote, brain.md:552. The first two pass only when the reply
@@ -218,6 +228,28 @@ _REPLACE_WORDS_RE = re.compile(
     r"(?:new|fresh|another|correct|right)\b"
     r"|\b(?:naya|nayi|naye|dusra|doosra|dusri|doosri)\b.{0,20}?\bbhej\w*"
     r"|\bdobara\s+bhej\w*|\bbadal\s+(?:denge|dege|dunga|dungi|diya|dete)\b",
+    re.IGNORECASE,
+)
+
+# Rule 6: a free-shipping mention, and a suggestion to add or combine
+# products to reach it. Judged on the whole reply — "Free shipping applies
+# above ₹799 — the Duo or a tray would get you there" puts the suggestion in
+# another clause. "wouldn't qualify" and "your two trays would qualify" are
+# statements about their own order, not suggestions, and pass.
+_FREE_SHIP_MENTION_RE = re.compile(
+    r"free[- ]?shipping|free delivery|ships? (?:for )?free|shipping(?:'s| is)? (?:also )?free"
+    r"|₹\s?799\b|\brs\.?\s?799\b|\binr\s?799\b",
+    re.IGNORECASE,
+)
+_COMBINATION_RE = re.compile(
+    r"\bif you add\b|\badd(?:ing)? (?:a|an|another|one more|any|the|it|on)\b(?! to (?:your |the )?cart)"
+    r"|\bget(?:s)? you (?:there|over|above|past)\b"
+    r"|\b(?:push|take|bring)(?:es|s)? (?:you|it|the total|your total|your order) (?:over|above|past)\b"
+    r"|\bto (?:reach|cross|hit|unlock|qualify for) (?:the )?(?:₹\s?799|free)"
+    r"|\bhave you considered\b|\byou could (?:add|get|pick|also)\b|\bupgrade to\b"
+    r"|\btop(?:ping)? (?:it )?up\b|\bpair it with\b|\bcombin(?:e|ing|ation)\b|\bcombo that\b"
+    r"|\bor a (?:tray|set|duo|trio) (?:would|to|and)\b|\bwith (?:a|another|one more) (?:tray|set|duo|trio|pair)\b"
+    r"|\badd kar\w*|\bsaath (?:mein|me)\b|\bmila(?:kar|ke)\b|\bek aur\b",
     re.IGNORECASE,
 )
 
@@ -392,5 +424,10 @@ def check_reply(text: str, allowed_amounts) -> list[str]:
     promised = _rule5_words(text)
     if promised:
         reasons.append(f"rule 5 (replacement/reshipment promise): {', '.join(promised)}")
+
+    if _FREE_SHIP_MENTION_RE.search(text):
+        combos = [m.group(0) for m in _COMBINATION_RE.finditer(text)]
+        if combos:
+            reasons.append(f"rule 6 (suggests products to reach free shipping): {', '.join(combos)}")
 
     return reasons

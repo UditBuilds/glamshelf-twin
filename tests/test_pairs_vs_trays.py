@@ -113,5 +113,74 @@ class PromptCarriesTheConversion(unittest.TestCase):
         self.assertNotIn("100", note)
 
 
+def guard(text):
+    return output_guard.check_reply(text, LIVE_PRICES)
+
+
+class FreeShippingThresholdOnly(unittest.TestCase):
+    """Finding 12: Twin states the ₹799 threshold only — no product
+    combinations to reach it (the maths was wrong: ₹299 + ₹499 = ₹798)."""
+
+    def test_brain_says_threshold_only(self):
+        rule = next(l for l in BRAIN.splitlines() if l.startswith("- **State the threshold only:**"))
+        self.assertIn("never suggest adding a product, a set or a tray to reach ₹799", rule)
+        self.assertIn("never work out whether some combination would qualify", rule)
+        heading = "**Is shipping free? (their order is ₹799 or less):**"
+        t = re.search(r'^> "(.+?)"$', BRAIN.split(heading, 1)[1], re.M).group(1)
+        self.assertEqual(t, "Free shipping applies on orders above ₹799 — below that, the exact "
+                            "delivery charge shows at checkout 🤍")
+        self.assertEqual(guard(t), [])
+
+    def test_combination_suggestions_are_held(self):
+        for text in (
+            # audit G2 turn 3 (main run)
+            "Kawaii is ₹299, so shipping would fall under the ₹799 free-shipping threshold — the "
+            "exact charge shows at checkout. If you add a tray or a set, it ships free 🤍",
+            # this PR's BEFORE run 3 on main — passed the old guard
+            "Kawaii is ₹299, so shipping is calculated at checkout on that one. Free shipping applies "
+            "on orders above ₹799 — the Everyday + Glam Duo or a tray would get you there 🤍",
+            # audit B2 — passed the old guard
+            "Free shipping applies on orders above ₹799, so a single Kawaii pair at ₹299 wouldn't "
+            "qualify — the delivery charge shows at checkout. Have you considered the Mink Duo at "
+            "₹499 or a tray? 🤍",
+            "Free shipping is on orders above ₹799, so adding another Kawaii would take you over 🤍",
+            "Free shipping above ₹799 hai — ek aur pair add karo toh free ho jayega 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("rule 6 (suggests products to reach free shipping)", " ".join(guard(text)))
+
+    def test_statements_about_their_own_order_pass(self):
+        for text in (
+            "Free shipping applies on orders above ₹799, so a single Kawaii pair at ₹299 wouldn't "
+            "qualify — the delivery charge shows at checkout 🤍",
+            "Our prices are already reduced from the original MRP, so there's no additional discount on "
+            "retail orders — but free shipping applies on orders above ₹799, which two trays would "
+            "qualify for 🤍",
+            "Great choice! You can order directly here\n→ glamshelf.in/products/gs1-luxe-light-lash-tray"
+            "\n\nFree shipping since it's above ₹799 🤍",
+            "Just add it to your cart on glamshelf.in — free shipping applies on orders above ₹799 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_the_threshold_said_other_ways_is_sent(self):
+        # main held both of these (this PR's and PR 3's BEFORE runs)
+        for text in (
+            "Shipping for a single Kawaii pair is calculated at checkout, so you'll see the exact "
+            "charge before paying. Orders above ₹799 ship free 🤍",
+            "GS1 is ₹849 for a tray of 10 pairs — soft, natural, and perfect for everyday or light "
+            "bridal looks. Free shipping kicks in above ₹799 🤍",
+            "Anything above ₹799 ships free 🤍",
+            "Free shipping starts above ₹799 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_threshold_less_claims_stay_held(self):
+        for text in ("Orders ship free 🤍", "Free shipping kicks in soon 🤍", "Shipping is free on this one 🤍"):
+            with self.subTest(text=text):
+                self.assertIn("rule 2", " ".join(guard(text)))
+
+
 if __name__ == "__main__":
     unittest.main()
