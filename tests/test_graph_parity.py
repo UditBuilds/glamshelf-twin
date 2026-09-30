@@ -70,6 +70,7 @@ EFFECT_FNS = {
     "_persist_seen_id",
     "_alert_send_failure",
     "_ig_rate_limited",
+    "_ig_unanswered",
 }
 
 
@@ -124,6 +125,9 @@ class GraphParityTestCase(unittest.TestCase):
             # test_rate_limit.py); `limited` simulates a refusal.
             patch.object(glam, "_llm_admission", recorder("_llm_admission", limited)),
             patch.object(glam, "_ig_rate_limited", recorder("_ig_rate_limited")),
+            # Paused / human-handled messages: logged + forwarded, not
+            # answered (its own tests live in test_paused_and_limited.py).
+            patch.object(glam, "_ig_unanswered", recorder("_ig_unanswered")),
             patch.object(glam, "_persist_seen_id", recorder("_persist_seen_id")),
             patch.object(glam, "_lookup_recent_order", recorder("_lookup_recent_order", ORDER_LINE)),
             patch.object(glam, "_load_instagram_history", recorder("_load_instagram_history", list(HISTORY))),
@@ -573,7 +577,8 @@ class GraphParityTestCase(unittest.TestCase):
 
     def test_paused_sender_short_circuits_before_llm(self):
         old = self._run("old", llm_response=AUTO_JSON, paused=True)
-        self.assertEqual(effects(old), [])
+        self.assertEqual(effects(old), [("_ig_unanswered", (SENDER, MSG, str(TIMESTAMP), "paused"), {})])
+        self.assertEqual(named(old, "ask_claude"), [])
 
         new = self._run("new", llm_response=AUTO_JSON, paused=True)
         self._assert_parity(old, new)
@@ -589,7 +594,8 @@ class GraphParityTestCase(unittest.TestCase):
 
     def test_human_handling_window_short_circuits_before_llm(self):
         old = self._run("old", llm_response=AUTO_JSON, udit_recent=True)
-        self.assertEqual(effects(old), [])
+        self.assertEqual(effects(old), [("_ig_unanswered", (SENDER, MSG, str(TIMESTAMP), "human_handling"), {})])
+        self.assertEqual(named(old, "ask_claude"), [])
 
         new = self._run("new", llm_response=AUTO_JSON, udit_recent=True)
         self._assert_parity(old, new)

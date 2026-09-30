@@ -244,7 +244,12 @@ class EndToEnd(RateLimitTestCase):
         sends = named(self.calls, "_send_instagram_reply")
         self.assertEqual(len(sends), 9)
         self.assertEqual(sends[-1][1], (S1, glam.RATE_LIMIT_NOTICE))
-        self.assertEqual(len(named(self.calls, "_telegram_api")), 1)
+        # Since audit finding 8: each refused message is forwarded to the
+        # founder (replacing the once-a-day sender alert).
+        forwards = named(self.calls, "_telegram_api")
+        self.assertEqual(len(forwards), 2)
+        self.assertIn('"question 8"', forwards[0][1][1]["text"])
+        self.assertIn('"question 9"', forwards[1][1][1]["text"])
         limited_rows = db_rows(
             "SELECT message_text, reply_text FROM instagram_logs WHERE source = 'RATE_LIMITED_IG' ORDER BY id"
         )
