@@ -867,10 +867,27 @@ def _pause_number(wa_id: str, ttl_seconds: int = PAUSED_TTL_SECONDS) -> bool:
         return False
     try:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT OR REPLACE INTO paused_senders (sender_id, paused_until) VALUES (?, ?)",
-            (wa_id, time.time() + ttl_seconds),
-        )
+        now = time.time()
+        # Extending a pause that is still running keeps its ack_sent_at, so
+        # the customer gets _ig_unanswered's one-time line at most once per
+        # pause; a new pause (the old one expired) starts with it empty.
+        try:
+            conn.execute(
+                "INSERT INTO paused_senders (sender_id, paused_until) VALUES (?, ?) "
+                "ON CONFLICT(sender_id) DO UPDATE SET "
+                "ack_sent_at = CASE WHEN paused_senders.paused_until >= ? "
+                "THEN paused_senders.ack_sent_at ELSE NULL END, "
+                "paused_until = excluded.paused_until",
+                (wa_id, now + ttl_seconds, now),
+            )
+        except sqlite3.OperationalError as e:
+            # No ack_sent_at column (its migration failed): pausing must
+            # still work, as it did before the column existed.
+            print(f"[PAUSE] Upsert failed ({e}) — plain pause write for {wa_id}")
+            conn.execute(
+                "INSERT OR REPLACE INTO paused_senders (sender_id, paused_until) VALUES (?, ?)",
+                (wa_id, now + ttl_seconds),
+            )
         conn.commit()
         hit = conn.execute(
             "SELECT 1 FROM paused_senders WHERE sender_id = ?", (wa_id,)
@@ -1041,11 +1058,14 @@ def _handle_llm_limit(
     text: str,
     send_fn,
     now: float | None = None,
+    alert: bool = True,
 ) -> bool:
     """React to a refused admission: at most one RATE_LIMIT_NOTICE per
     sender per window (the rolling 10 minutes for the window limit, the IST
     day for the daily limits), then silence; one Telegram alert per sender
     per IST day for the sender limits, one per IST day for the global cap.
+    `alert=False` skips the alert: Instagram forwards every refused message
+    to the founder instead (_ig_rate_limited).
 
     `send_fn` is the channel's sender (_send_instagram_reply or
     send_whatsapp_reply). Events are stamped BEFORE sending, so a flaky
@@ -1070,7 +1090,7 @@ def _handle_llm_limit(
                 ).fetchone() is not None
 
             notice_due = not seen(notice_kind, sender_id, notice_since)
-            alert_due = not seen(alert_kind, alert_subject, day_start)
+            alert_due = alert and not seen(alert_kind, alert_subject, day_start)
             for due, kind, subject in (
                 (notice_due, notice_kind, sender_id),
                 (alert_due, alert_kind, alert_subject),
@@ -1108,7 +1128,7 @@ def _rate_limit_alert(channel: str, sender_id: str, limit: str, text: str) -> No
         body = (
             f"🚦 Daily LLM cap reached — {_llm_daily_cap()} replies today (LLM_DAILY_CAP).\n"
             f"Until IST midnight, new messages get only \"{RATE_LIMIT_NOTICE}\" "
-            f"(once per sender), then silence.\n"
+            f"(once per sender), then silence. On Instagram each one is forwarded to you here.\n"
             f"Raise LLM_DAILY_CAP on Render to lift it.\n\n"
             f"(One alert per day.)"
         )
@@ -1779,6 +1799,15 @@ def _init_db() -> None:
             )
             """
         )
+        # ack_sent_at: when this pause's one-time line went out to the
+        # customer (_ig_unanswered, audit finding 8). NULL = not yet.
+        try:
+            paused_cols = [row[1] for row in conn.execute("PRAGMA table_info(paused_senders)").fetchall()]
+            if "ack_sent_at" not in paused_cols:
+                conn.execute("ALTER TABLE paused_senders ADD COLUMN ack_sent_at REAL")
+                print("[DB] Migrated paused_senders: added `ack_sent_at` column")
+        except Exception as e:
+            print(f"[DB] paused_senders ack_sent_at migration failed: {type(e).__name__}: {e}")
 
         # Telegram DRAFT+APPROVE approval queue — previously the in-memory
         # _pending_drafts dict, which dropped every pending draft on
@@ -2770,6 +2799,7 @@ def _resume_sender(sender_id: str) -> bool:
 _IG_HISTORY_EXCLUDED_SOURCES = frozenset({
     "AUTO_FAILED_IG", "DRAFT_SEND_FAILED_IG", "ESCALATE_HOLDING_FAILED_IG",
     "PIPELINE_HOLDING_FAILED_IG", "PHOTO_IG_FAILED", "LEAD_FAILED_IG",
+    "MEDIA_IG_FAILED",
 })
 # A delivered line a DRAFT+APPROVE turn logs with an empty message_text, right
 # before the turn's DRAFT_PENDING_IG row (see _ig_draft_handoff): the handoff
@@ -7792,6 +7822,14 @@ def _ig_escalate(
     Shared with graph.py's dispatch_escalate so the two stay in parity.
     """
     kind, customer_text = _ig_escalation_reply(text, tag)
+    # A second escalation inside the handoff window (a DRAFT then an
+    # ESCALATE, or after a resume) doesn't resend the holding line (audit
+    # finding 8); the founder is still paged. The safety line is health
+    # advice and always goes out.
+    repeat = customer_text == BRAIN_HOLDING_LINE and _ig_handoff_sent_recently(sender_id)
+    if repeat:
+        customer_text = ""
+        print(f"[ESCALATE] {sender_id} got the holding line in the last 30 min — not resending it")
     sent, send_err = False, ""
     if customer_text:
         sent, send_err = _send_instagram_reply(sender_id, customer_text)
@@ -7799,10 +7837,12 @@ def _ig_escalate(
             print(f"[ESCALATE] {kind} escalation — sent to {sender_id}: {customer_text[:60]!r}")
         else:
             print(f"[ESCALATE] {kind} escalation — send FAILED to {sender_id}: {send_err}")
-    else:
+    elif not repeat:
         print(f"[ESCALATE] {kind} escalation — deliberately silent for {sender_id}")
 
-    if not customer_text:
+    if repeat:
+        customer_line = "Nothing new sent — they got the holding line in the last 30 minutes."
+    elif not customer_text:
         customer_line = f"Nothing sent to the customer — {kind} escalations get no automated reply."
     elif sent:
         customer_line = f'Sent to the customer:\n"{customer_text}"'
@@ -7830,6 +7870,9 @@ def _ig_escalate(
     elif customer_text:
         # Attempted but unconfirmed: kept for audit, excluded from history.
         _log_instagram(sender_id, text, customer_text, timestamp, source="ESCALATE_HOLDING_FAILED_IG")
+    elif repeat:
+        # Nothing new sent: NULL reply keeps the row out of history.
+        _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_REPEAT_IG")
     else:
         # Deliberate silence: NULL reply keeps the row out of history.
         _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
@@ -7948,11 +7991,158 @@ def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> N
     delivered (history-visible), NULL otherwise (history-excluded).
 
     Shared with graph.py's intake so the two stay in parity."""
-    sent = _handle_llm_limit("Instagram", sender_id, limit, text, _send_instagram_reply)
+    # Every refused message is forwarded to the founder (audit finding 8),
+    # so the per-sender daily alert would only repeat the first forward;
+    # the once-a-day global-cap alert stays.
+    sent = _handle_llm_limit(
+        "Instagram", sender_id, limit, text, _send_instagram_reply,
+        alert=(limit == LIMIT_GLOBAL_DAY),
+    )
     _log_instagram(
         sender_id, text, RATE_LIMIT_NOTICE if sent else None, timestamp,
         source="RATE_LIMITED_IG",
     )
+    what = {
+        LIMIT_SENDER_WINDOW: f"{RATE_LIMIT_WINDOW_MAX} messages in 10 minutes",
+        LIMIT_SENDER_DAY: f"{RATE_LIMIT_DAILY_MAX} messages today",
+        LIMIT_GLOBAL_DAY: f"today's cap of {_llm_daily_cap()} replies for everyone",
+    }.get(limit, limit)
+    got = (f'They got "{RATE_LIMIT_NOTICE}"' if sent
+           else "Nothing new sent to them (they already got the rate-limit notice)")
+    _ig_forward_to_founder(
+        sender_id, text,
+        headline=f"🚦 Twin didn't answer — over the rate limit ({what})",
+        outcome=got, resume_button=False,
+    )
+
+
+# Messages Twin doesn't answer used to vanish (audit findings 8 and 19): a
+# paused sender (after an escalation, or the founder's 🛑 Stop bot) or one
+# the founder is chatting with got nothing, with no log row and no notice.
+# Now each one is logged and forwarded to the founder (no model call), and
+# a paused customer gets IG_DRAFT_ACK_LINE at most once per pause — but only
+# after an escalation that sent them a holding line: never while the
+# founder is chatting with them (human takeover), never after a legal or
+# press escalation (silent by design).
+_IG_ESCALATION_SOURCES = ("ESCALATE_IG", "ESCALATE_HOLDING_IG", "ESCALATE_HOLDING_FAILED_IG", "ESCALATE_REPEAT_IG")
+_IG_HOLDING_LINE_SOURCES = ("ESCALATE_HOLDING_IG", "DRAFT_HANDOFF_IG", "PIPELINE_HOLDING_IG")
+
+
+def _ig_pause_ack_blocker(sender_id: str) -> str:
+    """"" when a paused sender may get the one-time line, else why not (for
+    the founder's forward). Fails closed: a DB error sends nothing."""
+    if _udit_replied_recently_ig(sender_id):
+        return "you're handling this chat"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            last_escalation = conn.execute(
+                f"SELECT source FROM instagram_logs WHERE sender_id = ? AND source IN "
+                f"({', '.join('?' * len(_IG_ESCALATION_SOURCES))}) ORDER BY id DESC LIMIT 1",
+                (sender_id, *_IG_ESCALATION_SOURCES),
+            ).fetchone()
+            holding = conn.execute(
+                f"SELECT 1 FROM instagram_logs WHERE sender_id = ? AND source IN "
+                f"({', '.join('?' * len(_IG_HOLDING_LINE_SOURCES))}) "
+                f"AND logged_at >= datetime('now', ?) LIMIT 1",
+                (sender_id, *_IG_HOLDING_LINE_SOURCES, f"-{PAUSED_TTL_SECONDS} seconds"),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[PAUSED] Ack check failed for {sender_id}: {type(e).__name__}: {e}")
+        return "couldn't check the pause, so nothing was sent"
+    if last_escalation and last_escalation[0] == "ESCALATE_IG":
+        return "their escalation gets no automated reply (legal / press)"
+    if last_escalation and last_escalation[0] == "ESCALATE_HOLDING_FAILED_IG":
+        return "their holding line failed to send, so nothing automatic goes out"
+    if not holding:
+        return "they didn't get a holding line with this pause"
+    return ""
+
+
+def _ig_claim_pause_ack(sender_id: str, release: bool = False) -> bool:
+    """Atomically claim this pause's one-time line (True = send it now), or
+    with release=True give the claim back after a failed send. Restart-safe
+    and worker-safe: the stamp lives in paused_senders."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            if release:
+                conn.execute("UPDATE paused_senders SET ack_sent_at = NULL WHERE sender_id = ?", (sender_id,))
+                conn.commit()
+                return False
+            now = time.time()
+            claimed = conn.execute(
+                "UPDATE paused_senders SET ack_sent_at = ? "
+                "WHERE sender_id = ? AND ack_sent_at IS NULL AND paused_until >= ?",
+                (now, sender_id, now),
+            ).rowcount
+            conn.commit()
+            return claimed == 1
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[PAUSED] Ack claim failed for {sender_id}: {type(e).__name__}: {e}")
+        return False
+
+
+def _ig_forward_to_founder(sender_id: str, text: str, headline: str, outcome: str,
+                           resume_button: bool = True) -> None:
+    """Forward a message Twin didn't answer to the founder on Telegram, with
+    what the customer got. Never raises (_telegram_api swallows failures)."""
+    if not TELEGRAM_CHAT_ID:
+        print("[INSTAGRAM] Forward skipped: TELEGRAM_CHAT_ID not set")
+        return
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": (
+            f"{headline}\n\n"
+            f"From: Instagram DM — sender {sender_id}\n\n"
+            f"They said:\n\"{text}\"\n\n"
+            f"{outcome}.\n"
+            f"→ Reply from your Instagram DMs"
+            + (" — or tap ▶️ Resume bot to let Twin answer them again." if resume_button else ".")
+        ),
+    }
+    if resume_button:
+        payload["reply_markup"] = {"inline_keyboard": [[
+            {"text": "▶️ Resume bot", "callback_data": f"action:resume|id:{sender_id}"},
+        ]]}
+    _telegram_api("sendMessage", payload)
+
+
+def _ig_unanswered(sender_id: str, text: str, timestamp: str, reason: str) -> None:
+    """A message Twin won't answer: `reason` is "paused" or
+    "human_handling"; `text` is what they wrote, or "[sent a photo]" and the
+    like. Logs it, sends the one-time line when it's due (see above) and
+    forwards it to the founder.
+
+    Shared with graph.py's intake so the two stay in parity."""
+    ack_sent = False
+    if reason == "paused":
+        why_not = _ig_pause_ack_blocker(sender_id)
+        if not why_not:
+            if _ig_claim_pause_ack(sender_id):
+                ack_sent, send_err = _send_instagram_reply(sender_id, IG_DRAFT_ACK_LINE)
+                if not ack_sent:
+                    _ig_claim_pause_ack(sender_id, release=True)
+                    why_not = f"the one-time line failed to send ({send_err})"
+            else:
+                why_not = "they already got the one-time line during this pause"
+        headline = "⏸️ Twin didn't answer — this customer is paused"
+    else:
+        why_not = "you're handling this chat"
+        headline = "⏸️ Twin didn't answer — you replied to this customer in the last 4 hours"
+    _log_instagram(
+        sender_id, text, IG_DRAFT_ACK_LINE if ack_sent else None, timestamp,
+        source=("PAUSED_ACK_IG" if ack_sent else "PAUSED_IG") if reason == "paused" else "HUMAN_HANDLING_IG",
+    )
+    outcome = (f'They got the one-time line: "{IG_DRAFT_ACK_LINE}"' if ack_sent
+               else f"Nothing sent to them — {why_not}")
+    print(f"[INSTAGRAM] Unanswered ({reason}) message from {sender_id} logged and forwarded; "
+          f"ack {'sent' if ack_sent else 'not sent'}")
+    _ig_forward_to_founder(sender_id, text, headline, outcome)
 
 
 # Instagram photos (audit T1-9). The vision pipeline is WhatsApp-only, so on
@@ -8057,6 +8247,113 @@ def _handle_instagram_photo(sender_id: str, timestamp: str) -> None:
     })
 
 
+# Voice notes, shared posts and reels (audit finding 10) used to be dropped
+# silently: no reply, no notice. They now get the founder's line at most
+# once per sender per INSTAGRAM_MEDIA_REPLY_WINDOW_SECONDS, and the founder
+# a Telegram notice every time. A story mention gets the notice only (no
+# reply, founder decision). A video or file gets the notice only too: the
+# line names voice notes and shared posts, so nothing automatic goes out.
+INSTAGRAM_MEDIA_REPLY = (
+    "I can't open voice notes or shared posts here yet — could you type your question? 🤍"
+)
+INSTAGRAM_MEDIA_REPLY_WINDOW_SECONDS = 10 * 60
+# What the log (and so the next turn's history) says the customer sent.
+IG_MEDIA_LABELS = {
+    "photo": "[sent a photo]",
+    "voice": "[sent a voice note]",
+    "share": "[shared a post]",
+    "reel": "[shared a reel]",
+    "story_mention": "[mentioned @glamshelfstore in their story]",
+    "video": "[sent a video]",
+    "file": "[sent a file]",
+}
+# Meta attachment type -> our kind. Images are _ig_has_photo's (stickers are
+# images too, and stay ignored).
+_IG_ATTACHMENT_KINDS = {
+    "audio": "voice",
+    "share": "share", "ig_post": "share",
+    "reel": "reel", "ig_reel": "reel",
+    "story_mention": "story_mention",
+    "video": "video",
+    "file": "file",
+}
+_IG_MEDIA_NOTICE = {
+    "voice": ("🎤", "voice note"),
+    "share": ("🔗", "shared post"),
+    "reel": ("🎞️", "shared reel"),
+    "story_mention": ("📣", "story mention"),
+    "video": ("🎬", "video"),
+    "file": ("📎", "file"),
+}
+
+
+def _ig_media_kind(message: dict) -> str:
+    """"photo", "voice", "share", "reel", "story_mention", "video", "file",
+    or "" for anything Twin ignores (a sticker, a reaction, no attachment)."""
+    if _ig_has_photo(message):
+        return "photo"
+    for att in message.get("attachments") or []:
+        if isinstance(att, dict):
+            kind = _IG_ATTACHMENT_KINDS.get(str(att.get("type") or "").lower())
+            if kind:
+                return kind
+    return ""
+
+
+def _ig_media_replied_recently(sender_id: str) -> bool:
+    """Has this sender had INSTAGRAM_MEDIA_REPLY inside the window? Read from
+    instagram_logs, so it survives restarts. Fails open (False)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM instagram_logs "
+                "WHERE sender_id = ? AND source = 'MEDIA_IG' "
+                "AND logged_at >= datetime('now', ?) LIMIT 1",
+                (sender_id, f"-{INSTAGRAM_MEDIA_REPLY_WINDOW_SECONDS} seconds"),
+            ).fetchone()
+        finally:
+            conn.close()
+        return hit is not None
+    except Exception as e:
+        print(f"[INSTAGRAM] Media-reply window check failed for {sender_id}: {type(e).__name__}: {e}")
+        return False
+
+
+def _handle_instagram_media(sender_id: str, kind: str, timestamp: str) -> None:
+    """A voice note, shared post / reel, story mention, video or file (not
+    a photo — _handle_instagram_photo). Logged under IG_MEDIA_LABELS, so the
+    next turn's history shows what arrived and what Twin said."""
+    label = IG_MEDIA_LABELS[kind]
+    icon, what = _IG_MEDIA_NOTICE[kind]
+    if kind in ("voice", "share", "reel"):
+        if _ig_media_replied_recently(sender_id):
+            _log_instagram(sender_id, label, None, timestamp, source="MEDIA_IG_REPEAT")
+            outcome = "They got the type-your-question line in the last 10 minutes, so nothing new was sent"
+        else:
+            sent, send_err = _send_instagram_reply(sender_id, INSTAGRAM_MEDIA_REPLY)
+            _log_instagram(
+                sender_id, label, INSTAGRAM_MEDIA_REPLY, timestamp,
+                source="MEDIA_IG" if sent else "MEDIA_IG_FAILED",
+            )
+            outcome = (f'Twin can\'t open it and replied: "{INSTAGRAM_MEDIA_REPLY}"' if sent
+                       else f"Twin can't open it, and its reply FAILED to send ({send_err})")
+    elif kind == "story_mention":
+        _log_instagram(sender_id, label, None, timestamp, source="STORY_MENTION_IG")
+        outcome = "No reply sent (story mentions get none)"
+    else:
+        _log_instagram(sender_id, label, None, timestamp, source="MEDIA_IG_UNANSWERED")
+        outcome = f"Twin can't open a {what} and didn't reply"
+    print(f"[INSTAGRAM] {what} from {sender_id}: {outcome}")
+    if not TELEGRAM_CHAT_ID:
+        print("[INSTAGRAM] Media notice skipped: TELEGRAM_CHAT_ID not set")
+        return
+    _telegram_api("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": f"{icon} Instagram {what} from sender {sender_id}\n{outcome}.\nOpen the DM to see it.",
+    })
+
+
 def _process_instagram_event(event: dict) -> None:
     """Handle a single messaging event. Failures are absorbed into log
     lines so one bad event can't take down the rest of the batch."""
@@ -8118,12 +8415,13 @@ def _process_instagram_event(event: dict) -> None:
         if message.get("is_echo"):
             return
 
-        # A photo gets an honest canned reply (audit T1-9) once it has
-        # passed the same dedup / pause / takeover gates as text, below.
-        # Every other non-text event (reaction, sticker, share, reel, read
-        # receipt...) is still ignored — but logged, not dropped silently.
-        is_photo = not text and _ig_has_photo(message)
-        if not text and not is_photo:
+        # A photo (audit T1-9), voice note, shared post or reel, story
+        # mention, video or file (audit finding 10) passes the same dedup /
+        # pause / takeover gates as text, below, then gets its own handling.
+        # Every other non-text event (reaction, sticker, read receipt,
+        # deleted message...) is ignored — logged, not dropped silently.
+        media = "" if text else _ig_media_kind(message)
+        if not text and not media:
             print(
                 f"[INSTAGRAM] Ignored non-text event from "
                 f"{sender_id or '(no sender)'}: {_ig_event_kind(event)}"
@@ -8137,7 +8435,8 @@ def _process_instagram_event(event: dict) -> None:
         msg_id = (message.get("mid") or "").strip()
         timestamp = str(event.get("timestamp") or "")
 
-        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200] if text else '[photo]'}")
+        label = text or IG_MEDIA_LABELS[media]
+        print(f"[INSTAGRAM] DM from {sender_id}: {text[:200] if text else label}")
 
         # Reuse the same dedup set the WATI webhook uses — sender ID + mid
         # collisions across channels would be astronomically improbable.
@@ -8154,22 +8453,31 @@ def _process_instagram_event(event: dict) -> None:
         # after sending the holding reply, subsequent inbound messages
         # from that sender short-circuit here without invoking Claude or
         # paging the founder again.
+        # No model call while paused — but the message is logged and
+        # forwarded to the founder, and the customer may get the one-time
+        # line (_ig_unanswered, audit findings 8 and 19).
         if _is_paused(sender_id):
-            print(f"[PAUSED] Skipping reply — auto-pause active for IG sender {sender_id}")
+            print(f"[PAUSED] Not answering — auto-pause active for IG sender {sender_id}")
+            _ig_unanswered(sender_id, label, timestamp, "paused")
             return
 
         # DB-backed safety net (survives Render restarts). If Udit
         # manually replied on Instagram in the last 4h — recorded as a
-        # HUMAN_UDIT_INSTAGRAM row by the page-id detection above — skip
-        # silently. Mirrors the WATI _udit_replied_recently safety net.
+        # HUMAN_UDIT_INSTAGRAM row by the page-id detection above — Twin
+        # stays out of it; the message is logged and forwarded like a
+        # paused one. Mirrors the WATI _udit_replied_recently safety net.
         if _udit_replied_recently_ig(sender_id):
-            print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
+            print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — not answering")
+            _ig_unanswered(sender_id, label, timestamp, "human_handling")
             return
 
-        if is_photo:
-            # No model call for a photo, so no rate-limit budget either;
-            # _handle_instagram_photo answers at most once per burst.
+        # No model call for a photo or other media, so no rate-limit budget
+        # either; each answers at most once per burst.
+        if media == "photo":
             _handle_instagram_photo(sender_id, timestamp)
+            return
+        if media:
+            _handle_instagram_media(sender_id, media, timestamp)
             return
 
         # LLM rate limits (audit T1-3) — after the takeover gates, so a
