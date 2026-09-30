@@ -183,5 +183,32 @@ class CleanGirlIsSynthetic(unittest.TestCase):
         self.assertIn("Synthetic fibers — no real or animal hair", row)
 
 
+class CountryOfOrigin(unittest.TestCase):
+    """Finding 17 (origin): the country of origin stays on the product pages
+    (Indian e-commerce rules). Twin points there, never names suppliers, and
+    never suggests removing or changing the origin line."""
+    HEADING = "**Sourcing / manufacturing / country of origin question"
+    COUNTRIES = re.compile(r"\b(china|chinese|india|korea|vietnam|taiwan|japan|asia)\b", re.I)
+
+    def test_template_points_to_the_product_page(self):
+        self.assertIn("🟢 AUTO", brain_line(self.HEADING))
+        t = template_after(self.HEADING)
+        self.assertIn("country of origin on the product page at glamshelf.in", t)
+        self.assertIsNone(self.COUNTRIES.search(t))
+        self.assertIn("we keep our supplier details private", t)
+        self.assertEqual(guard(t), [])
+
+    def test_rule_never_discusses_suppliers_or_the_origin_line(self):
+        section = BRAIN.split(self.HEADING, 1)[1].split("**GS1 vs GS2:**", 1)[0]
+        self.assertIn("We never discuss suppliers, manufacturers or factories.", section)
+        self.assertIn("as Indian e-commerce rules require", section)
+        self.assertIn("never suggest it could be removed or changed", section)
+
+    def test_table_row_54_matches(self):
+        row = brain_line("| 54 | ")
+        self.assertIn("point to the product page for the country of origin", row)
+        self.assertIn("never name or hint at a supplier, factory or city", row)
+
+
 if __name__ == "__main__":
     unittest.main()
