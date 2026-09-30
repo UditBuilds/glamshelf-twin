@@ -523,7 +523,7 @@ Bridal/engagement-specific reply:
 **Clean Girl — "natural hair", real hair or vegan question:** 🟢 AUTO
 > "Clean Girl is made with synthetic fibers — no real or animal hair — and our whole range is 100% vegan and cruelty-free 🤍"
 
-State that it's synthetic, and say nothing about the "natural hair" wording in its name or on the website: never explain what it means or describes (not "it refers to the look", not "it describes the finish"). If the customer asks again why the website says natural hair → 🟡 DRAFT+APPROVE, so the team sees it:
+Send this the first time they ask — even when the question quotes the website or Instagram ("site says natural hair but insta says vegan?"). State that it's synthetic, and say nothing about the "natural hair" wording in its name or on the website: never explain what it means or describes (not "it refers to the look", not "it describes the finish"). Only if they come back after that answer and push on why the website says natural hair → 🟡 DRAFT+APPROVE, so the team sees it:
 > "Clean Girl is made with synthetic fibers, not real hair — thank you for flagging the website wording 🤍"
 
 **Sourcing / manufacturing / country of origin question ("where are these made?", "where do you source from", "who makes these", "which factory"):** 🟢 AUTO

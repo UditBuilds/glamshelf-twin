@@ -167,13 +167,18 @@ class CleanGirlIsSynthetic(unittest.TestCase):
         self.assertEqual(guard(t), [])
 
     def test_the_rule_forbids_explaining_the_wording(self):
-        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing question", 1)[0]
+        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing", 1)[0]
         self.assertIn('say nothing about the "natural hair" wording', section)
         self.assertIn("never explain what it means or describes", section)
 
+    def test_first_question_is_answered_even_when_it_quotes_the_website(self):
+        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing", 1)[0]
+        self.assertIn("Send this the first time they ask — even when the question quotes the website", section)
+
     def test_asking_again_goes_to_a_draft(self):
-        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing question", 1)[0]
-        self.assertIn("asks again why the website says natural hair → 🟡 DRAFT+APPROVE", section)
+        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing", 1)[0]
+        self.assertIn("come back after that answer and push on why the website says natural hair → "
+                      "🟡 DRAFT+APPROVE", section)
         second = re.findall(r'^> "(.+?)"$', section, re.M)[1]
         self.assertIn("synthetic fibers, not real hair", second)
         self.assertIsNone(self.EXPLAINING.search(second))
