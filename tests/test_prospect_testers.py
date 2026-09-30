@@ -222,7 +222,8 @@ class BrainTesterRule(unittest.TestCase):
         for line in (INVITE_LINE, glam.LEAD_REPLY):
             with self.subTest(line=line):
                 self.assertIn(line, BRAIN)
-                self.assertEqual(output_guard.check_reply(line, LIVE_PRICES), [])
+                # Sent only with a LEAD notice (rule 7's founder_notice).
+                self.assertEqual(output_guard.check_reply(line, LIVE_PRICES, founder_notice=True), [])
         self.assertNotIn("Udit", INVITE_LINE)
 
     def test_testers_are_no_longer_short_circuited_to_the_lead_line(self):

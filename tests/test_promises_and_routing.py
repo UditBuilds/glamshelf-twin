@@ -1,0 +1,190 @@
+"""No follow-up promises nobody is told about; angry complaints escalate;
+Hinglish in, Hinglish out; a decided buyer gets the link (audit findings 6,
+11, 14 and 15, and brain.md's stale empty-reply note).
+
+Twin can't message anyone later, so "we'll take it from there" on a plain
+AUTO reply (audit D4) or "whenever you're ready, we'll be right here" (E3)
+promised something nobody would do. Output guard rule 7 now holds a
+follow-up promise; the handoff, ack and LEAD lines pass only when a founder
+notice goes out with the reply.
+
+No live API call anywhere here: every send and Telegram call is stubbed.
+
+Run:  python -m unittest tests.test_promises_and_routing
+"""
+import io, json, os, re, sqlite3, sys, tempfile, unittest, uuid
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+os.environ["DB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="glamshelf-promises-test-"), "test.db"
+)
+os.environ["GITHUB_TOKEN"] = ""; os.environ["GITHUB_REPO"] = ""
+os.environ.setdefault("SECRET_KEY", "t"); os.environ.setdefault("APP_PASSWORD", "t")
+os.environ.setdefault("DASHBOARD_KEY", "t")
+import app as glam
+import output_guard
+
+BRAIN = (REPO / "brain" / "brain.md").read_text(encoding="utf-8")
+LIVE_PRICES = {249.0, 299.0, 499.0, 699.0, 849.0}
+SENDER = "17800000000000611"
+HANDOFF = glam.BRAIN_HOLDING_LINE
+ACK = glam.IG_DRAFT_ACK_LINE
+
+
+def guard(text, founder_notice=False):
+    return output_guard.check_reply(text, LIVE_PRICES, founder_notice=founder_notice)
+
+
+def rule7(text, founder_notice=False):
+    return [r for r in guard(text, founder_notice) if r.startswith("rule 7")]
+
+
+class FollowUpPromisesAreHeld(unittest.TestCase):
+    def test_the_audits_promises_are_held(self):
+        for text in (
+            # audit D4, brain.md:552's template, on an untagged AUTO reply
+            "Our bulk rate is ₹749/tray for orders of 20+ — and shipping is free, since an order that "
+            "size is well above ₹799. Please share your Instagram handle or business name and we'll "
+            "take it from there 🤍",
+            # audit E3
+            "That sounds lovely — whenever you're ready, we'll be right here. You can order anytime at "
+            "glamshelf.in 🤍",
+            # the founder's examples
+            "Refunds are initiated within 24–48 hours of approval, and the team will update you 🤍",
+            "No problem, we'll remind you next week 🤍",
+            "We'll be right here whenever you need us 🤍",
+            # brain.md's old warm close
+            "We'll be in touch soon 🤍",
+            "GS3 is sold out — I'll let you know as soon as it's back 🤍",
+            "You'll hear from us soon 🤍",
+            "Team The Glam Shelf will personally look into this and get back to you shortly 🤍",
+            "Our team will reach out to you shortly 🤍",
+            "Got it — Team The Glam Shelf has your details and will reach out shortly 🤍",
+            # Hinglish
+            "Bilkul, next week remind kar denge 🤍",
+            "Team aapko jaldi update karegi 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(rule7(text), text)
+
+    def test_founder_notice_does_not_excuse_other_promises(self):
+        # An ORDER heads-up makes "they'll reply to you here" true — not
+        # "the team will update you" or a reminder.
+        self.assertTrue(rule7("I've passed this to the team and they'll update you shortly 🤍", True))
+        self.assertTrue(rule7("We'll remind you next week 🤍", True))
+
+    def test_the_handoff_ack_and_lead_lines_need_a_founder_notice(self):
+        for text in (
+            HANDOFF,
+            ACK,
+            glam.LEAD_REPLY,
+            "Sorry it's taking longer than usual — could you share your order ID? I've passed this "
+            "to the team and they'll reply to you here with an update 🤍",
+            "Happy to help — could you share your order ID? I can't look orders up myself, so I'll "
+            "pass it to the team and they'll reply to you here 🤍",
+            "The team has your return request and will reply to you here 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(rule7(text, founder_notice=True), [])
+                self.assertTrue(rule7(text, founder_notice=False))
+
+    def test_answers_that_promise_no_later_contact_pass(self):
+        for text in (
+            "Refunds are initiated within 24–48 hours of approval — from there it reflects in UPI/bank "
+            "accounts in 5–7 working days and cards in 7–10 working days 🤍",
+            "Refunds are initiated within 24–48 hours of approval, then take 5–7 working days to reflect "
+            "for UPI/bank and 7–10 working days for cards. If you share your order ID, I'll pass it to "
+            "the team so they can check yours 🤍",
+            "I can't send reminders from here, but you can order anytime at glamshelf.in 🤍",
+            "Orders usually dispatch within 2–5 business days, and delivery takes 7–10 business days "
+            "anywhere in India. You'll get a tracking link by SMS once it ships 🤍",
+            "Welcome back — let me know what you'd like to go ahead with and I'll help you through it 🤍",
+            "Just email glamshelfstore@gmail.com with your order ID to get it started 🤍",
+            "Which occasion is it for? I'll pick the right one.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_curly_apostrophes_are_caught(self):
+        self.assertTrue(rule7("We’ll be right here 🤍"))
+
+
+class FollowUpGuardInTheHandler(unittest.TestCase):
+    """_process_instagram_event end to end, model and sends stubbed."""
+
+    def setUp(self):
+        glam._init_db()
+        for var in ("OUTPUT_GUARD_DISABLED", "ESCALATION_PREFILTER_DISABLED"):
+            os.environ.pop(var, None)
+        conn = sqlite3.connect(glam.DB_PATH)
+        for table in ("instagram_logs", "paused_senders", "llm_usage", "pending_drafts"):
+            conn.execute(f"DELETE FROM {table}")
+        conn.commit(); conn.close()
+        self.sends, self.drafts, self.notices = [], [], []
+        for p in (
+            patch.object(glam, "_send_instagram_reply", self._send),
+            patch.object(glam, "send_draft_for_approval", self._draft),
+            patch.object(glam, "send_telegram_notification", self._notify),
+            patch.object(glam, "_llm_admission", lambda *a, **k: None),
+            patch.object(glam, "_lookup_recent_order", lambda *a, **k: ""),
+            patch.object(glam, "_load_instagram_history", lambda *a, **k: []),
+            patch.object(glam, "_persist_seen_id", lambda mid: None),
+            patch.dict(glam._inventory_cache, {"prices": set(LIVE_PRICES)}),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _send(self, sender_id, text):
+        self.sends.append(text)
+        return True, ""
+
+    def _draft(self, **kwargs):
+        self.drafts.append(kwargs)
+        return True
+
+    def _notify(self, classification, customer_message, reply, **kwargs):
+        self.notices.append(classification)
+
+    def dm(self, text, classification, reply, tag=""):
+        raw = json.dumps({"classification": classification, "reply": reply, "tag": tag})
+        with patch.object(glam, "draft_reply_logic", lambda *a, **k: (classification, reply, raw)), \
+             redirect_stdout(io.StringIO()):
+            glam._process_instagram_event({
+                "sender": {"id": SENDER}, "recipient": {"id": "1"},
+                "timestamp": 1, "message": {"mid": f"promises.{uuid.uuid4().hex}", "text": text},
+            })
+
+    def test_order_tagged_handoff_wording_is_sent_with_the_heads_up(self):
+        reply = "Could you share your order ID? I've passed this to the team and they'll reply to you here 🤍"
+        self.dm("my parcel still hasnt come", "AUTO", reply, tag="ORDER")
+        self.assertEqual(self.sends, [reply])
+        self.assertEqual(self.notices, ["ORDER"])
+        self.assertEqual(self.drafts, [])
+
+    def test_the_same_wording_on_a_plain_auto_reply_becomes_a_draft(self):
+        reply = "Could you share your order ID? I've passed this to the team and they'll reply to you here 🤍"
+        self.dm("hi, quick question about lashes", "AUTO", reply)
+        self.assertEqual(self.sends, [HANDOFF])       # now true: the founder has the draft
+        (draft,) = self.drafts
+        self.assertIn("rule 7", draft["guard_note"])
+
+    def test_bulk_template_promise_becomes_a_draft(self):
+        reply = ("Our bulk rate is ₹749/tray for orders of 20+ — and shipping is free, since an order "
+                 "that size is well above ₹799. Please share your Instagram handle or business name and "
+                 "we'll take it from there 🤍")
+        self.dm("whats ur bulk rate for 30 trays", "AUTO", reply)
+        self.assertEqual(self.sends, [HANDOFF])
+        self.assertIn("rule 7", self.drafts[0]["guard_note"])
+
+    def test_lead_line_is_sent_with_the_lead_notice(self):
+        self.dm("I run a lash brand, want this bot for my store", "AUTO", glam.LEAD_REPLY, tag="LEAD")
+        self.assertEqual(self.sends, [glam.LEAD_REPLY])
+        self.assertEqual(self.notices, ["LEAD"])
+
+
+if __name__ == "__main__":
+    unittest.main()

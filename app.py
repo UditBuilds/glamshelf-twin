@@ -7669,12 +7669,17 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
-def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
+def _ig_output_guard(sender_id: str, classification: str, reply: str,
+                     founder_notice: bool = False) -> str:
     """Output guard for Instagram AUTO replies (audit T1-4): run the pure
     checks in output_guard.py before an AUTO reply is sent. Returns "" when
     it may go out, else the rule(s) that fired — the caller then routes it
     to DRAFT+APPROVE (handoff line to the customer, draft plus this reason
     to the founder). The text is never rewritten.
+
+    `founder_notice`: a founder notice goes out with this reply
+    (_ig_founder_told), which is what makes "they'll reply to you here" or
+    "Udit will message you personally" true (rule 7, audit finding 6).
 
     Allowed ₹ amounts: the product prices in _inventory_cache — from the
     last successful Shopify fetch, or before one, from ALLOWED_PRICES_PATH
@@ -7694,7 +7699,7 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     prices = _inventory_cache.get("prices") or set()
     if not prices:
         print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
-    reasons = output_guard.check_reply(reply, prices)
+    reasons = output_guard.check_reply(reply, prices, founder_notice=founder_notice)
     if not reasons:
         return ""
     note = "; ".join(reasons)
@@ -7801,7 +7806,9 @@ def _ig_draft_handoff(sender_id: str, timestamp: str) -> bool:
         )
         return False
     print(f"[INSTAGRAM-DRAFT] {sender_id} already got the handoff line recently — not repeating it")
-    if _ig_output_guard(sender_id, "AUTO", IG_DRAFT_ACK_LINE):
+    # The founder gets this draft, so the ack line's "the team will reply
+    # here" is true (founder_notice).
+    if _ig_output_guard(sender_id, "AUTO", IG_DRAFT_ACK_LINE, founder_notice=True):
         print(f"[INSTAGRAM-DRAFT] Acknowledgement to {sender_id} held by the output guard — nothing sent")
         return False
     _ig_send_draft_line(sender_id, timestamp, IG_DRAFT_ACK_LINE, "DRAFT_ACK", "Acknowledgement")
@@ -7943,6 +7950,16 @@ def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: boo
     except Exception as tg_err:
         print(f"[INSTAGRAM-TG] LEAD notice failed: {type(tg_err).__name__}: {tg_err}")
     print(f"[INSTAGRAM-LEAD] {sender_id}'s answer waits for approval; founder notified, no pause")
+
+
+def _ig_founder_told(message: str, classification: str, reply: str, tag: str) -> bool:
+    """Does a founder notice go out with this AUTO reply — an ORDER /
+    RESTOCK heads-up (_ig_fyi_topic) or a LEAD notice (_ig_is_lead)? Only
+    then is a follow-up line like "they'll reply to you here" true, so the
+    output guard lets it through (rule 7, audit finding 6).
+
+    Shared with graph.py's route node so the two stay in parity."""
+    return bool(_ig_fyi_topic(message, tag)) or _ig_is_lead(message, classification, reply, tag)
 
 
 def _ig_fyi_topic(message: str, tag: str) -> str:
@@ -8251,8 +8268,14 @@ def _process_instagram_event(event: dict) -> None:
         # Output guard (audit T1-4): an AUTO reply that trips a rule is held
         # for approval instead of sent — before the LEAD check, so a
         # tester's AUTO reply is guarded too (the draft branch below still
-        # sends their LEAD notice).
-        guard_note = _ig_output_guard(sender_id, classification, reply)
+        # sends their LEAD notice). It's told whether a founder notice goes
+        # out with the reply, which is what makes a follow-up line true
+        # (rule 7, audit finding 6).
+        tag = _parse_twin_tag(_raw)
+        guard_note = _ig_output_guard(
+            sender_id, classification, reply,
+            founder_notice=_ig_founder_told(text, classification, reply, tag),
+        )
         if guard_note:
             classification = "DRAFT+APPROVE"
 
@@ -8260,7 +8283,6 @@ def _process_instagram_event(event: dict) -> None:
         # their answer (or brain.md's invite / LEAD line), a LEAD notice and
         # no 4h lockout (audit T1-5) — unless something more serious (legal,
         # press, health, a prefilter hit) is going on; see _ig_is_lead.
-        tag = _parse_twin_tag(_raw)
         if _ig_is_lead(text, classification, reply, tag):
             _ig_lead(sender_id, text, timestamp, reply if classification == "AUTO" else "")
             return
