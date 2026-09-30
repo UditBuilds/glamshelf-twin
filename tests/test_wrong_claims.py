@@ -272,7 +272,11 @@ class GuardHoldsReplacementPromises(unittest.TestCase):
 
     def test_the_audits_live_promises_are_held(self):
         for text in (
-            # PR 48's live run: a damaged follow-up went AUTO with this.
+            # PR 48's live run: "ok what next?" after a damage report went AUTO
+            # with exactly this.
+            "Please send clear photos of the damaged tray, the packaging, and the courier "
+            "label — we'll arrange a replacement for you right away 🤍",
+            # main's damage template, if the model ever sent it AUTO.
             "I'm really sorry about this. Could you send clear photos of the product, "
             "packaging, and the courier label? We'll arrange a replacement for you right away 🤍",
             "So sorry! We'll send you a new tray as soon as possible 🤍",
