@@ -129,12 +129,16 @@ def intake(state: TwinState) -> TwinState:
         app._seen_ids.add(msg_id)
         app._persist_seen_id(msg_id)
 
+    # Not answered, but logged and forwarded to the founder (and maybe the
+    # one-time line) — same helper as production (audit findings 8, 19).
     if app._is_paused(sender_id):
-        print(f"[PAUSED] Skipping reply — auto-pause active for IG sender {sender_id}")
+        print(f"[PAUSED] Not answering — auto-pause active for IG sender {sender_id}")
+        app._ig_unanswered(sender_id, state["text"], state.get("timestamp", ""), "paused")
         return {"drop_reason": "paused"}
 
     if app._udit_replied_recently_ig(sender_id):
-        print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — skipping")
+        print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — not answering")
+        app._ig_unanswered(sender_id, state["text"], state.get("timestamp", ""), "human_handling")
         return {"drop_reason": "human_handling"}
 
     # LLM rate limits (audit T1-3) — same gate and helper as production.

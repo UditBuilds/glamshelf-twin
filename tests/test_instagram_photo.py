@@ -131,11 +131,19 @@ class PhotoReply(InstagramPhotoTestCase):
         self.assertEqual(turn["msg_text"], "[sent a photo]")
         self.assertEqual(turn["reply_text"], glam.INSTAGRAM_PHOTO_REPLY)
 
-    def test_paused_sender_gets_nothing(self):
+    def test_paused_sender_gets_no_photo_reply_but_the_founder_sees_it(self):
+        # Since audit finding 8: a paused sender's message is logged and
+        # forwarded (no escalation holding line here, so no one-time line).
         glam._pause_number(SENDER)
         self.process(event({"mid": "", "attachments": [PHOTO]}))
         self.assertEqual(self.sends, [])
-        self.assertEqual(self.notices, [])
+        (forward,) = self.notices
+        self.assertIn("this customer is paused", forward)
+        self.assertIn('"[sent a photo]"', forward)
+        self.assertEqual(
+            db_rows("SELECT message_text, reply_text, source FROM instagram_logs"),
+            [("[sent a photo]", None, "PAUSED_IG")],
+        )
 
     def test_duplicate_delivery_answered_once(self):
         mid = "photo-dedup-test-mid"
@@ -159,9 +167,8 @@ class OtherNonTextEvents(InstagramPhotoTestCase):
         sticker = {"type": "image", "payload": {"url": "https://x/s.png", "sticker_id": 369239263222822}}
         self.assert_ignored_and_logged(event({"mid": "", "attachments": [sticker]}), "attachments=image")
 
-    def test_shared_post(self):
-        share = {"type": "share", "payload": {"url": "https://instagram.com/p/x"}}
-        self.assert_ignored_and_logged(event({"mid": "", "attachments": [share]}), "attachments=share")
+    # A shared post is no longer ignored (audit finding 10): see
+    # tests/test_paused_and_limited.py.
 
     def test_reaction(self):
         self.assert_ignored_and_logged(
