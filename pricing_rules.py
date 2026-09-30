@@ -132,3 +132,39 @@ def trays_mentioned(message: str) -> int | float | None:
         return None
     total = sum(_as_trays(int(n), unit) for n, unit in found)
     return int(total) if float(total).is_integer() else total
+
+
+def bulk_quantity_note(message: str) -> str:
+    """The pairs-to-trays conversion and bulk verdict for the customer's own
+    numbers, written for the model ("" when there's nothing to convert).
+    The model doesn't do arithmetic reliably (audit finding 3: "20 pairs"
+    got the 20+ tray quote word-for-word 3/3), so the system does it and
+    app.build_user_message adds the line to the prompt. Only digits from the
+    message reach the note — never the customer's words. A pair or two
+    ("2 pairs of Kawaii") is a singles question and gets no note."""
+    found = _QUANTITY_RE.findall(message or "")
+    if not found:
+        return ""
+    pairs = [int(n) for n, unit in found if unit.lower().startswith("pair")]
+    total = trays_mentioned(message)
+    # A pair or two is a singles question; one tray is a plain price question.
+    if (not pairs and total < 2) or (len(pairs) == len(found) and sum(pairs) < PAIRS_PER_TRAY):
+        return ""
+    parts = []
+    for n, unit in found:
+        n = int(n)
+        if unit.lower().startswith("pair"):
+            parts.append(f"{n} pairs = {_as_trays(n, unit):g} trays")
+        else:
+            parts.append(f"{n} {'tray' if n == 1 else 'trays'}")
+    line = "; ".join(parts)
+    if len(parts) > 1:
+        line += f" — {total:g} trays in all"
+    if pairs:
+        line += " (trays come in 10 pairs each)"
+    if total >= BULK_MIN_TRAYS:
+        verdict = f"That is 20+ trays, so the ₹{BULK_RATE_INR}/tray bulk rate applies."
+    else:
+        verdict = (f"That is under 20 trays (200 pairs), so the ₹{BULK_RATE_INR} bulk rate "
+                   "does NOT apply — the regular tray price does.")
+    return f"{line}. {verdict}"
