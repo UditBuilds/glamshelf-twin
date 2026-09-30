@@ -154,6 +154,65 @@ class BrainPromisesNoFollowUp(unittest.TestCase):
         self.assertTrue(rule7("Got it — Team The Glam Shelf has your details and will reach out shortly 🤍"))
 
 
+F4 = "THIS IS RIDICULOUS. ordered 12 days ago, emailed you twice, NO ONE REPLIES. worst brand ever"
+
+
+class AngryComplaintsEscalate(unittest.TestCase):
+    """Finding 11: the founder's rule — an angry complaint (all caps,
+    "ridiculous", "no one replies") always escalates, legal threat or not."""
+
+    def setUp(self):
+        os.environ.pop("ESCALATION_PREFILTER_DISABLED", None)
+
+    def test_angry_messages_hit_the_prefilter(self):
+        for message in (
+            F4,
+            "this is ridiculous, where is my order",
+            "no one replies on whatsapp either",
+            "nobody is responding to my emails",
+            "worst service ever, still no parcel",
+            "koi reply nahi aaya abhi tak",
+            "WHY IS MY PARCEL STILL NOT HERE AFTER 10 DAYS",
+            "pathetic. 2 weeks and nothing",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(glam._escalation_prefilter_hit(message))
+
+    def test_look_alikes_do_not(self):
+        for message in (
+            "these are ridiculously pretty!!",
+            "PRICE OF GS1?",
+            "HI I WANT TO ORDER GS1 TRAY",
+            "OMG THESE ARE SO CUTE",
+            "COD hai kya?",
+            "is GS2 band thicker than GS1?",
+            "what's the worst that can happen if I wear them daily?",
+            "does anyone reply on sundays?",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(glam._escalation_prefilter_hit(message))
+
+    def test_legal_threats_still_win_and_stay_silent(self):
+        text = "THIS IS RIDICULOUS, I'll take you to consumer court"
+        self.assertEqual(glam._escalation_prefilter_hit(text).lower(), "consumer court")
+        self.assertEqual(glam._ig_escalation_reply(text, "")[0], "legal")
+
+    def test_an_angry_complaint_gets_the_handoff_line(self):
+        self.assertEqual(glam._ig_escalation_reply(F4, ""), ("other", HANDOFF))
+
+    def test_kill_switch_turns_it_off(self):
+        os.environ["ESCALATION_PREFILTER_DISABLED"] = "1"
+        try:
+            self.assertIsNone(glam._escalation_prefilter_hit(F4))
+        finally:
+            os.environ.pop("ESCALATION_PREFILTER_DISABLED", None)
+
+    def test_brain_says_escalate(self):
+        self.assertIn('| 43 | Angry complaint — one gaali, a caps-lock rant, "ridiculous", "no one replies", '
+                      '"worst brand" | 🔴 ESCALATE — always, legal threat or not', BRAIN)
+        self.assertNotIn("| 43 | One gaali / caps lock rant | 🟡 DRAFT+APPROVE |", BRAIN)
+
+
 class FollowUpGuardInTheHandler(unittest.TestCase):
     """_process_instagram_event end to end, model and sends stubbed."""
 
@@ -220,6 +279,25 @@ class FollowUpGuardInTheHandler(unittest.TestCase):
         self.dm("whats ur bulk rate for 30 trays", "AUTO", reply)
         self.assertEqual(self.sends, [HANDOFF])
         self.assertIn("rule 7", self.drafts[0]["guard_note"])
+
+    def test_f4_escalates_even_when_the_model_says_draft(self):
+        # The audit's main run: the model said DRAFT+APPROVE, so no pause.
+        # Only the model call is stubbed; draft_reply_logic's prefilter runs.
+        raw = json.dumps({"classification": "DRAFT+APPROVE",
+                          "reply": "Really sorry about the back and forth 🤍", "tag": ""})
+        with patch.object(glam, "ask_claude", lambda *a, **k: raw), \
+             patch.object(glam, "get_live_inventory", lambda: ""), \
+             patch.object(glam, "get_live_policies", lambda: ""), \
+             patch.object(glam, "_rag_retrieve", lambda m: ""), \
+             redirect_stdout(io.StringIO()):
+            glam._process_instagram_event({
+                "sender": {"id": SENDER}, "recipient": {"id": "1"},
+                "timestamp": 1, "message": {"mid": f"promises.{uuid.uuid4().hex}", "text": F4},
+            })
+        self.assertEqual(self.sends, [HANDOFF])
+        self.assertEqual(self.notices, ["ESCALATE"])
+        self.assertEqual(self.drafts, [])
+        self.assertTrue(glam._is_paused(SENDER))
 
     def test_lead_line_is_sent_with_the_lead_notice(self):
         self.dm("I run a lash brand, want this bot for my store", "AUTO", glam.LEAD_REPLY, tag="LEAD")

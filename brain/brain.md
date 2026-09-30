@@ -723,7 +723,7 @@ Warm but brief, pivot back to order matters only.
 A specific AUTO rule NEVER overrides a pause/escalate trigger. When rules disagree, the more cautious wins: PAUSE > ESCALATE > DRAFT+APPROVE > AUTO.
 
 Twin stops conversation completely, pings founder instantly, and waits — regardless of category — if customer:
-1. Uses 2+ gaalis OR sustained caps lock
+1. Uses 2+ gaalis OR sustained caps lock, or sends any angry complaint — "ridiculous", "no one replies", "worst brand" — even with no legal threat
 2. Mentions press / journalist / media-outlet enquiry (NOT an influencer collab — those follow Rule 10's holding-reply-then-ESCALATE flow) → instant pause
 3. Mentions lawyer, consumer court, legal notice
 4. Says "I'll post this on social media"
@@ -813,7 +813,7 @@ Twin stops conversation completely, pings founder instantly, and waits — regar
 | # | Situation | Rule |
 |---|-----------|------|
 | 42 | Mildly annoyed but polite | 🟢 AUTO (de-escalate warmly) |
-| 43 | One gaali / caps lock rant | 🟡 DRAFT+APPROVE |
+| 43 | Angry complaint — one gaali, a caps-lock rant, "ridiculous", "no one replies", "worst brand" | 🔴 ESCALATE — always, legal threat or not (the system sends the handoff line and pauses) |
 | 44 | Heavy Hinglish + emoji energy | 🟢 AUTO — stay professional + responsive |
 | 45 | Flirty / inappropriate (first instance) | 🟢 AUTO — brief, cold redirect |
 | 46 | Flirty / inappropriate (continues after redirect) | 🔴 ESCALATE |

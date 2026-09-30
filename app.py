@@ -5087,7 +5087,10 @@ get_live_policies()
 # runs alongside the LLM classification and can only UPGRADE the result to
 # ESCALATE; it never downgrades an LLM decision. The phrase list is
 # deliberately short and founder-confirmed — do not extend it with soft
-# signals (tone, sentiment, non-Hindi anger); those stay with the LLM.
+# signals (tone, sentiment); those stay with the LLM. The one exception is
+# the founder's own (30 Sep 2026): an angry complaint — all caps,
+# "ridiculous", "no one replies" — always escalates, legal threat or not
+# (_ANGER_PHRASES_RE / _caps_complaint below, audit finding 11).
 #
 # Rollback: set ESCALATION_PREFILTER_DISABLED=1 in the environment and
 # restart. Do not edit brain.md to compensate for filter behavior.
@@ -5311,8 +5314,52 @@ def _ig_is_lead(message: str, classification: str, reply: str, tag: str) -> bool
     return classification == "AUTO" and bool(reply) and bool(_LEAD_RE.search(message or ""))
 
 
+# Angry complaints (founder decision, 30 Sep 2026): always ESCALATE, with or
+# without a legal threat. The audit's "THIS IS RIDICULOUS. ordered 12 days
+# ago, emailed you twice, NO ONE REPLIES. worst brand ever" went to DRAFT 1
+# of 3 times (finding 11). Explicit phrases first; a caps-lock run counts
+# only next to a complaint word, so "PRICE OF GS1?" typed in capitals or
+# "OMG THESE ARE SO CUTE" isn't one. Not legal: the customer gets the
+# handoff line, as for any other escalation.
+_ANGER_PHRASES_RE = re.compile(
+    r"\b(?:ridiculous|pathetic|disgusting|unacceptable|fed up)\b"
+    r"|\bworst (?:brand|service|company|experience|customer service|shopping)\b"
+    r"|\b(?:no ?one|nobody|no body)\s+(?:is\s+|was\s+|has\s+|ever\s+)?"
+    r"(?:repl(?:y|ies|ied|ying)|respond(?:s|ed|ing)?|answer(?:s|ed|ing)?|getting back)\b"
+    r"|\bno (?:reply|response|answer)s? (?:from|yet|till|at all|since)\b"
+    r"|\bkoi (?:reply|jawab|response) (?:nahi|nhi|nahin)\b",
+    re.IGNORECASE,
+)
+_CAPS_EXEMPT_WORDS = frozenset({
+    "GS1", "GS2", "GS3", "COD", "UPI", "MUA", "ID", "OK", "DM", "IG", "INR", "RS",
+    "AWB", "RTO", "POD", "GST", "MRP", "PR", "UGC", "OTP", "SMS", "PM", "AM",
+})
+_COMPLAINT_WORD_RE = re.compile(
+    r"\b(?:ordered|refunds?|money back|waiting|waited|days|weeks?|worst|fake|fraud|scam|cheat\w*"
+    r"|complain\w*|problem|issue|damaged|broken|wrong|never|still|ignor\w*"
+    r"|not (?:received|delivered|arrived))\b",
+    re.IGNORECASE,
+)
+
+
+def _caps_complaint(message: str) -> bool:
+    """Three or more words in a row typed in capitals (brand codes aside)
+    in a message that also names a problem."""
+    run = best = 0
+    for token in re.findall(r"[A-Za-z0-9']+", message or ""):
+        letters = re.sub(r"[^A-Za-z]", "", token)
+        if len(letters) >= 2 and letters.isupper() and token.upper() not in _CAPS_EXEMPT_WORDS:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best >= 3 and bool(_COMPLAINT_WORD_RE.search(message or ""))
+
+
 def _escalation_prefilter_hit(message: str) -> str | None:
-    """Return the matched high-risk phrase, or None.
+    """Return the matched high-risk phrase, or None: a legal threat or a
+    social-media threat (_ESCALATION_PREFILTER_PATTERNS), else an angry
+    complaint (_ANGER_PHRASES_RE, or "caps-lock complaint").
 
     Returns None unconditionally when ESCALATION_PREFILTER_DISABLED is
     set (rollback switch — read per call so a Render env change takes
@@ -5321,7 +5368,12 @@ def _escalation_prefilter_hit(message: str) -> str | None:
     if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
         return None
     m = _ESCALATION_PREFILTER_PATTERNS.search(message or "")
-    return m.group(0) if m else None
+    if m:
+        return m.group(0)
+    m = _ANGER_PHRASES_RE.search(message or "")
+    if m:
+        return m.group(0)
+    return "caps-lock complaint" if _caps_complaint(message) else None
 
 
 def _bulk_commit_prefilter_hit(message: str) -> int | None:
