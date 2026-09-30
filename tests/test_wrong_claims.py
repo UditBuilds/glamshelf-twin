@@ -210,5 +210,51 @@ class CountryOfOrigin(unittest.TestCase):
         self.assertIn("never name or hint at a supplier, factory or city", row)
 
 
+DAMAGE_TEMPLATE = (
+    "I'm really sorry about this. Please email clear photos of the product, packaging "
+    "and courier label to glamshelfstore@gmail.com with your order number, within 48 "
+    "hours of delivery. Once verified, we'll arrange a replacement or refund at no "
+    "additional cost 🤍"
+)
+
+
+class DamagePhotosGoByEmail(unittest.TestCase):
+    """Finding 9: brain.md:172 said never ask for photos on Instagram, while
+    the damage template (brain.md:420) asked for them — and promised a
+    replacement "right away" before anyone had seen them."""
+
+    def test_damage_template_asks_for_photos_by_email(self):
+        self.assertEqual(template_after("Reply for damaged/wrong item:"), DAMAGE_TEMPLATE)
+        self.assertIn("🟡 DRAFT+APPROVE (Rule 8)", brain_line("Reply for damaged/wrong item:"))
+
+    def test_no_unconditional_replacement_promise(self):
+        self.assertNotIn("We'll arrange a replacement for you right away", BRAIN)
+        self.assertIn("Once verified, we'll arrange a replacement or refund", DAMAGE_TEMPLATE)
+        section = BRAIN.split("Reply for damaged/wrong item:", 1)[1].split("### 3.4 Payments", 1)[0]
+        self.assertIn("Never ask for the photos on Instagram", section)
+        self.assertIn('never promise a replacement, refund or reship without "once verified"', section)
+
+    def test_proof_goes_by_email_within_48_hours(self):
+        section = BRAIN.split("**Proof required:**", 1)[1].split("**Resolution options", 1)[0]
+        self.assertIn("email to glamshelfstore@gmail.com with the order number", section)
+        self.assertIn("never on Instagram", section)
+        self.assertIn("within **48 hours of delivery**", section)
+        self.assertNotIn("24–48 hours of delivery**", section)
+
+    def test_instagram_photo_rule_has_the_email_exception(self):
+        rule = brain_line("**On Instagram, photos are NOT processed")
+        self.assertIn("never ask the customer to send or re-send one here", rule)
+        self.assertIn("go by email to glamshelfstore@gmail.com with the order number (Section 3.3), "
+                      "never on Instagram", rule)
+        mention = BRAIN.split("If a customer mentions an image you have no record of", 1)[1][:900]
+        self.assertIn("use the Section 3.3 damaged / wrong item reply instead (photos by email", mention)
+
+    def test_no_template_asks_for_photos_on_instagram(self):
+        for quoted in re.findall(r'^> "(.+?)"$', BRAIN, re.M):
+            if re.search(r"\b(photos?|pictures?|pics?|images?)\b", quoted, re.I) and \
+                    re.search(r"\b(send|share|upload)\b", quoted, re.I):
+                self.assertIn("glamshelfstore@gmail.com", quoted, quoted)
+
+
 if __name__ == "__main__":
     unittest.main()
