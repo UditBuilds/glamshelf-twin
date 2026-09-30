@@ -29,6 +29,10 @@ import re
 BULK_RATE_INR = 749
 BULK_MIN_TRAYS = 20
 HARD_MONEY_THRESHOLD_INR = 1500
+# Every tray holds 10 pairs, so the bulk rate starts at 200 pairs. A
+# quantity in pairs is converted before any bulk decision (audit finding 3:
+# "20 pairs" got the 20+ tray quote).
+PAIRS_PER_TRAY = 10
 
 INTENT_ASK = "ask"
 INTENT_COMMIT = "commit"
@@ -77,24 +81,54 @@ def resolve_pricing_action(quantity: int | None, amount: float | None, intent: s
 # that carry an explicit quantity belong here — "book it" is also a commit
 # signal but has no number, so it stays with the LLM, which has conversation
 # history to judge it. Do not extend this list with unconfirmed phrasings.
+# A bare number means trays (the founder's examples); "pairs" right after
+# it is converted (finding 3: "I'll take 25 pairs" used to count as 25 trays).
 _BULK_COMMIT_PATTERNS = re.compile(
     r"\b(?:"
     r"i[’']?ll\s+take\s+(\d+)"
     r"|let[’']?s\s+do\s+(\d+)"
     r"|how\s+do\s+i\s+pay\s+for\s+(\d+)"
-    r")\b",
+    r")\b(?:\s*(pairs?|trays?)\b)?",
+    re.IGNORECASE,
+)
+
+# A number with its unit: "20 pairs", "25 trays", "3 tray". "10 pairs each"
+# / "10 pairs per tray" describe a tray, not an order, and don't count.
+_QUANTITY_RE = re.compile(
+    r"\b(\d{1,5})\s*(pairs?|trays?)\b(?!\s+(?:each|per\b|in (?:a|one|each|every) tray))",
     re.IGNORECASE,
 )
 
 
-def detect_bulk_commit_quantity(message: str) -> int | None:
-    """Return the quantity from an explicit commit phrase, or None.
+def _as_trays(count: int, unit: str) -> int | float:
+    """`count` pairs or trays, in trays: 20 pairs -> 2, 25 pairs -> 2.5."""
+    if not (unit or "").lower().startswith("pair"):
+        return count
+    trays = count / PAIRS_PER_TRAY
+    return int(trays) if trays.is_integer() else trays
 
-    None means "no deterministic commit signal", not "this is an ask" —
-    ambiguous messages are left to the LLM classification.
+
+def detect_bulk_commit_quantity(message: str) -> int | float | None:
+    """Return the quantity in trays from an explicit commit phrase, or None.
+
+    "I'll take 200 pairs" is 20 trays; "I'll take 25 pairs" is 2.5 trays —
+    never 25. None means "no deterministic commit signal", not "this is an
+    ask" — ambiguous messages are left to the LLM classification.
     """
     m = _BULK_COMMIT_PATTERNS.search(message or "")
     if not m:
         return None
-    qty = next(g for g in m.groups() if g is not None)
-    return int(qty)
+    qty = next(g for g in m.groups()[:3] if g is not None)
+    return _as_trays(int(qty), m.group(4))
+
+
+def trays_mentioned(message: str) -> int | float | None:
+    """How many trays the message asks about, pairs converted at
+    PAIRS_PER_TRAY per tray: "20 pairs" -> 2, "200 pairs" -> 20, "25 trays"
+    -> 25. Several quantities add up. None when no number carries a pairs
+    or trays unit."""
+    found = _QUANTITY_RE.findall(message or "")
+    if not found:
+        return None
+    total = sum(_as_trays(int(n), unit) for n, unit in found)
+    return int(total) if float(total).is_integer() else total

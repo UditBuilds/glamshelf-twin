@@ -18,11 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pricing_rules import (
     ACTION_AUTO,
     ACTION_ESCALATE,
+    BULK_MIN_TRAYS,
     BULK_RATE_INR,
     INTENT_ASK,
     INTENT_COMMIT,
+    PAIRS_PER_TRAY,
     detect_bulk_commit_quantity,
     resolve_pricing_action,
+    trays_mentioned,
 )
 
 
@@ -109,6 +112,65 @@ class CommitPhraseDetection(unittest.TestCase):
     def test_empty_and_none_safe(self):
         self.assertIsNone(detect_bulk_commit_quantity(""))
         self.assertIsNone(detect_bulk_commit_quantity(None))
+
+
+class PairsAreNotTrays(unittest.TestCase):
+    """Audit finding 3: "20 pairs" got the 20+ TRAY bulk quote, and "I'll take
+    25 pairs" counted as 25 trays. Pairs convert at 10 per tray; the ₹749 rate
+    starts at 20 trays = 200 pairs."""
+
+    def test_ten_pairs_per_tray(self):
+        self.assertEqual(PAIRS_PER_TRAY, 10)
+        self.assertEqual(BULK_MIN_TRAYS * PAIRS_PER_TRAY, 200)
+
+    def test_quantities_the_brief_lists(self):
+        for message, trays in (
+            ("im a MUA, need 20 pairs for my bridal kit. whats ur bulk price?", 2),
+            ("50 pairs", 5),
+            ("200 pairs", 20),
+            ("25 trays", 25),
+            ("I'll take 25 pairs", 2.5),
+            ("need 3 trays", 3),
+            ("is 25 trays bulk?", 25),
+            ("1 tray", 1),
+            ("need 1 pair", 0.1),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(trays_mentioned(message), trays)
+
+    def test_bulk_rate_only_from_200_pairs(self):
+        for message, bulk in (("20 pairs", False), ("50 pairs", False), ("199 pairs", False),
+                              ("200 pairs", True), ("25 trays", True), ("need 3 trays", False)):
+            with self.subTest(message=message):
+                self.assertEqual(trays_mentioned(message) >= BULK_MIN_TRAYS, bulk)
+
+    def test_a_tray_description_is_not_an_order(self):
+        self.assertIsNone(trays_mentioned("how many pairs in one tray?"))
+        self.assertIsNone(trays_mentioned("is it 10 pairs each?"))
+        self.assertIsNone(trays_mentioned("so 10 pairs per tray?"))
+        self.assertIsNone(trays_mentioned("GS1 tray price?"))
+        self.assertIsNone(trays_mentioned(""))
+        self.assertIsNone(trays_mentioned(None))
+
+    def test_several_quantities_add_up(self):
+        self.assertEqual(trays_mentioned("5 trays for the salon and 50 pairs for my kit"), 10)
+
+    def test_ill_take_25_pairs_is_not_25_trays(self):
+        qty = detect_bulk_commit_quantity("ok I'll take 25 pairs")
+        self.assertEqual(qty, 2.5)
+        self.assertEqual(resolve_pricing_action(quantity=qty, amount=None, intent=INTENT_COMMIT),
+                         ACTION_AUTO)
+
+    def test_ill_take_200_pairs_is_a_20_tray_commit(self):
+        qty = detect_bulk_commit_quantity("ok I'll take 200 pairs")
+        self.assertEqual(qty, 20)
+        self.assertEqual(resolve_pricing_action(quantity=qty, amount=qty * BULK_RATE_INR,
+                                                intent=INTENT_COMMIT), ACTION_ESCALATE)
+
+    def test_bare_numbers_and_trays_still_mean_trays(self):
+        self.assertEqual(detect_bulk_commit_quantity("ok I'll take 25"), 25)
+        self.assertEqual(detect_bulk_commit_quantity("let's do 30 trays"), 30)
+        self.assertEqual(detect_bulk_commit_quantity("how do I pay for 20 pairs"), 2)
 
 
 if __name__ == "__main__":
