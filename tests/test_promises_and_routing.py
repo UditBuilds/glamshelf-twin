@@ -243,6 +243,17 @@ class HinglishInHinglishOut(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(guard(text), [])
 
+    def test_the_output_contract_checks_the_language(self):
+        line = next(l for l in BRAIN.splitlines() if l.startswith("- **Language:**"))
+        self.assertIn("they give you the facts, not the language: translate the one you'd use", line)
+
+    def test_the_hinglish_handoff_line_needs_a_founder_notice_like_the_english_one(self):
+        # This PR's AFTER run: an ORDER-tagged Hinglish answer was held for it.
+        text = ("Order ID share kar dijiye, main team ko pass kar deti hoon aur woh yahan reply "
+                "karenge 🤍")
+        self.assertEqual(rule7(text, founder_notice=True), [])
+        self.assertTrue(rule7(text, founder_notice=False))
+
     def test_a_hinglish_policy_sentence_is_held(self):
         # Why brain.md keeps policy sentences in English: rule 2 only knows
         # the English statements, so this becomes a draft.

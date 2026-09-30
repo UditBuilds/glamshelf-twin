@@ -320,7 +320,9 @@ _FOLLOWUP_RE = re.compile(
 _NOTIFIED_FOLLOWUP_RE = re.compile(
     r"\b(?:they|the team|our team|team the glam shelf)(?:'ll| will) reply (?:to you )?here\b"
     r"|\b(?:has|have) (?:your|the) [\w ]{0,30}? and will reply (?:to you )?here\b"
-    r"|\budit will message you personally\b",
+    r"|\budit will message you personally\b"
+    # the same line in Hinglish: "(team / woh) yahan reply karenge"
+    r"|\b(?:woh|wo|team)\s+(?:aapko\s+)?(?:yahan|yahin|yahi|idhar)\s+(?:hi\s+)?reply\s+kar(?:enge|egi|ega)\b",
     re.IGNORECASE,
 )
 
