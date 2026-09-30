@@ -26,8 +26,10 @@ os.environ["GITHUB_TOKEN"] = ""; os.environ["GITHUB_REPO"] = ""
 os.environ.setdefault("SECRET_KEY", "t"); os.environ.setdefault("APP_PASSWORD", "t")
 os.environ.setdefault("DASHBOARD_KEY", "t")
 import app as glam
+import output_guard
 
 BRAIN = (REPO / "brain" / "brain.md").read_text(encoding="utf-8")
+LIVE_PRICES = {249.0, 299.0, 499.0, 699.0, 849.0}
 
 
 def quiet(fn, *a, **k):
@@ -37,6 +39,16 @@ def quiet(fn, *a, **k):
 
 def brain_line(start: str) -> str:
     return next(l for l in BRAIN.splitlines() if l.startswith(start))
+
+
+def template_after(heading: str) -> str:
+    """The first quoted template (> "…") after a brain.md heading."""
+    section = BRAIN.split(heading, 1)[1]
+    return re.search(r'^> "(.+?)"$', section, re.M).group(1)
+
+
+def guard(text: str) -> list:
+    return output_guard.check_reply(text, LIVE_PRICES)
 
 
 class StorefrontCopyGivesSpecsOnly(unittest.TestCase):
@@ -95,6 +107,49 @@ class StorefrontCopyGivesSpecsOnly(unittest.TestCase):
              patch.object(glam, "_save_allowed_prices", lambda prices: None), \
              patch.object(glam.requests, "get", Mock(return_value=resp)):
             self.assertEqual(quiet(glam.get_live_inventory), "")
+
+
+class SensitiveEyes(unittest.TestCase):
+    """Finding 2: a pre-purchase sensitive-eye question gets no comfort or
+    suitability claim — the founder's template, AUTO, no SAFETY tag."""
+    HEADING = "**Sensitive eyes (before buying"
+    TEMPLATE = (
+        "We can't guarantee our lashes will suit sensitive eyes. Before wearing them, "
+        "patch-test the lash glue on your inner arm for 24 hours. If you notice any "
+        "irritation, remove the lashes and stop using them 🤍"
+    )
+
+    def test_template_is_the_founders_wording(self):
+        self.assertEqual(template_after(self.HEADING), self.TEMPLATE)
+
+    def test_template_makes_no_comfort_or_suitability_claim(self):
+        low = self.TEMPLATE.lower()
+        for word in ("comfortable", "gentle", "lightweight", "feather", "safe", "most customers"):
+            self.assertNotIn(word, low)
+        for must in ("can't guarantee", "inner arm", "24 hours", "remove the lashes", "stop using"):
+            self.assertIn(must, low)
+
+    def test_template_passes_the_output_guard(self):
+        self.assertEqual(guard(self.TEMPLATE), [])
+
+    def test_it_is_auto_without_the_safety_tag(self):
+        heading = brain_line(self.HEADING)
+        self.assertIn('🟢 AUTO, tag ""', heading)
+        self.assertIn('not "SAFETY"', heading)
+        row = brain_line("| 58 | Sensitive eyes, before buying")
+        self.assertIn('🟢 AUTO, tag ""', row)
+        self.assertIn("Rule 32", row)
+
+    def test_a_reaction_still_escalates(self):
+        section = BRAIN.split(self.HEADING, 1)[1].split("**Lash extension service request", 1)[0]
+        self.assertIn('allergic reaction escalation (🔴 ESCALATE, tag "SAFETY")', section)
+        self.assertIn("| 32 | Allergic reaction claim | 🔴 ESCALATE", BRAIN)
+
+    def test_never_26_points_at_the_template(self):
+        never = brain_line("26. **NEVER** make medical")
+        self.assertIn("comfort or suitability claims", never)
+        self.assertIn("Sensitive eyes template", never)
+        self.assertNotIn('redirect to *"please patch-test first 🤍"*', never)
 
 
 if __name__ == "__main__":
