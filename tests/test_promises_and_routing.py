@@ -113,6 +113,47 @@ class FollowUpPromisesAreHeld(unittest.TestCase):
         self.assertTrue(rule7("We’ll be right here 🤍"))
 
 
+def template_after(heading: str) -> str:
+    return re.search(r'^> "(.+?)"$', BRAIN.split(heading, 1)[1], re.M).group(1)
+
+
+class BrainPromisesNoFollowUp(unittest.TestCase):
+    def test_the_rule_is_stated(self):
+        self.assertIn("never promise a reminder: if they ask you to remind them later, say plainly "
+                      "you can't send reminders", BRAIN)
+        rule = next(l for l in BRAIN.splitlines() if l.startswith("- **No other follow-up promise on an AUTO reply:**"))
+        for phrase in ("the team will update you", "we'll remind you", "we'll be right here",
+                       "we'll take it from there", "we'll get back to you", "🟡 DRAFT+APPROVE"):
+            self.assertIn(phrase, rule)
+
+    def test_bulk_template_no_longer_promises_to_take_it_from_there(self):
+        t = template_after("**Bulk / MUA pricing — 20+ trays confirmed:**")
+        self.assertNotIn("take it from there", t)
+        self.assertIn("20+ trays", t)
+        self.assertIn("shipping is free", t)        # brain.md: bulk rate ships with the free-shipping fact
+        self.assertEqual(guard(t), [])
+
+    def test_reminder_template(self):
+        heading = "**Customer asks for a reminder"
+        self.assertIn("🟢 AUTO", next(l for l in BRAIN.splitlines() if l.startswith(heading)))
+        t = template_after(heading)
+        self.assertEqual(t, "I can't send reminders from here, but you can order anytime at glamshelf.in 🤍")
+        self.assertEqual(guard(t), [])
+
+    def test_warm_close_is_not_a_promise(self):
+        self.assertNotIn('`"We\'ll be in touch soon 🤍"` and Classify', BRAIN)
+        self.assertIn('`"Happy to help 🤍"` (never a follow-up promise', BRAIN)
+        self.assertEqual(guard("Happy to help 🤍"), [])
+
+    def test_collab_replies_go_to_a_draft(self):
+        self.assertIn("**Collab / ambassador:** 🟡 DRAFT+APPROVE", BRAIN)
+        self.assertIn("| 10 | Collab / ambassador DM | 🟡 DRAFT+APPROVE", BRAIN)
+        self.assertIn("sends their Instagram handle) → 🟡 DRAFT+APPROVE", BRAIN)
+        # The collab drafts still promise a follow-up — fine in a draft the
+        # founder approves, held if the model ever sent them AUTO.
+        self.assertTrue(rule7("Got it — Team The Glam Shelf has your details and will reach out shortly 🤍"))
+
+
 class FollowUpGuardInTheHandler(unittest.TestCase):
     """_process_instagram_event end to end, model and sends stubbed."""
 
