@@ -213,6 +213,42 @@ class AngryComplaintsEscalate(unittest.TestCase):
         self.assertNotIn("| 43 | One gaali / caps lock rant | 🟡 DRAFT+APPROVE |", BRAIN)
 
 
+class HinglishInHinglishOut(unittest.TestCase):
+    """Finding 14: 0 of 7 Hinglish messages got a Hinglish reply. brain.md's
+    only Hinglish example said "(only if customer is informal)"."""
+
+    def test_the_rule_is_every_time_in_roman_script(self):
+        rule = next(l for l in BRAIN.splitlines() if l.startswith("- **Language mirroring:**"))
+        self.assertIn("reply in Hinglish, in Roman script, with exactly the same facts", rule)
+        self.assertIn("every time, not only when the customer is informal", rule)
+        self.assertIn("Keep policy sentences in English, word for word", rule)
+        self.assertNotIn("Example Hinglish mirror (only if customer is informal)", BRAIN)
+
+    def test_the_examples_pass_the_guard(self):
+        notes = BRAIN.split("### Hinglish Mirroring", 1)[1].split("###", 1)[0]
+        examples = re.findall(r'→ \*"(.+?)"\*', notes)
+        self.assertEqual(len(examples), 3)
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_english_policy_sentences_keep_a_hinglish_reply_sendable(self):
+        for text in (
+            "Refunds are initiated within 24–48 hours of approval, then reach UPI/bank accounts in "
+            "5–7 working days. Return ke liye glamshelfstore@gmail.com pe order ID ke saath email "
+            "kar dijiye 🤍",
+            "Humare prices already MRP se kam hain. Our prices are already reduced from the original "
+            "MRP — there's no additional discount available at the moment 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_a_hinglish_policy_sentence_is_held(self):
+        # Why brain.md keeps policy sentences in English: rule 2 only knows
+        # the English statements, so this becomes a draft.
+        self.assertIn("rule 2", " ".join(guard("₹799 se upar ke orders pe shipping free hai 🤍")))
+
+
 class FollowUpGuardInTheHandler(unittest.TestCase):
     """_process_instagram_event end to end, model and sends stubbed."""
 
