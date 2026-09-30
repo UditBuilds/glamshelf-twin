@@ -152,5 +152,36 @@ class SensitiveEyes(unittest.TestCase):
         self.assertNotIn('redirect to *"please patch-test first 🤍"*', never)
 
 
+class CleanGirlIsSynthetic(unittest.TestCase):
+    """Finding 5: Clean Girl is synthetic (founder fact). Twin says so and
+    never explains away the storefront's "natural hair" wording."""
+    HEADING = '**Clean Girl — "natural hair", real hair or vegan question:**'
+    EXPLAINING = re.compile(r"refers? to|describes|means|just the name|in the name", re.I)
+
+    def test_auto_template_says_synthetic_and_explains_nothing(self):
+        self.assertIn("🟢 AUTO", brain_line(self.HEADING))
+        t = template_after(self.HEADING)
+        self.assertEqual(t, "Clean Girl is made with synthetic fibers — no real or animal hair "
+                            "— and our whole range is 100% vegan and cruelty-free 🤍")
+        self.assertIsNone(self.EXPLAINING.search(t))
+        self.assertEqual(guard(t), [])
+
+    def test_the_rule_forbids_explaining_the_wording(self):
+        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing question", 1)[0]
+        self.assertIn('say nothing about the "natural hair" wording', section)
+        self.assertIn("never explain what it means or describes", section)
+
+    def test_asking_again_goes_to_a_draft(self):
+        section = BRAIN.split(self.HEADING, 1)[1].split("**Sourcing / manufacturing question", 1)[0]
+        self.assertIn("asks again why the website says natural hair → 🟡 DRAFT+APPROVE", section)
+        second = re.findall(r'^> "(.+?)"$', section, re.M)[1]
+        self.assertIn("synthetic fibers, not real hair", second)
+        self.assertIsNone(self.EXPLAINING.search(second))
+
+    def test_product_table_says_synthetic(self):
+        row = brain_line("| CLEAN GIRL — Natural Hair Lashes | ₹249 |")
+        self.assertIn("Synthetic fibers — no real or animal hair", row)
+
+
 if __name__ == "__main__":
     unittest.main()
