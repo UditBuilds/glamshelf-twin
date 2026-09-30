@@ -271,6 +271,24 @@ class DecidedBuyerGetsTheLink(unittest.TestCase):
         self.assertEqual(guard(text), [])
 
 
+class EmptyReplyNoteMatchesTheCode(unittest.TestCase):
+    """brain.md:853 said the webhook sends nothing for an empty reply. Since
+    PR 48 an empty AUTO / DRAFT reply goes to the founder as a draft and the
+    customer gets the handoff line, the one-time ack, or nothing new."""
+
+    def test_the_stale_explanation_is_gone(self):
+        self.assertNotIn('the webhook treats empty reply as "do not send anything"', BRAIN)
+
+    def test_the_new_explanation(self):
+        line = next(l for l in BRAIN.splitlines() if l.startswith('→ Reply: `""` (empty string).'))
+        self.assertIn("forwards the customer's message to the team as a draft", line)
+        self.assertIn("the handoff line", line)
+        self.assertIn("in the last 30 minutes, the one-time acknowledgement", line)
+        self.assertIn(f'("{ACK}")', line)
+        self.assertIn("nothing new goes out", line)
+        self.assertEqual(glam.IG_DRAFT_HANDOFF_WINDOW_SECONDS, 30 * 60)
+
+
 class FollowUpGuardInTheHandler(unittest.TestCase):
     """_process_instagram_event end to end, model and sends stubbed."""
 
