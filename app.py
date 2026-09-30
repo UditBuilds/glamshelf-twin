@@ -7902,6 +7902,14 @@ def _ig_escalate(
     Shared with graph.py's dispatch_escalate so the two stay in parity.
     """
     kind, customer_text = _ig_escalation_reply(text, tag)
+    # A second escalation inside the handoff window (a DRAFT then an
+    # ESCALATE, or after a resume) doesn't resend the holding line (audit
+    # finding 8); the founder is still paged. The safety line is health
+    # advice and always goes out.
+    repeat = customer_text == BRAIN_HOLDING_LINE and _ig_handoff_sent_recently(sender_id)
+    if repeat:
+        customer_text = ""
+        print(f"[ESCALATE] {sender_id} got the holding line in the last 30 min — not resending it")
     sent, send_err = False, ""
     if customer_text:
         sent, send_err = _send_instagram_reply(sender_id, customer_text)
@@ -7909,10 +7917,12 @@ def _ig_escalate(
             print(f"[ESCALATE] {kind} escalation — sent to {sender_id}: {customer_text[:60]!r}")
         else:
             print(f"[ESCALATE] {kind} escalation — send FAILED to {sender_id}: {send_err}")
-    else:
+    elif not repeat:
         print(f"[ESCALATE] {kind} escalation — deliberately silent for {sender_id}")
 
-    if not customer_text:
+    if repeat:
+        customer_line = "Nothing new sent — they got the holding line in the last 30 minutes."
+    elif not customer_text:
         customer_line = f"Nothing sent to the customer — {kind} escalations get no automated reply."
     elif sent:
         customer_line = f'Sent to the customer:\n"{customer_text}"'
@@ -7940,6 +7950,9 @@ def _ig_escalate(
     elif customer_text:
         # Attempted but unconfirmed: kept for audit, excluded from history.
         _log_instagram(sender_id, text, customer_text, timestamp, source="ESCALATE_HOLDING_FAILED_IG")
+    elif repeat:
+        # Nothing new sent: NULL reply keeps the row out of history.
+        _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_REPEAT_IG")
     else:
         # Deliberate silence: NULL reply keeps the row out of history.
         _log_instagram(sender_id, text, None, timestamp, source="ESCALATE_IG")
