@@ -249,6 +249,28 @@ class HinglishInHinglishOut(unittest.TestCase):
         self.assertIn("rule 2", " ".join(guard("₹799 se upar ke orders pe shipping free hai 🤍")))
 
 
+class DecidedBuyerGetsTheLink(unittest.TestCase):
+    """Finding 15: "just place the order for me - GS1 tray. ill pay later"
+    got "checkout on glamshelf.in is the way to go" — no product link."""
+
+    def rule(self):
+        return BRAIN.split("**RULE: CUSTOMER ALREADY DECIDED — DON'T QUALIFY**", 1)[1].split("**RULE:", 1)[0]
+
+    def test_place_the_order_for_me_is_a_decided_buyer(self):
+        rule = self.rule()
+        self.assertIn('"place the order for me — GS1 tray"', rule)
+        self.assertIn('"ill pay later"', rule)
+        self.assertIn("never send them to the homepage instead of the product link", rule)
+
+    def test_the_template_has_the_link_and_passes_the_guard(self):
+        quoted = re.findall(r'^> (.*)$', self.rule().split("If they ask you to place the order for them", 1)[1], re.M)
+        text = "\n".join(q.strip('"') for q in quoted[:4])
+        self.assertIn("I can't place orders from here", text)
+        self.assertIn("glamshelf.in/products/gs1-luxe-light-lash-tray", text)
+        self.assertIn("prepaid only", text)
+        self.assertEqual(guard(text), [])
+
+
 class FollowUpGuardInTheHandler(unittest.TestCase):
     """_process_instagram_event end to end, model and sends stubbed."""
 
