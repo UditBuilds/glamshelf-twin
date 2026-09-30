@@ -125,6 +125,13 @@ _FREE_SHIPPING_THIS_ORDER = (
 _FREE_SHIPPING_BULK = (
     rf"{_LEAD}shipping is free,? since an order that size is well above {_T}",
 )
+# The same fact without the ₹799 figure — "and shipping is free on an order
+# that size". It passes only in a reply that quotes the ₹749/tray bulk rate,
+# which starts at 20 trays (₹14,980), so the order is always above ₹799.
+_FREE_SHIPPING_BULK_SIZE = (
+    rf"{_LEAD}(?:shipping is (?:also )?free|it ships (?:for )?free) (?:on|for) (?:an order|orders|a bulk order|bulk orders) (?:of )?(?:that|this) size",
+)
+_BULK_QUOTE_RE = re.compile(r"₹\s?749\s?(?:/\s?tray|per tray)", re.IGNORECASE)
 # Below the threshold — says shipping ISN'T free, brain.md:923.
 _UNDER_THRESHOLD = (
     rf"(?:is|it's|it is|falls|fall|would fall|comes to|comes in)(?: just)? (?:under|below) (?:our |the )?"
@@ -215,6 +222,7 @@ def _compile(patterns, at_end: bool) -> tuple:
 # Free shipping with the threshold may be followed by more words ("…above
 # ₹799, which two trays would qualify for"); the others must end the clause.
 _FREE_SHIPPING_STATEMENTS = _compile(_FREE_SHIPPING_RULE + _FREE_SHIPPING_BULK, at_end=False)
+_BULK_SIZE_STATEMENTS = _compile(_FREE_SHIPPING_BULK_SIZE, at_end=True)
 _THIS_ORDER_STATEMENTS = _compile(_FREE_SHIPPING_THIS_ORDER, at_end=False)
 _CLAUSE_END_STATEMENTS = _compile(_NO_DISCOUNT + _NON_REFUNDABLE + _UNDER_THRESHOLD + _ONCE_VERIFIED, at_end=True)
 _REFUND_STATEMENTS = tuple(re.compile(p) for p in _REFUND_TIMELINE)
@@ -324,8 +332,11 @@ def _covered(clause: str, statements, words_re=_PROMO_WORDS_RE) -> bool:
     return False
 
 
-def _approved(clause: str, rest_of_sentence: str, under_threshold_amount: bool) -> bool:
+def _approved(clause: str, rest_of_sentence: str, under_threshold_amount: bool,
+              bulk_quote: bool = False) -> bool:
     if _covered(clause, _FREE_SHIPPING_STATEMENTS) or _covered(clause, _CLAUSE_END_STATEMENTS):
+        return True
+    if bulk_quote and _covered(clause, _BULK_SIZE_STATEMENTS):
         return True
     if _covered(clause, _THIS_ORDER_STATEMENTS) and not under_threshold_amount:
         return True
@@ -339,13 +350,14 @@ def _rule2_words(text: str) -> list[str]:
     """Rule 2's trigger words that no approved statement covers, judged
     sentence by sentence and clause by clause."""
     under_threshold = any(a < FREE_SHIPPING_THRESHOLD_INR for a in _order_amounts(text))
+    bulk_quote = bool(_BULK_QUOTE_RE.search(text or ""))
     left: list[str] = []
     for sentence in _SENTENCE_SPLIT_RE.split(text or ""):
         clauses = [_EXEMPT_PHRASES_RE.sub(" ", c) for c in _CLAUSE_SPLIT_RE.split(sentence)]
         normalized = [_normalize(c) for c in clauses]
         for i, clause in enumerate(clauses):
             words = [m.group(0) for m in _PROMO_WORDS_RE.finditer(clause)]
-            if words and not _approved(normalized[i], " ".join(normalized[i:]), under_threshold):
+            if words and not _approved(normalized[i], " ".join(normalized[i:]), under_threshold, bulk_quote):
                 left.extend(words)
     return left
 

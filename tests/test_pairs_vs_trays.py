@@ -176,6 +176,21 @@ class FreeShippingThresholdOnly(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(guard(text), [])
 
+    def test_bulk_quote_with_free_shipping_on_that_size_is_sent(self):
+        # This PR's AFTER runs 1-2 for "is 25 trays bulk?": right answer, held.
+        for text in (
+            "Yes — 25 trays qualifies for our bulk rate of ₹749/tray, and shipping is free on an "
+            "order that size 🤍",
+            "Our bulk rate is ₹749 per tray for 20+ trays, and it ships free for orders of that size 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_that_size_needs_the_bulk_quote(self):
+        self.assertIn("rule 2", " ".join(guard("Shipping is free on an order that size 🤍")))
+        self.assertIn("rule 2", " ".join(guard(
+            "GS1 is ₹849, and shipping is free on an order that size 🤍")))
+
     def test_threshold_less_claims_stay_held(self):
         for text in ("Orders ship free 🤍", "Free shipping kicks in soon 🤍", "Shipping is free on this one 🤍"):
             with self.subTest(text=text):
