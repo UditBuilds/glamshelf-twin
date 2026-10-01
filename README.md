@@ -24,7 +24,7 @@ People testing the assistant get their question answered like any customer's, or
 
 The twin uses a **RAG retrieval layer** built on `fastembed` with ONNX embeddings. Behind every reply, it searches a per-SKU product knowledge base — materials, band types, lash lengths, care instructions — and injects relevant facts into the prompt before generating a response. This means the twin doesn't guess about product details. If a customer asks "are GS1 lashes suitable for hooded eyes?", it retrieves the actual GS1 specs and answers from real data, not training memory.
 
-Prices and stock come from the live Shopify storefront feed (cached for up to 5 minutes) and are injected into every call — they are not hard-coded in the prompt.
+Stock status and product descriptions come from the live Shopify storefront feed (cached for up to 5 minutes) and are injected into every call. Prices are quoted from `brain.md`; the live storefront prices feed the output guard instead, so a ₹ amount that doesn't match the store is held for the founder rather than sent.
 
 ---
 
@@ -33,6 +33,12 @@ Prices and stock come from the live Shopify storefront feed (cached for up to 5 
 - **Output guard** — before an Instagram AUTO reply is sent, a plain-Python check holds it for founder approval (the customer gets the handoff line) if it mentions a ₹ amount that isn't a current Shopify price, a fixed policy amount, or an order total of up to ₹1,500 built from those prices; offers a code, discount, refund or freebie (each sentence is judged on its own, and brain.md's policy statements — free shipping above ₹799, no coupon codes, the refund timeline — are sent); links anywhere other than the brand's own site and Instagram; or talks about its own instructions.
 - **Rate limits** — at most 8 messages per sender per 10 minutes and 40 per day reach the model, plus a daily cap on model calls overall. Over a limit, the sender gets one short notice and the founder a Telegram alert.
 - **Fixed escalation words** — legal threats (lawyer, court, consumer forum, legal notice, police, FIR, and Hinglish forms such as "case kar dunga") always escalate, whatever the model decides.
+
+---
+
+## How it's evaluated
+
+[`eval/`](eval/README.md) re-runs real customer questions through the live reply logic (`draft_reply_logic`) and scores each fresh answer against the founder's own written ideal answer with an LLM judge — Pass / Partial / Fail plus a reason, overall and by category. It never sends anything to a real customer. See [`eval/README.md`](eval/README.md) for how the ground truth was built and its known limits.
 
 ---
 
@@ -55,7 +61,7 @@ Prices and stock come from the live Shopify storefront feed (cached for up to 5 
 
 ## In production
 
-The twin answers real customers of a live D2C store on Instagram. Drafts, output-guard holds and escalations go to the founder on Telegram; the other replies go out automatically, with product facts, live Shopify prices and stock, and the conversation history injected into every call.
+The twin answers real customers of a live D2C store on Instagram. Drafts, output-guard holds and escalations go to the founder on Telegram; the other replies go out automatically, with product facts, live Shopify stock, and the conversation history injected into every call.
 
 ---
 
