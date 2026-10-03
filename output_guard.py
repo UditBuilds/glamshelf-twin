@@ -32,6 +32,11 @@ Rules (each returns a short reason naming the rule and what matched):
      statements pass: "Once verified, we'll arrange a replacement or refund
      at no additional cost" and the exchange offer. Refund promises were
      already held by rule 2; that policy sentence now passes rule 2 too.
+  6. A reply that mentions free shipping (or ₹799) and also suggests
+     adding or combining products to reach it — "if you add a set", "the
+     Duo or a tray would get you there", "have you considered the Mink
+     Duo" (audit finding 12: Twin states the threshold only, and its
+     combination maths was wrong).
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -103,6 +108,11 @@ _APPLIES = r"(?: (?:does |also )?appl(?:y|ies))?"
 _FREE_SHIPPING_RULE = (
     rf"{_LEAD}(?:we (?:do )?offer |you get )?{_FREE_SHIPPING}{_APPLIES}(?: on (?:all |any )?orders)? (?:above|over) {_T}(?: though)?",
     rf"{_LEAD}if (?:your|the) (?:order|total|cart) is (?:above|over) {_T},? (?:it ships (?:for )?free|shipping is free|you get free shipping)",
+    # The threshold said other ways (finding 12: "state the threshold only";
+    # main held "Orders above ₹799 ship free" and "Free shipping kicks in
+    # above ₹799").
+    rf"{_LEAD}(?:all |any )?(?:orders|anything) (?:above|over) {_T} (?:ships?|get|gets) (?:for )?free(?: shipping)?",
+    rf"{_LEAD}free shipping (?:kicks in|starts) (?:above|over|from|on orders above|on orders over) {_T}",
 )
 # Free shipping because THIS order is above ₹799 — brain.md:921-923, and
 # the 20+ tray bulk quote, brain.md:552. The first two pass only when the reply
@@ -115,10 +125,20 @@ _FREE_SHIPPING_THIS_ORDER = (
 _FREE_SHIPPING_BULK = (
     rf"{_LEAD}shipping is free,? since an order that size is well above {_T}",
 )
+# The same fact without the ₹799 figure — "and shipping is free on an order
+# that size". It passes only in a reply that quotes the ₹749/tray bulk rate,
+# which starts at 20 trays (₹14,980), so the order is always above ₹799.
+_FREE_SHIPPING_BULK_SIZE = (
+    rf"{_LEAD}(?:shipping is (?:also )?free|it ships (?:for )?free) (?:on|for) (?:an order|orders|a bulk order|bulk orders) (?:of )?(?:that|this) size",
+)
+_BULK_QUOTE_RE = re.compile(r"₹\s?749\s?(?:/\s?tray|per tray)", re.IGNORECASE)
 # Below the threshold — says shipping ISN'T free, brain.md:923.
+# "mark", "limit" and "minimum" are the same threshold (PR 50's re-check:
+# "it's under the ₹799 free-shipping mark" was held).
+_THRESHOLD_WORD = r"(?:threshold|mark|limit|minimum)"
 _UNDER_THRESHOLD = (
     rf"(?:is|it's|it is|falls|fall|would fall|comes to|comes in)(?: just)? (?:under|below) (?:our |the )?"
-    rf"(?:{_T} free[- ]shipping threshold|free[- ]shipping threshold of {_T})",
+    rf"(?:{_T} free[- ]shipping {_THRESHOLD_WORD}|free[- ]shipping {_THRESHOLD_WORD} of {_T})",
 )
 
 # No discount / no codes — brain.md:606 ("there's no additional discount
@@ -205,6 +225,7 @@ def _compile(patterns, at_end: bool) -> tuple:
 # Free shipping with the threshold may be followed by more words ("…above
 # ₹799, which two trays would qualify for"); the others must end the clause.
 _FREE_SHIPPING_STATEMENTS = _compile(_FREE_SHIPPING_RULE + _FREE_SHIPPING_BULK, at_end=False)
+_BULK_SIZE_STATEMENTS = _compile(_FREE_SHIPPING_BULK_SIZE, at_end=True)
 _THIS_ORDER_STATEMENTS = _compile(_FREE_SHIPPING_THIS_ORDER, at_end=False)
 _CLAUSE_END_STATEMENTS = _compile(_NO_DISCOUNT + _NON_REFUNDABLE + _UNDER_THRESHOLD + _ONCE_VERIFIED, at_end=True)
 _REFUND_STATEMENTS = tuple(re.compile(p) for p in _REFUND_TIMELINE)
@@ -218,6 +239,28 @@ _REPLACE_WORDS_RE = re.compile(
     r"(?:new|fresh|another|correct|right)\b"
     r"|\b(?:naya|nayi|naye|dusra|doosra|dusri|doosri)\b.{0,20}?\bbhej\w*"
     r"|\bdobara\s+bhej\w*|\bbadal\s+(?:denge|dege|dunga|dungi|diya|dete)\b",
+    re.IGNORECASE,
+)
+
+# Rule 6: a free-shipping mention, and a suggestion to add or combine
+# products to reach it. Judged on the whole reply — "Free shipping applies
+# above ₹799 — the Duo or a tray would get you there" puts the suggestion in
+# another clause. "wouldn't qualify" and "your two trays would qualify" are
+# statements about their own order, not suggestions, and pass.
+_FREE_SHIP_MENTION_RE = re.compile(
+    r"free[- ]?shipping|free delivery|ships? (?:for )?free|shipping(?:'s| is)? (?:also )?free"
+    r"|₹\s?799\b|\brs\.?\s?799\b|\binr\s?799\b",
+    re.IGNORECASE,
+)
+_COMBINATION_RE = re.compile(
+    r"\bif you add\b|\badd(?:ing)? (?:a|an|another|one more|any|the|it|on)\b(?! to (?:your |the )?cart)"
+    r"|\bget(?:s)? you (?:there|over|above|past)\b"
+    r"|\b(?:push|take|bring)(?:es|s)? (?:you|it|the total|your total|your order) (?:over|above|past)\b"
+    r"|\bto (?:reach|cross|hit|unlock|qualify for) (?:the )?(?:₹\s?799|free)"
+    r"|\bhave you considered\b|\byou could (?:add|get|pick|also)\b|\bupgrade to\b"
+    r"|\btop(?:ping)? (?:it )?up\b|\bpair it with\b|\bcombin(?:e|ing|ation)\b|\bcombo that\b"
+    r"|\bor a (?:tray|set|duo|trio) (?:would|to|and)\b|\bwith (?:a|another|one more) (?:tray|set|duo|trio|pair)\b"
+    r"|\badd kar\w*|\bsaath (?:mein|me)\b|\bmila(?:kar|ke)\b|\bek aur\b",
     re.IGNORECASE,
 )
 
@@ -292,8 +335,11 @@ def _covered(clause: str, statements, words_re=_PROMO_WORDS_RE) -> bool:
     return False
 
 
-def _approved(clause: str, rest_of_sentence: str, under_threshold_amount: bool) -> bool:
+def _approved(clause: str, rest_of_sentence: str, under_threshold_amount: bool,
+              bulk_quote: bool = False) -> bool:
     if _covered(clause, _FREE_SHIPPING_STATEMENTS) or _covered(clause, _CLAUSE_END_STATEMENTS):
+        return True
+    if bulk_quote and _covered(clause, _BULK_SIZE_STATEMENTS):
         return True
     if _covered(clause, _THIS_ORDER_STATEMENTS) and not under_threshold_amount:
         return True
@@ -307,13 +353,14 @@ def _rule2_words(text: str) -> list[str]:
     """Rule 2's trigger words that no approved statement covers, judged
     sentence by sentence and clause by clause."""
     under_threshold = any(a < FREE_SHIPPING_THRESHOLD_INR for a in _order_amounts(text))
+    bulk_quote = bool(_BULK_QUOTE_RE.search(text or ""))
     left: list[str] = []
     for sentence in _SENTENCE_SPLIT_RE.split(text or ""):
         clauses = [_EXEMPT_PHRASES_RE.sub(" ", c) for c in _CLAUSE_SPLIT_RE.split(sentence)]
         normalized = [_normalize(c) for c in clauses]
         for i, clause in enumerate(clauses):
             words = [m.group(0) for m in _PROMO_WORDS_RE.finditer(clause)]
-            if words and not _approved(normalized[i], " ".join(normalized[i:]), under_threshold):
+            if words and not _approved(normalized[i], " ".join(normalized[i:]), under_threshold, bulk_quote):
                 left.extend(words)
     return left
 
@@ -392,5 +439,10 @@ def check_reply(text: str, allowed_amounts) -> list[str]:
     promised = _rule5_words(text)
     if promised:
         reasons.append(f"rule 5 (replacement/reshipment promise): {', '.join(promised)}")
+
+    if _FREE_SHIP_MENTION_RE.search(text):
+        combos = [m.group(0) for m in _COMBINATION_RE.finditer(text)]
+        if combos:
+            reasons.append(f"rule 6 (suggests products to reach free shipping): {', '.join(combos)}")
 
     return reasons
