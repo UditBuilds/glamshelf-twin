@@ -37,6 +37,15 @@ Rules (each returns a short reason naming the rule and what matched):
      Duo or a tray would get you there", "have you considered the Mink
      Duo" (audit finding 12: Twin states the threshold only, and its
      combination maths was wrong).
+  7. A follow-up promise (audit finding 6): Twin can't message anyone
+     later, so "the team will update you", "we'll remind you", "we'll be
+     right here", "we'll take it from there", "we'll get back to you" and
+     their Hinglish forms are held. The handoff and ack lines' "they'll /
+     the team will reply here" and the LEAD line's "Udit will message you
+     personally" pass only when the caller says a founder notice goes out
+     with the reply (`founder_notice`: an ORDER / RESTOCK heads-up or a
+     LEAD notice); on a plain AUTO reply nobody is told, so they're held
+     too.
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -286,6 +295,46 @@ _META_RE = re.compile(
 )
 
 
+# Rule 7: a promise that someone will contact the customer later, or keep
+# something open for them. "I'll pass it to the team" (an action on their
+# next message, e.g. "if you share your order ID") and capability talk ("we
+# can…") aren't promises of a later contact and pass.
+_FOLLOWUP_RE = re.compile(
+    r"\b(?:we|i|the team|our team|team the glam shelf|they|someone|somebody|udit|our founder|the founder)"
+    r"(?:'ll|'d| will| would| shall| (?:is|are|am) going to)\s+"
+    r"(?:(?:personally|also|then|soon|shortly|definitely|surely|happily|just|quickly|directly)\s+)*"
+    r"(?:update|remind|notify|follow[- ]?up|get back|reach out|contact|message|text|call|ping|"
+    r"let you know|keep you (?:posted|updated|informed)|be in touch|get in touch|take it from there|"
+    r"reply|respond|check back|circle back|look into|send you (?:a )?(?:reminder|message|update|note|dm))\b"
+    r"|\b(?:we|i)(?:'ll| will) be (?:right )?here\b|\bget back to you\b"
+    r"|\bwill (?:reply|get back|reach out|follow up|be in touch|update you|contact you|message you|remind you)\b"
+    r"|\byou(?:'ll| will) hear (?:back )?from (?:us|the team|our team|udit)\b"
+    r"|\b(?:remind|reminder|update|bata|contact|message|reply)\s+(?:bhi\s+)?(?:kar\s+)?"
+    r"(?:denge|dunga|dungi|karenge|karega|karegi|karungi|karunga)\b"
+    r"|\bteam\b.{0,40}?\b(?:karegi|karega|karenge|bataegi|bataenge|bata degi)\b",
+    re.IGNORECASE,
+)
+# The follow-ups that are true when the founder is told: the handoff and
+# ack lines ("they'll reply to you here", "the team will reply here") and
+# the LEAD line.
+_NOTIFIED_FOLLOWUP_RE = re.compile(
+    r"\b(?:they|the team|our team|team the glam shelf)(?:'ll| will) reply (?:to you )?here\b"
+    r"|\b(?:has|have) (?:your|the) [\w ]{0,30}? and will reply (?:to you )?here\b"
+    r"|\budit will message you personally\b"
+    # the same line in Hinglish: "(team / woh) yahan reply karenge"
+    r"|\b(?:woh|wo|team)\s+(?:aapko\s+)?(?:yahan|yahin|yahi|idhar)\s+(?:hi\s+)?reply\s+kar(?:enge|egi|ega)\b",
+    re.IGNORECASE,
+)
+
+
+def _followup_promises(text: str, founder_notice: bool) -> list[str]:
+    """Rule 7's follow-up promises that aren't allowed here."""
+    text = (text or "").replace("’", "'")
+    allowed = [m.span() for m in _NOTIFIED_FOLLOWUP_RE.finditer(text)] if founder_notice else []
+    return [m.group(0) for m in _FOLLOWUP_RE.finditer(text)
+            if not any(s <= m.start() and m.end() <= e for s, e in allowed)]
+
+
 def _amount_value(digits: str, fraction: str | None) -> float:
     value = float(digits.replace(",", ""))
     if fraction:
@@ -391,11 +440,12 @@ def _link_allowed(link: str) -> bool:
     return False
 
 
-def check_reply(text: str, allowed_amounts) -> list[str]:
+def check_reply(text: str, allowed_amounts, founder_notice: bool = False) -> list[str]:
     """Return one reason per rule that fired ([] = the reply may be sent).
     `allowed_amounts` are the live product prices; FIXED_ALLOWED_INR is
     always added, and so are order totals up to ₹1,500 built from the live
-    prices (_order_totals_paise)."""
+    prices (_order_totals_paise). `founder_notice`: a founder notice goes
+    out with this reply (rule 7)."""
     text = text or ""
     allowed = set(FIXED_ALLOWED_INR) | {float(a) for a in allowed_amounts or ()}
     totals = _order_totals_paise(allowed_amounts)
@@ -444,5 +494,9 @@ def check_reply(text: str, allowed_amounts) -> list[str]:
         combos = [m.group(0) for m in _COMBINATION_RE.finditer(text)]
         if combos:
             reasons.append(f"rule 6 (suggests products to reach free shipping): {', '.join(combos)}")
+
+    promises = _followup_promises(text, founder_notice)
+    if promises:
+        reasons.append(f"rule 7 (follow-up promise): {', '.join(promises)}")
 
     return reasons

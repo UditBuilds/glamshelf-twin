@@ -134,6 +134,21 @@ def trays_mentioned(message: str) -> int | float | None:
     return int(total) if float(total).is_integer() else total
 
 
+# "20+ trays" / "200+ pairs": the plus keeps _QUANTITY_RE from seeing them.
+_PLUS_QUANTITY_RE = re.compile(r"\b(\d{1,5})\s*\+\s*(pairs?|trays?)\b", re.IGNORECASE)
+
+
+def bulk_trays_asked(message: str) -> int | float | None:
+    """The trays a message asks about when that's 20+ (200+ pairs, at
+    PAIRS_PER_TRAY per tray), else None. "20+ trays" and "200+ pairs" count
+    as 20. Used for the founder's LEAD notice on a bulk question (founder
+    decision, 3 Oct 2026); it never changes the reply."""
+    counts = [trays_mentioned(message) or 0]
+    counts += [_as_trays(int(n), unit) for n, unit in _PLUS_QUANTITY_RE.findall(message or "")]
+    best = max(counts)
+    return best if best >= BULK_MIN_TRAYS else None
+
+
 def bulk_quantity_note(message: str) -> str:
     """The pairs-to-trays conversion and bulk verdict for the customer's own
     numbers, written for the model ("" when there's nothing to convert).

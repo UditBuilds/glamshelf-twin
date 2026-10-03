@@ -305,14 +305,18 @@ def triage(state: TwinState) -> TwinState:
         classification = "ESCALATE"
 
     # Output guard (audit T1-4): an AUTO reply that trips a rule is held
-    # for approval — same helper and same place as production.
-    guard_note = app._ig_output_guard(state["sender_id"], classification, reply)
+    # for approval — same helper, same founder-notice input (rule 7) and
+    # same place as production.
+    tag = app._parse_twin_tag(state.get("raw_response", ""))
+    guard_note = app._ig_output_guard(
+        state["sender_id"], classification, reply,
+        founder_notice=app._ig_founder_told(state["text"], classification, reply, tag),
+    )
     if guard_note:
         classification = "DRAFT+APPROVE"
 
     # Testers / brand owners / questions about the AI service: friendly
     # reply, LEAD notice, no pause (audit T1-5) — same rule as production.
-    tag = app._parse_twin_tag(state.get("raw_response", ""))
     if app._ig_is_lead(state["text"], classification, reply, tag):
         return {
             "decision": "LEAD",
@@ -383,6 +387,8 @@ def dispatch_auto(state: TwinState) -> TwinState:
     topic = app._ig_fyi_topic(state["text"], state.get("tag", ""))
     if topic:
         app._ig_send_fyi(sender_id, state["text"], reply, topic, sent)
+    # 20+ tray question: LEAD notice — same helper as production.
+    app._ig_send_bulk_lead(sender_id, state["text"], reply if sent else f"(send FAILED) {reply}")
 
     return {"dispatch": {"channel": "instagram", "sent": sent, "error": send_err}}
 

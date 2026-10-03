@@ -323,15 +323,20 @@ class GuardHoldsReplacementPromises(unittest.TestCase):
 
     def test_approved_lines_and_plain_answers_still_pass(self):
         for text in (
-            glam.BRAIN_HOLDING_LINE,
-            glam.IG_DRAFT_ACK_LINE,
             SensitiveEyes.TEMPLATE,
             "With proper care, you'll get 5–7 wears per pair 🤍",
-            "Could you share your order ID? I can't see tracking myself, but I've passed "
-            "this to the team and they'll reply to you here 🤍",
             "Each tray has 10 pairs of lashes 🤍",
         ):
             self.assertEqual(guard(text), [], text)
+        # "they'll / the team will reply here" is true only when the founder
+        # is told (rule 7, finding 6), and these lines go out with a notice.
+        for text in (
+            glam.BRAIN_HOLDING_LINE,
+            glam.IG_DRAFT_ACK_LINE,
+            "Could you share your order ID? I can't see tracking myself, but I've passed "
+            "this to the team and they'll reply to you here 🤍",
+        ):
+            self.assertEqual(output_guard.check_reply(text, LIVE_PRICES, founder_notice=True), [], text)
 
     def test_every_changed_template_passes_the_guard(self):
         for heading in (SensitiveEyes.HEADING, CleanGirlIsSynthetic.HEADING,
