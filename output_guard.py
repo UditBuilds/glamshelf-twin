@@ -16,7 +16,8 @@ Rules (each returns a short reason naming the rule and what matched):
      sentence by sentence (_rule2_words): a clause with one of these words
      passes only when it is one of brain.md's approved policy statements —
      free shipping above ₹799, no discount / no codes, the refund
-     timeline, shipping charges being non-refundable. "cruelty-free" and
+     timeline, shipping charges being non-refundable, a replacement or
+     refund "once verified" (rule 5). "cruelty-free" and
      the discount decline pass wherever they appear, as before. Any other
      clause with one of the words holds the whole reply.
   3. A link, domain, email or @handle other than glamshelf.in,
@@ -24,6 +25,13 @@ Rules (each returns a short reason naming the rule and what matched):
   4. Prompt-injection phrasing: "system prompt", "my/your instructions",
      "ignore previous", QA mode or classifying. Plain "instructions"
      ("care instructions") and "brain" in product text pass.
+  5. A replacement, reshipment or exchange (replace, reship, resend,
+     exchange, "send you a new one", Hinglish "naya bhej denge"...), judged
+     clause by clause like rule 2 (audit findings 2 and 9: the founder alone
+     promises these, through approved drafts). Only the store policy's own
+     statements pass: "Once verified, we'll arrange a replacement or refund
+     at no additional cost" and the exchange offer. Refund promises were
+     already held by rule 2; that policy sentence now passes rule 2 too.
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -125,6 +133,19 @@ _NO_DISCOUNT = (
     rf"{_NEG}we don't have any (?:active )?{_CODES}{_EXTRA}{_WHEN}",
 )
 
+# Damaged / wrong item — the store's refund policy page and brain.md's
+# damage template: a replacement or refund only "once verified". Approved in
+# rule 2 (refund) and rule 5 (replacement). "We'll arrange a replacement
+# for you right away" matches nothing and is held.
+_ONCE_VERIFIED = (
+    rf"{_LEAD}once (?:verified|we(?:'ve| have)? verified (?:it|them|the photos)),? "
+    r"we(?:'ll| will) arrange a replacement or (?:a )?refund(?: at no (?:additional|extra) cost)?",
+)
+# The exchange offer — brain.md's exchange template and the policy page.
+_EXCHANGE_OFFER = (
+    rf"{_LEAD}we (?:do )?offer exchanges (?:on|for) eligible products,? subject to availability",
+)
+
 # Shipping charges aren't refunded — brain.md's refund notes and the
 # store's refund policy page.
 _NON_REFUNDABLE = (
@@ -185,8 +206,20 @@ def _compile(patterns, at_end: bool) -> tuple:
 # ₹799, which two trays would qualify for"); the others must end the clause.
 _FREE_SHIPPING_STATEMENTS = _compile(_FREE_SHIPPING_RULE + _FREE_SHIPPING_BULK, at_end=False)
 _THIS_ORDER_STATEMENTS = _compile(_FREE_SHIPPING_THIS_ORDER, at_end=False)
-_CLAUSE_END_STATEMENTS = _compile(_NO_DISCOUNT + _NON_REFUNDABLE + _UNDER_THRESHOLD, at_end=True)
+_CLAUSE_END_STATEMENTS = _compile(_NO_DISCOUNT + _NON_REFUNDABLE + _UNDER_THRESHOLD + _ONCE_VERIFIED, at_end=True)
 _REFUND_STATEMENTS = tuple(re.compile(p) for p in _REFUND_TIMELINE)
+_REPLACEMENT_STATEMENTS = _compile(_ONCE_VERIFIED + _EXCHANGE_OFFER, at_end=True)
+
+# Rule 5 trigger words: a replacement, reshipment or exchange, in English
+# or Hinglish.
+_REPLACE_WORDS_RE = re.compile(
+    r"\b(?:replac\w*|re-?ship\w*|re-?send\w*|exchang\w*)\b"
+    r"|\b(?:send|ship|courier|dispatch)(?:ing)?\s+(?:you\s+)?(?:a\s+|the\s+)?"
+    r"(?:new|fresh|another|correct|right)\b"
+    r"|\b(?:naya|nayi|naye|dusra|doosra|dusri|doosri)\b.{0,20}?\bbhej\w*"
+    r"|\bdobara\s+bhej\w*|\bbadal\s+(?:denge|dege|dunga|dungi|diya|dete)\b",
+    re.IGNORECASE,
+)
 
 # Per-unit prices ("₹749/tray", "₹85 per pair") aren't order amounts.
 _PER_UNIT_RE = re.compile(
@@ -250,11 +283,11 @@ def _order_amounts(text: str) -> list[float]:
             if not _PER_UNIT_RE.match(text, m.end())]
 
 
-def _covered(clause: str, statements) -> bool:
+def _covered(clause: str, statements, words_re=_PROMO_WORDS_RE) -> bool:
     """One approved statement in the clause, and no trigger word outside it."""
     for pat in statements:
         for m in pat.finditer(clause):
-            if not _PROMO_WORDS_RE.search(clause[:m.start()] + " " + clause[m.end():]):
+            if not words_re.search(clause[:m.start()] + " " + clause[m.end():]):
                 return True
     return False
 
@@ -281,6 +314,18 @@ def _rule2_words(text: str) -> list[str]:
         for i, clause in enumerate(clauses):
             words = [m.group(0) for m in _PROMO_WORDS_RE.finditer(clause)]
             if words and not _approved(normalized[i], " ".join(normalized[i:]), under_threshold):
+                left.extend(words)
+    return left
+
+
+def _rule5_words(text: str) -> list[str]:
+    """Rule 5's replacement / reshipment words that no approved policy
+    statement covers, judged clause by clause like rule 2."""
+    left: list[str] = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text or ""):
+        for clause in _CLAUSE_SPLIT_RE.split(sentence):
+            words = [m.group(0) for m in _REPLACE_WORDS_RE.finditer(clause)]
+            if words and not _covered(_normalize(clause), _REPLACEMENT_STATEMENTS, _REPLACE_WORDS_RE):
                 left.extend(words)
     return left
 
@@ -343,5 +388,9 @@ def check_reply(text: str, allowed_amounts) -> list[str]:
     meta = [m.group(0) for m in _META_RE.finditer(text)]
     if meta:
         reasons.append(f"rule 4 (talks about its own setup): {', '.join(meta)}")
+
+    promised = _rule5_words(text)
+    if promised:
+        reasons.append(f"rule 5 (replacement/reshipment promise): {', '.join(promised)}")
 
     return reasons
