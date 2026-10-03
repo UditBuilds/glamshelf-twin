@@ -387,6 +387,8 @@ def dispatch_auto(state: TwinState) -> TwinState:
     topic = app._ig_fyi_topic(state["text"], state.get("tag", ""))
     if topic:
         app._ig_send_fyi(sender_id, state["text"], reply, topic, sent)
+    # 20+ tray question: LEAD notice — same helper as production.
+    app._ig_send_bulk_lead(sender_id, state["text"], reply if sent else f"(send FAILED) {reply}")
 
     return {"dispatch": {"channel": "instagram", "sent": sent, "error": send_err}}
 

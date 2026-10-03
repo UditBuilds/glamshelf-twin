@@ -33,6 +33,7 @@ LIVE_PRICES = {249.0, 299.0, 499.0, 699.0, 849.0}
 SENDER = "17800000000000611"
 HANDOFF = glam.BRAIN_HOLDING_LINE
 ACK = glam.IG_DRAFT_ACK_LINE
+REAL_NOTIFY = glam.send_telegram_notification
 
 
 def guard(text, founder_notice=False):
@@ -390,6 +391,93 @@ class FollowUpGuardInTheHandler(unittest.TestCase):
         self.dm("I run a lash brand, want this bot for my store", "AUTO", glam.LEAD_REPLY, tag="LEAD")
         self.assertEqual(self.sends, [glam.LEAD_REPLY])
         self.assertEqual(self.notices, ["LEAD"])
+
+
+class BulkQuestionLeadNotice(unittest.TestCase):
+    """A question about 20+ trays / 200+ pairs, rate or availability, gets
+    the founder a 🟢 LEAD notice with the message (founder decision, 3 Oct
+    2026). The customer's reply is unchanged and promises nothing."""
+
+    TEMPLATE = ("Our bulk rate is ₹749/tray for orders of 20+ trays (200+ pairs) — and shipping is "
+                "free, since an order that size is well above ₹799 🤍")
+
+    setUp = FollowUpGuardInTheHandler.setUp
+    _send = FollowUpGuardInTheHandler._send
+    _draft = FollowUpGuardInTheHandler._draft
+    dm = FollowUpGuardInTheHandler.dm
+
+    def _notify(self, classification, customer_message, reply, **kwargs):
+        self.notices.append((classification, customer_message, reply))
+
+    def test_what_counts_as_a_bulk_question(self):
+        from pricing_rules import bulk_trays_asked
+        for message, trays in (("is 25 trays bulk?", 25), ("need 200 pairs for my academy", 20),
+                               ("whats the rate for 20+ trays?", 20), ("200+ pairs ka rate kya hai?", 20),
+                               ("do you have 30 trays of GS2 in stock?", 30),
+                               ("10 trays of GS1 and 15 trays of GS2 pls", 25)):
+            with self.subTest(message=message):
+                self.assertEqual(bulk_trays_asked(message), trays)
+        for message in ("im a MUA, need 20 pairs", "need 19 trays", "price of GS1?", "2 trays of GS1",
+                        "each tray has 10 pairs each", "is 25 bulk?"):
+            with self.subTest(message=message):
+                self.assertIsNone(bulk_trays_asked(message))
+
+    def test_the_rate_question_gets_the_lead_notice_and_the_same_reply(self):
+        self.dm("is 25 trays bulk?", "AUTO", self.TEMPLATE)
+        self.assertEqual(self.sends, [self.TEMPLATE])
+        self.assertEqual(self.notices, [("BULK", "is 25 trays bulk?", self.TEMPLATE)])
+        self.assertEqual(self.drafts, [])
+
+    def test_an_availability_question_in_pairs_gets_it_too(self):
+        reply = "Yes, GS2 is in stock 🤍"
+        self.dm("do you have 300 pairs of GS2 available?", "AUTO", reply)
+        self.assertEqual(self.sends, [reply])
+        self.assertEqual([n[0] for n in self.notices], ["BULK"])
+
+    def test_under_20_trays_gets_no_notice(self):
+        reply = ("20 pairs is 2 trays (10 pairs each), so our regular ₹849/tray pricing applies — the "
+                 "₹749 bulk rate starts at 20 trays (200 pairs). Free shipping applies on orders above ₹799 🤍")
+        self.dm("im a MUA, need 20 pairs for my bridal kit. whats ur bulk price?", "AUTO", reply)
+        self.assertEqual(self.sends, [reply])
+        self.assertEqual(self.notices, [])
+
+    def test_the_notice_does_not_excuse_a_promise(self):
+        # Rule 7 still holds it: the notice isn't a founder_notice for the guard.
+        reply = self.TEMPLATE.replace(" 🤍", " — Udit will message you personally 🤍")
+        self.dm("whats ur bulk rate for 30 trays", "AUTO", reply)
+        self.assertEqual(self.sends, [HANDOFF])
+        (draft,) = self.drafts
+        self.assertIn("rule 7", draft["guard_note"])
+        self.assertEqual([n[0] for n in self.notices], ["BULK"])
+        self.assertFalse(glam._ig_founder_told("whats ur bulk rate for 30 trays", "AUTO", reply, ""))
+
+    def test_a_bulk_commit_escalates_without_a_lead_notice(self):
+        self.dm("ok I'll take 25 trays", "ESCALATE", "")
+        self.assertEqual([n[0] for n in self.notices], ["ESCALATE"])
+
+    def test_the_telegram_text(self):
+        posted = []
+
+        class Ok:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return {"ok": True}
+
+        def post(url, json=None, timeout=None):
+            posted.append(json)
+            return Ok()
+
+        with patch.object(glam, "TELEGRAM_BOT_TOKEN", "t"), patch.object(glam, "TELEGRAM_CHAT_ID", "1"), \
+             patch.object(glam.requests, "post", post), redirect_stdout(io.StringIO()):
+            REAL_NOTIFY("BULK", "is 25 trays bulk?", self.TEMPLATE,
+                        sender_info=f"Instagram DM — sender {SENDER}", channel="Instagram",
+                        customer_id=SENDER)
+        (payload,) = posted
+        self.assertTrue(payload["text"].startswith("🟢 LEAD — bulk question (20+ trays / 200+ pairs)"))
+        self.assertIn('They said:\n"is 25 trays bulk?"', payload["text"])
+        self.assertIn(f'Twin replied:\n"{self.TEMPLATE}"', payload["text"])
 
 
 if __name__ == "__main__":

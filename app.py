@@ -43,6 +43,7 @@ from pricing_rules import (
     BULK_RATE_INR,
     INTENT_COMMIT,
     bulk_quantity_note,
+    bulk_trays_asked,
     detect_bulk_commit_quantity,
     resolve_pricing_action,
 )
@@ -3139,6 +3140,19 @@ def send_telegram_notification(
             "Twin replied:\n"
             f'"{reply}"\n\n'
             "→ Message them personally. Twin keeps answering them meanwhile (no pause)."
+        )
+    elif classification == "BULK":
+        # Instagram: a question about 20+ trays / 200+ pairs (founder
+        # decision, 3 Oct 2026). Twin's reply promised them nothing.
+        text = (
+            "🟢 LEAD — bulk question (20+ trays / 200+ pairs)\n\n"
+            f"{sender_block}"
+            "They said:\n"
+            f'"{customer_message}"\n\n'
+            "Twin replied:\n"
+            f'"{reply}"\n\n'
+            f"→ Message them personally from {approve_destination} if you want to. "
+            "Twin didn't promise a follow-up (no pause)."
         )
     elif classification in ("ORDER", "RESTOCK"):
         # Instagram heads-up for an AUTO reply Twin can't fully back up
@@ -8047,6 +8061,28 @@ def _ig_send_fyi(sender_id: str, text: str, reply: str, topic: str, sent: bool) 
         print(f"[INSTAGRAM-TG] {topic} notice failed: {type(tg_err).__name__}: {tg_err}")
 
 
+def _ig_send_bulk_lead(sender_id: str, text: str, shown: str) -> None:
+    """🟢 LEAD notice for a question about 20+ trays / 200+ pairs, rate or
+    availability (pricing_rules.bulk_trays_asked; founder decision, 3 Oct
+    2026). Only tells the founder: the customer's reply is unchanged, and
+    it doesn't count as a founder notice for output-guard rule 7, so a
+    follow-up promise in that reply is still held. `shown` is what the
+    customer got. A bulk commit escalates instead and never gets here.
+
+    Shared with graph.py's dispatch_auto so the two stay in parity."""
+    if bulk_trays_asked(text) is None:
+        return
+    try:
+        send_telegram_notification(
+            "BULK", text, shown,
+            sender_info=f"Instagram DM — sender {sender_id}",
+            channel="Instagram",
+            customer_id=sender_id,
+        )
+    except Exception as tg_err:
+        print(f"[INSTAGRAM-TG] BULK lead notice failed: {type(tg_err).__name__}: {tg_err}")
+
+
 def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> None:
     """Instagram side of a refused admission (audit T1-3): the notice (at
     most once per window) via _handle_llm_limit, plus a log row so the
@@ -8396,6 +8432,8 @@ def _process_instagram_event(event: dict) -> None:
             topic = _ig_fyi_topic(text, tag)
             if topic:
                 _ig_send_fyi(sender_id, text, reply, topic, sent)
+            # A 20+ tray question: a LEAD notice for the founder.
+            _ig_send_bulk_lead(sender_id, text, reply if sent else f"(send FAILED) {reply}")
 
         elif classification == "DRAFT+APPROVE":
             # Same buttoned approval flow WhatsApp uses, keyed on the IG
@@ -8430,6 +8468,9 @@ def _process_instagram_event(event: dict) -> None:
             # A tester whose answer waits for approval is still a LEAD: the
             # founder gets the LEAD notice too (audit finding #4).
             _ig_lead_draft_notice(sender_id, text, tag, handoff_sent)
+            # A 20+ tray question whose answer waits for approval is still
+            # a bulk lead.
+            _ig_send_bulk_lead(sender_id, text, "(waiting for your approval — see the 🟡 draft)")
             # Log the pending draft with a NULL reply — the draft text is never
             # stored here, so an un-approved draft can't appear in conversation
             # context as if the customer received it. _load_instagram_history
