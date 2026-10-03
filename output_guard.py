@@ -133,9 +133,12 @@ _FREE_SHIPPING_BULK_SIZE = (
 )
 _BULK_QUOTE_RE = re.compile(r"₹\s?749\s?(?:/\s?tray|per tray)", re.IGNORECASE)
 # Below the threshold — says shipping ISN'T free, brain.md:923.
+# "mark", "limit" and "minimum" are the same threshold (PR 50's re-check:
+# "it's under the ₹799 free-shipping mark" was held).
+_THRESHOLD_WORD = r"(?:threshold|mark|limit|minimum)"
 _UNDER_THRESHOLD = (
     rf"(?:is|it's|it is|falls|fall|would fall|comes to|comes in)(?: just)? (?:under|below) (?:our |the )?"
-    rf"(?:{_T} free[- ]shipping threshold|free[- ]shipping threshold of {_T})",
+    rf"(?:{_T} free[- ]shipping {_THRESHOLD_WORD}|free[- ]shipping {_THRESHOLD_WORD} of {_T})",
 )
 
 # No discount / no codes — brain.md:606 ("there's no additional discount

@@ -191,6 +191,24 @@ class FreeShippingThresholdOnly(unittest.TestCase):
         self.assertIn("rule 2", " ".join(guard(
             "GS1 is ₹849, and shipping is free on an order that size 🤍")))
 
+    def test_under_the_mark_limit_or_minimum_is_sent_like_under_the_threshold(self):
+        for text in (
+            # this PR's re-check after the rebase: right answer, held on "mark"
+            "Kawaii is ₹299, so it's under the ₹799 free-shipping mark — the exact delivery charge "
+            "will show at checkout. Shall I send you the link 🤍",
+            "Kawaii is ₹299, which is below the ₹799 free shipping limit — the charge shows at checkout 🤍",
+            "A single pair falls under the free-shipping minimum of ₹799 🤍",
+            "Since Kawaii is ₹299, it's under our ₹799 free-shipping threshold — the exact delivery "
+            "charge will show at checkout 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_a_free_claim_next_to_the_mark_is_still_held(self):
+        self.assertIn("rule 2", " ".join(guard(
+            "It's under the ₹799 free-shipping mark, but it ships free anyway 🤍")))
+        self.assertIn("rule 2", " ".join(guard("Free shipping mark is low 🤍")))
+
     def test_threshold_less_claims_stay_held(self):
         for text in ("Orders ship free 🤍", "Free shipping kicks in soon 🤍", "Shipping is free on this one 🤍"):
             with self.subTest(text=text):
