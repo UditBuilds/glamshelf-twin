@@ -255,7 +255,7 @@ class RateLimitForwarding(Base):
         self.assertEqual(self.sends, [glam.RATE_LIMIT_NOTICE])     # once per window, as before
         self.assertEqual(self.llm_calls, [])
         f1, f2 = self.forwards()
-        self.assertIn("over the rate limit (8 messages in 10 minutes)", f1["text"])
+        self.assertIn("over the rate limit (15 messages in 10 minutes)", f1["text"])
         self.assertIn('"price of GS1?"', f1["text"])
         self.assertIn(f'They got "{glam.RATE_LIMIT_NOTICE}"', f1["text"])
         self.assertIn('"hello??"', f2["text"])
@@ -281,9 +281,11 @@ class RateLimitForwarding(Base):
         self.assertTrue(any("Daily LLM cap reached" in t for t in texts))
         self.assertTrue(any(t.startswith("🚦 Twin didn't answer") and '"hi"' in t for t in texts))
 
-    def test_the_limits_themselves_are_unchanged(self):
+    def test_the_limits_are_15_per_10_minutes_40_a_day_and_500_overall(self):
+        # Founder decision, 4 Oct 2026: 15 per 10 minutes (was 8); the
+        # daily caps are unchanged.
         self.assertEqual((glam.RATE_LIMIT_WINDOW_MAX, glam.RATE_LIMIT_DAILY_MAX, glam.LLM_DAILY_CAP_DEFAULT),
-                         (8, 40, 500))
+                         (15, 40, 500))
 
 
 class VoiceSharesReelsAndStories(Base):

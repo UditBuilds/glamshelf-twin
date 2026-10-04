@@ -948,7 +948,9 @@ def _unpause_number(wa_id: str) -> bool:
 # one Telegram alert per sender per IST day, and one per IST day for the
 # global cap. Kill switch: LLM_RATE_LIMIT_DISABLED=1.
 RATE_LIMIT_WINDOW_SECONDS = 10 * 60
-RATE_LIMIT_WINDOW_MAX = 8
+# 15, up from 8 (founder decision, 4 Oct 2026): a prospect testing Twin in a
+# burst shouldn't hit the wall at message 9. The daily caps are unchanged.
+RATE_LIMIT_WINDOW_MAX = 15
 RATE_LIMIT_DAILY_MAX = 40
 LLM_DAILY_CAP_DEFAULT = 500
 RATE_LIMIT_RETENTION_SECONDS = 2 * 24 * 60 * 60

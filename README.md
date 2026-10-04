@@ -31,7 +31,7 @@ Stock status and product descriptions come from the live Shopify storefront feed
 ## Safety rails
 
 - **Output guard** — before an Instagram AUTO reply is sent, a plain-Python check holds it for founder approval (the customer gets the handoff line) if it mentions a ₹ amount that isn't a current Shopify price, a fixed policy amount, or an order total of up to ₹1,500 built from those prices; offers a code, discount, refund or freebie (each sentence is judged on its own, and brain.md's policy statements — free shipping above ₹799, no coupon codes, the refund timeline — are sent); links anywhere other than the brand's own site and Instagram; or talks about its own instructions.
-- **Rate limits** — at most 8 messages per sender per 10 minutes and 40 per day reach the model, plus a daily cap on model calls overall. Over a limit, the sender gets one short notice and the founder a Telegram alert.
+- **Rate limits** — at most 15 messages per sender per 10 minutes and 40 per day reach the model, plus a daily cap on model calls overall. Over a limit, the sender gets one short notice and the founder a Telegram alert.
 - **Fixed escalation words** — legal threats (lawyer, court, consumer forum, legal notice, police, FIR, and Hinglish forms such as "case kar dunga") always escalate, whatever the model decides.
 
 ---
