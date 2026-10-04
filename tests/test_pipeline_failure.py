@@ -1,6 +1,7 @@
 """No more silent DeepSeek failures (audit T1-8).
 
-  - the DeepSeek client fails fast (timeout 20s, 1 retry) and gunicorn's
+  - the DeepSeek client fails fast (timeout 20s, 1 retry inside the reply
+    budget — tests/test_reply_budget.py) and gunicorn's
     worker timeout is raised to 60s, so a slow call ends in our own
     failure handling instead of a killed worker;
   - an Instagram pipeline failure sends brain.md's holding line and a
@@ -48,8 +49,11 @@ def recorder(calls, name, ret=None, exc=None):
 
 class DeepSeekCallBudget(unittest.TestCase):
     def test_client_fails_fast(self):
+        # 20s per attempt; the one retry is _deepseek_create's, inside the
+        # reply budget (audit finding 13, tests/test_reply_budget.py).
         self.assertEqual(glam.deepseek_client.timeout, 20)
-        self.assertEqual(glam.deepseek_client.max_retries, 1)
+        self.assertEqual(glam.deepseek_client.max_retries, 0)
+        self.assertEqual(glam.DEEPSEEK_MAX_RETRIES, 1)
 
     def test_procfile_raises_gunicorn_worker_timeout(self):
         procfile = (REPO / "Procfile").read_text(encoding="utf-8")

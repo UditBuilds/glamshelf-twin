@@ -32,7 +32,7 @@ from html import unescape
 from pathlib import Path
 
 import requests
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -350,15 +350,23 @@ SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
 # without us having to manage a Shopify Admin App token.
 SHOPIFY_PRODUCTS_URL = "https://glamshelf.in/products.json"
 SHOPIFY_PRODUCTS_LIMIT = 250  # the endpoint's max page size
-SHOPIFY_TIMEOUT_SECONDS = 8
+# Per request, and never more than what's left of the reply budget
+# (_budget_timeout, audit finding 13). Was 8s.
+SHOPIFY_TIMEOUT_SECONDS = 5
+# After a failed live-inventory or policy fetch, the next one waits this
+# long — meanwhile the reply path gets what a failed fetch gives (no
+# inventory block / the last good policy text) without paying the timeout
+# again on every message during a store outage.
+SHOPIFY_RETRY_AFTER_FAILURE_SECONDS = 60
 
 # 5-minute in-memory cache for live inventory. Single-entry dict — the
 # formatted block (string) and the unix timestamp it was fetched at.
 # Empty-string entries are NOT cached: a transient Shopify outage
 # shouldn't pin a no-data result for the full TTL. Only successful
-# fetches set fetched_at.
+# fetches set fetched_at; a failure sets retry_at (one short wait).
 INVENTORY_CACHE_TTL_SECONDS = 300
-_inventory_cache: dict = {"text": "", "fetched_at": 0.0, "prices": set(), "prices_source": ""}
+_inventory_cache: dict = {"text": "", "fetched_at": 0.0, "prices": set(), "prices_source": "",
+                          "retry_at": 0.0}
 
 # The output guard's allowed ₹ amounts (audit T1-4) must survive a restart
 # during a Shopify outage. Every good inventory fetch saves its price set
@@ -2656,7 +2664,8 @@ def _send_instagram_message(sender_id: str, text: str) -> tuple[bool, str]:
 
     try:
         resp = requests.post(
-            url, params=params, json=payload, timeout=INSTAGRAM_TIMEOUT_SECONDS
+            url, params=params, json=payload,
+            timeout=_budget_timeout(INSTAGRAM_TIMEOUT_SECONDS, floor=INSTAGRAM_SEND_FLOOR_SECONDS),
         )
         if resp.ok:
             print(f"[INSTAGRAM] Sent reply to {sender_id} ({len(text)} chars)")
@@ -3042,22 +3051,124 @@ else:
 # DeepSeek call budget (audit T1-8). The SDK default is a 600s timeout with
 # 2 retries — far past gunicorn's worker timeout (Procfile: --timeout 60).
 # A slow call got the worker killed mid-request: no reply, no alert, and
-# Meta's retry of that message was dropped by the mid dedup. 20s per
-# attempt plus one retry fails fast enough for the webhook's own failure
-# handling (holding line + Telegram alert) to run. httpx applies the
-# timeout per network operation (connect, each read), not as one
-# wall-clock cap on the whole call.
+# Meta's retry of that message was dropped by the mid dedup. At most 20s
+# per attempt, and one retry — made by _deepseek_create, not the SDK
+# (max_retries=0), so it only happens when the reply budget below still has
+# room for it. httpx applies the timeout per network operation (connect,
+# each read), not as one wall-clock cap on the whole call.
 DEEPSEEK_TIMEOUT_SECONDS = 20
 DEEPSEEK_MAX_RETRIES = 1
 deepseek_client = OpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
     base_url="https://api.deepseek.com",
     timeout=DEEPSEEK_TIMEOUT_SECONDS,
-    max_retries=DEEPSEEK_MAX_RETRIES,
+    max_retries=0,
 )
 claude_client = Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
 )
+
+
+# ----- Reply time budget (audit finding 13) -----
+#
+# Webhook events are processed inline, and gunicorn kills the worker 60s
+# into a request (Procfile: --timeout 60): no reply, no alert, and Meta's
+# retry of the message is dropped by the mid dedup. So each webhook request
+# gets REPLY_BUDGET_SECONDS (_with_reply_budget), and every outbound call in
+# the reply path takes its timeout from what's left (_budget_timeout):
+#   - Shopify (live inventory, the two policy pages): SHOPIFY_TIMEOUT_SECONDS
+#     each, and after a failure no retry for SHOPIFY_RETRY_AFTER_FAILURE_SECONDS;
+#   - RAG retrieval: RAG_RETRIEVAL_TIMEOUT_SECONDS of wall-clock time, then the
+#     reply goes ahead brain-only;
+#   - DeepSeek: up to DEEPSEEK_TIMEOUT_SECONDS per attempt, always keeping
+#     DEEPSEEK_RESERVE_SECONDS back for sending the reply. An attempt (the
+#     retry, the parse retry) that can't get DEEPSEEK_MIN_ATTEMPT_SECONDS
+#     isn't made: ReplyBudgetExceeded, so the customer gets the holding line
+#     and the founder an alert, as for any DeepSeek failure;
+#   - sends: Instagram INSTAGRAM_TIMEOUT_SECONDS and Telegram
+#     TELEGRAM_TIMEOUT_SECONDS, but never below their floors, so the
+#     customer's reply still gets a real try late in the budget.
+# Worst case, with every call hanging to its timeout, one message ends
+# around 52s. This bounds the arithmetic, not every byte: httpx timeouts
+# are per network operation. Background threads (reindex, hourly loop,
+# alerts) have no budget, so _budget_left() is infinite and the caps alone
+# apply.
+REPLY_BUDGET_SECONDS = 50
+DEEPSEEK_RESERVE_SECONDS = 10
+DEEPSEEK_MIN_ATTEMPT_SECONDS = 5
+INSTAGRAM_SEND_FLOOR_SECONDS = 5
+TELEGRAM_FLOOR_SECONDS = 2
+_reply_budget = threading.local()
+_clock = time.monotonic   # the budget's clock; tests swap in a fake one
+
+
+class ReplyBudgetExceeded(TimeoutError):
+    """Too little of the reply budget is left for another model call."""
+
+
+def _budget_left() -> float:
+    """Seconds left of this request's reply budget; infinite outside one."""
+    deadline = getattr(_reply_budget, "deadline", None)
+    return float("inf") if deadline is None else deadline - _clock()
+
+
+def _budget_timeout(cap: float, floor: float = 1.0) -> float:
+    """`cap`, cut to what's left of the reply budget, never below `floor`."""
+    return max(floor, min(cap, _budget_left()))
+
+
+def _with_reply_budget(view):
+    """Run a webhook view inside a fresh REPLY_BUDGET_SECONDS budget. It is
+    thread-local and cleared afterwards, so it never leaks into the next
+    request on this worker or into background threads."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        _reply_budget.deadline = _clock() + REPLY_BUDGET_SECONDS
+        try:
+            return view(*args, **kwargs)
+        finally:
+            _reply_budget.deadline = None
+    return wrapped
+
+
+def _deepseek_retryable(e: Exception) -> bool:
+    """The failures the OpenAI SDK itself would retry: no connection or a
+    timeout, 408, 409, 429 and 5xx."""
+    if isinstance(e, APIConnectionError):   # includes APITimeoutError
+        return True
+    status = getattr(e, "status_code", None)
+    return isinstance(status, int) and (status in (408, 409, 429) or status >= 500)
+
+
+def _deepseek_create(messages: list[dict]):
+    """One chat-completions call within the reply budget: up to
+    DEEPSEEK_TIMEOUT_SECONDS per attempt with DEEPSEEK_RESERVE_SECONDS kept
+    back, and DEEPSEEK_MAX_RETRIES retry on a retryable failure while an
+    attempt of DEEPSEEK_MIN_ATTEMPT_SECONDS still fits. Raises
+    ReplyBudgetExceeded when not even the first attempt fits."""
+    last_error: Exception | None = None
+    for attempt in range(DEEPSEEK_MAX_RETRIES + 1):
+        timeout = min(DEEPSEEK_TIMEOUT_SECONDS, _budget_left() - DEEPSEEK_RESERVE_SECONDS)
+        if timeout < DEEPSEEK_MIN_ATTEMPT_SECONDS:
+            if last_error is not None:
+                print(f"[LLM] No time left in the reply budget to retry {type(last_error).__name__}")
+                raise last_error
+            raise ReplyBudgetExceeded(
+                f"{max(0.0, _budget_left()):.0f}s of the reply budget left — no time for a model call"
+            )
+        try:
+            return deepseek_client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                max_tokens=MAX_TOKENS,
+                messages=messages,
+                timeout=timeout,
+            )
+        except Exception as e:
+            if attempt >= DEEPSEEK_MAX_RETRIES or not _deepseek_retryable(e):
+                raise
+            last_error = e
+            print(f"[LLM] {type(e).__name__} from DeepSeek — retrying once")
+    raise last_error  # unreachable: the loop returns or raises
 
 print(f"[INIT] DeepSeek text client configured: {bool(os.environ.get('DEEPSEEK_API_KEY', ''))}")
 print(f"[INIT] Claude vision client configured: {bool(os.environ.get('ANTHROPIC_API_KEY', ''))}")
@@ -3260,7 +3371,10 @@ def send_telegram_notification(
         payload["reply_markup"] = {"inline_keyboard": [buttons]}
 
     try:
-        response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
+        response = requests.post(
+            url, json=payload,
+            timeout=_budget_timeout(TELEGRAM_TIMEOUT_SECONDS, floor=TELEGRAM_FLOOR_SECONDS),
+        )
         if response.ok:
             print(f"[TG] Sent {classification} notification ({len(text)} chars)")
         else:
@@ -3294,7 +3408,10 @@ def _telegram_api(method: str, payload: dict) -> dict | None:
         # Every alert goes out through here — never with a token in it.
         payload = {**payload, "text": _redact_secrets(payload["text"])}
     try:
-        resp = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
+        resp = requests.post(
+            url, json=payload,
+            timeout=_budget_timeout(TELEGRAM_TIMEOUT_SECONDS, floor=TELEGRAM_FLOOR_SECONDS),
+        )
         if not resp.ok:
             print(f"[TELEGRAM DRAFT] {method} HTTP {resp.status_code}: {resp.text[:300]}")
             return None
@@ -4260,7 +4377,7 @@ _POLICY_PROMPT_PAGES = (
     ("Return & Refund Policy", "https://glamshelf.in/policies/refund-policy"),
     ("Shipping Policy", "https://glamshelf.in/policies/shipping-policy"),
 )
-_policy_cache: dict = {"text": "", "fetched_at": 0.0}
+_policy_cache: dict = {"text": "", "fetched_at": 0.0, "retry_at": 0.0}
 
 
 def _fetch_policy_page_html(url: str) -> str:
@@ -4268,7 +4385,7 @@ def _fetch_policy_page_html(url: str) -> str:
     (the shopify-policy__body div — clean policy text without theme
     chrome), or the whole page HTML as fallback. "" on any failure."""
     try:
-        resp = requests.get(url, timeout=SHOPIFY_TIMEOUT_SECONDS)
+        resp = requests.get(url, timeout=_budget_timeout(SHOPIFY_TIMEOUT_SECONDS))
         if not resp.ok:
             print(f"[POLICY] HTTP {resp.status_code} for {url}")
             return ""
@@ -4287,10 +4404,14 @@ def get_live_policies() -> str:
     for the system prompt. Cached for BRAIN_CACHE_TTL_SECONDS (same
     interval as brain.md). On fetch failure, serves the last good copy
     (even past TTL) rather than dropping the block; returns "" only when
-    no copy has ever been fetched — callers treat "" as a no-op."""
+    no copy has ever been fetched — callers treat "" as a no-op. After a
+    failed refresh, the next one waits SHOPIFY_RETRY_AFTER_FAILURE_SECONDS
+    (audit finding 13)."""
     now = time.time()
     age = now - _policy_cache["fetched_at"]
     if _policy_cache["text"] and age < BRAIN_CACHE_TTL_SECONDS:
+        return _policy_cache["text"]
+    if now < _policy_cache.get("retry_at", 0.0):
         return _policy_cache["text"]
 
     sections = []
@@ -4300,6 +4421,7 @@ def get_live_policies() -> str:
             sections.append(f"== {name} (live page) ==\n{text}")
 
     if not sections:
+        _policy_cache["retry_at"] = now + SHOPIFY_RETRY_AFTER_FAILURE_SECONDS
         if _policy_cache["text"]:
             print("[POLICY] Refresh failed — serving last cached policy text")
         return _policy_cache["text"]
@@ -4354,8 +4476,10 @@ def get_live_inventory() -> str:
 
     Cached in-memory for 5 minutes per worker (INVENTORY_CACHE_TTL_SECONDS).
     Important: only SUCCESSFUL fetches are cached. If the call fails we
-    return "" without caching, so the next customer message will re-try
-    rather than wait out the full TTL behind a transient error.
+    return "" without caching, and the next fetch waits only
+    SHOPIFY_RETRY_AFTER_FAILURE_SECONDS, not the full TTL. The fetch takes
+    at most SHOPIFY_TIMEOUT_SECONDS, less when the reply budget is nearly
+    spent (audit finding 13).
 
     Product titles are echoed verbatim from Shopify — no mapping table
     here, so a product rename in Shopify takes effect on the next 5-min
@@ -4366,12 +4490,17 @@ def get_live_inventory() -> str:
     if _inventory_cache["text"] and age < INVENTORY_CACHE_TTL_SECONDS:
         print(f"[INVENTORY] Cache hit (age {age:.0f}s, TTL {INVENTORY_CACHE_TTL_SECONDS}s)")
         return _inventory_cache["text"]
+    if now < _inventory_cache.get("retry_at", 0.0):
+        print("[INVENTORY] Shopify fetch failed under a minute ago — not retrying yet")
+        return ""
 
     params = {"limit": SHOPIFY_PRODUCTS_LIMIT}
+    retry_at = now + SHOPIFY_RETRY_AFTER_FAILURE_SECONDS
 
     try:
         resp = requests.get(
-            SHOPIFY_PRODUCTS_URL, params=params, timeout=SHOPIFY_TIMEOUT_SECONDS
+            SHOPIFY_PRODUCTS_URL, params=params,
+            timeout=_budget_timeout(SHOPIFY_TIMEOUT_SECONDS),
         )
         if not resp.ok:
             # Status + first 200 chars is enough to diagnose 404 (wrong
@@ -4380,14 +4509,17 @@ def get_live_inventory() -> str:
                 f"[INVENTORY] Shopify HTTP {resp.status_code}: "
                 f"{resp.text[:200]}"
             )
+            _inventory_cache["retry_at"] = retry_at
             return ""
         products = (resp.json() or {}).get("products") or []
     except requests.RequestException as e:
         print(f"[INVENTORY] Network error: {type(e).__name__}: {e}")
+        _inventory_cache["retry_at"] = retry_at
         return ""
     except Exception as e:
         # Defensive — JSON decode error, unexpected payload shape, anything.
         print(f"[INVENTORY] Unexpected error: {type(e).__name__}: {e}")
+        _inventory_cache["retry_at"] = retry_at
         return ""
 
     lines = ["[LIVE INVENTORY - checked now]", INVENTORY_COPY_NOTE]
@@ -4480,6 +4612,13 @@ RAG_EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # fastembed's q
 RAG_EMBED_DIM = 384
 RAG_MODEL_CACHE_DIR = os.path.join(os.path.dirname(DB_PATH) or ".", "fastembed_cache")
 RAG_TOP_K = 2
+# Wall-clock cap on one retrieval (query embedding + search), less when the
+# reply budget is nearly spent; past it the reply goes ahead brain-only
+# (audit finding 13). Only one retrieval runs at a time: while an abandoned
+# slow one is still going, the next message skips retrieval rather than
+# stacking CPU-bound embedding threads on the worker.
+RAG_RETRIEVAL_TIMEOUT_SECONDS = 3
+_rag_inflight = threading.Lock()
 RAG_CANDIDATES = 8                 # over-fetch, then apply the product filter
 RAG_MAX_CONTEXT_CHARS = 2000       # ≈500 tokens (audit 5.4 budget)
 RAG_CHUNK_MAX_CHARS = 500
@@ -5077,6 +5216,39 @@ def _rag_named_products(message: str) -> set[str]:
 
 
 def _rag_retrieve(message: str) -> str:
+    """Point A retrieval (_rag_retrieve_now) with a wall-clock cap of
+    RAG_RETRIEVAL_TIMEOUT_SECONDS, cut to what's left of the reply budget.
+    Returns "" (brain-only) past the cap, while an earlier slow retrieval is
+    still running, or wherever _rag_retrieve_now would. Never raises."""
+    if _rag_embedder is None or not message or not _RAG_TRIGGER_RE.search(message):
+        return ""
+    if not _rag_inflight.acquire(blocking=False):
+        print("[RAG] An earlier slow retrieval is still running — skipped (brain-only)")
+        return ""
+    result: dict = {}
+
+    def work():
+        try:
+            result["text"] = _rag_retrieve_now(message)
+        finally:
+            _rag_inflight.release()
+
+    cap = _budget_timeout(RAG_RETRIEVAL_TIMEOUT_SECONDS, floor=0.5)
+    worker = threading.Thread(target=work, daemon=True)
+    try:
+        worker.start()
+    except Exception as e:
+        _rag_inflight.release()
+        print(f"[RAG] Couldn't start retrieval: {type(e).__name__}: {e} — brain-only")
+        return ""
+    worker.join(cap)
+    if worker.is_alive():
+        print(f"[RAG] Retrieval took longer than {cap:.1f}s — skipped (brain-only)")
+        return ""
+    return result.get("text", "")
+
+
+def _rag_retrieve_now(message: str) -> str:
     """Point A retrieval: keyword gate → embed query → top-K chunks →
     [RETRIEVED CONTEXT] block. Returns "" (a strict no-op for the caller)
     when the gate misses, the embedding model/index is unavailable, or
@@ -5978,11 +6150,7 @@ def ask_claude(
             all_messages.append({"role": "assistant", "content": turn["reply_text"]})
     all_messages.append({"role": "user", "content": user_text})
 
-    message = deepseek_client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=all_messages,
-    )
+    message = _deepseek_create(all_messages)
 
     choice = message.choices[0]
     raw = (choice.message.content or "").strip()
@@ -6359,6 +6527,7 @@ def webhook_verify(token=""):
 
 @app.route("/webhook", methods=["POST"], defaults={"token": ""})
 @app.route("/webhook/<token>", methods=["POST"])
+@_with_reply_budget
 def webhook(token=""):
     """WATI calls this when a customer sends us an inbound WhatsApp message.
 
@@ -7744,6 +7913,7 @@ def instagram_webhook_verify():
 
 
 @app.route("/instagram-webhook", methods=["POST"])
+@_with_reply_budget
 def instagram_webhook():
     """Receive Instagram DM webhook events from Meta.
 
