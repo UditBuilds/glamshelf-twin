@@ -8206,11 +8206,21 @@ def _ig_username(sender_id: str) -> str:
     return username
 
 
+def _ig_profile_link(username: str) -> str:
+    """The sender's Instagram profile as a link Telegram makes tappable.
+    Not "@username": in Telegram that's a link to a *Telegram* account of
+    that name, which may be a stranger's (founder decision, 4 Oct 2026).
+    `username` is already validated (_IG_USERNAME_RE), so it can't change
+    the URL."""
+    return f"https://instagram.com/{username}"
+
+
 def _ig_sender_label(sender_id: str) -> str:
-    """How the founder's notices name an Instagram sender: "@username
-    (sender 1784…)", or "sender 1784…" when the username isn't known."""
+    """How the founder's notices name an Instagram sender:
+    "https://instagram.com/username (sender 1784…)", or "sender 1784…" when
+    the username isn't known."""
     username = _ig_username(sender_id)
-    return f"@{username} (sender {sender_id})" if username else f"sender {sender_id}"
+    return f"{_ig_profile_link(username)} (sender {sender_id})" if username else f"sender {sender_id}"
 
 
 def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) -> bool:
@@ -9231,7 +9241,7 @@ def _process_instagram_event(event: dict) -> None:
             username = _ig_username(sender_id)
             sent_with_buttons = send_draft_for_approval(
                 customer_number=sender_id,
-                customer_name=f"@{username}" if username else "",
+                customer_name=_ig_profile_link(username) if username else "",
                 customer_message=text,
                 reply_text=reply,
                 channel="Instagram",

@@ -1,7 +1,9 @@
 """Instagram usernames in the founder's notices (PR 5b).
 
 The LEAD, DRAFT, ESCALATE and paused / rate-limit forward notices show
-"@username (sender 1784…)" instead of the bare numeric id. The username
+"https://instagram.com/username (sender 1784…)" instead of the bare
+numeric id — a link to the Instagram profile, never "@username", which
+Telegram would link to a Telegram account of that name. The username
 comes from Meta's User Profile API:
 
   - looked up only when a notice is built, which is always after the
@@ -30,6 +32,8 @@ os.environ.setdefault("SECRET_KEY", "t"); os.environ.setdefault("APP_PASSWORD", 
 os.environ.setdefault("DASHBOARD_KEY", "t")
 import requests
 import app as glam
+
+REAL_SEND_DRAFT = glam.send_draft_for_approval
 
 SENDER = "17841400000000777"
 TOKEN = "TEST-TOKEN-NOT-REAL-0123456789"
@@ -105,7 +109,8 @@ class Base(unittest.TestCase):
             })
 
 
-LABEL = f"@glam.tester_1 (sender {SENDER})"
+PROFILE = "https://instagram.com/glam.tester_1"
+LABEL = f"{PROFILE} (sender {SENDER})"
 
 
 class Lookup(Base):
@@ -204,7 +209,7 @@ class NoticesNameTheSender(Base):
         self.dm("my GS2 tray arrived damaged", "DRAFT+APPROVE", "So sorry — could you email us…")
         self.assertEqual(self.kinds()[:3], ["send", "lookup", "draft"])
         self.assertEqual(self.events[0][1], glam.BRAIN_HOLDING_LINE)       # the handoff line
-        self.assertEqual(self.events[2], ("draft", "@glam.tester_1", SENDER))
+        self.assertEqual(self.events[2], ("draft", PROFILE, SENDER))
 
     def test_draft_fallback_notice_when_the_buttons_fail(self):
         with patch.object(glam, "send_draft_for_approval", lambda **kw: False):
@@ -228,6 +233,31 @@ class NoticesNameTheSender(Base):
         self.dm("I want to speak to the owner", "ESCALATE", "Sorry 🤍")
         self.assertEqual(self.kinds(), ["send", "lookup", "notice"])
         self.assertEqual(self.events[2], ("notice", "ESCALATE", f"Instagram DM — sender {SENDER}"))
+
+    def test_no_notice_uses_a_bare_at_handle(self):
+        # "@handle" in Telegram links to a Telegram account of that name.
+        self.dm("I want to speak to the owner", "ESCALATE", "Sorry 🤍")
+        self.dm("hello?? can u just send me the payment link")
+        texts = [str(e) for e in self.events if e[0] in ("notice", "telegram", "draft")]
+        self.assertEqual(len(texts), 2)
+        for text in texts:
+            self.assertIn(PROFILE, text)
+            self.assertNotIn("@glam.tester_1", text)
+
+    def test_the_draft_card_shows_the_link_and_the_id(self):
+        captured = []
+
+        def tg(method, payload):
+            captured.append(payload)
+            return {"ok": True, "result": {"message_id": 1, "chat": {"id": 123}}}
+
+        with patch.object(glam, "send_draft_for_approval", REAL_SEND_DRAFT), \
+                patch.object(glam, "TELEGRAM_BOT_TOKEN", "123:TEST"), \
+                patch.object(glam, "_telegram_api", tg):
+            self.dm("my GS2 tray arrived damaged", "DRAFT+APPROVE", "So sorry 🤍")
+        (card,) = [p["text"] for p in captured if p["text"].startswith("🟡")]
+        self.assertIn(f"From: {PROFILE} ({SENDER})", card)
+        self.assertNotIn("@glam.tester_1", card)
 
     def test_order_heads_up_is_unchanged(self):
         self.dm("where is my order #1234?", "AUTO", "I've passed this to the team 🤍", tag="ORDER")

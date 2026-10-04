@@ -412,7 +412,7 @@ def dispatch_draft(state: TwinState) -> TwinState:
     username = app._ig_username(sender_id)
     sent_with_buttons = app.send_draft_for_approval(
         customer_number=sender_id,
-        customer_name=f"@{username}" if username else "",
+        customer_name=app._ig_profile_link(username) if username else "",
         customer_message=text,
         reply_text=reply,
         channel="Instagram",
