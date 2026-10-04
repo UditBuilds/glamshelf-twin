@@ -246,6 +246,10 @@ class RagWallClockCap(unittest.TestCase):
         self.started = []
         for p in (
             patch.object(glam, "_rag_embedder", object()),
+            # A timed-out retrieval starts the RAG health check on a
+            # background thread (test_rag_health.py); keep it out of here.
+            patch.object(glam, "_rag_alert_if_unhealthy", lambda when: None),
+            patch.dict(glam._rag_last_retrieval, {"at": None, "error": None}),
             patch.object(glam, "RAG_RETRIEVAL_TIMEOUT_SECONDS", 0.3),
             patch.object(glam, "_rag_retrieve_now", self.slow_retrieve),
         ):

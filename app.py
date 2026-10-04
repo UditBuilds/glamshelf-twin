@@ -4749,8 +4749,12 @@ def _rag_load_model() -> None:
 
 # Last sqlite-vec load failure, kept for the keyed /healthz view
 # (X-Dashboard-Key) so the real reason is visible without log-diving. None = loading works
-# (or hasn't been attempted yet). Logged once, not per connection —
-# _rag_db() runs on every retrieval and would spam the Render log stream.
+# (or hasn't been attempted yet). Logged once, at startup
+# (_rag_log_vector_search), not per connection — _rag_db() runs on every
+# retrieval and would spam the Render log stream. Render's Python builds
+# can't load extensions at all (3.14.3 and 3.13.15 alike), so there the
+# numpy fallback is the normal path and the line is information, not an
+# error (founder decision, 4 Oct 2026).
 _rag_vec_load_error: str | None = None
 _rag_vec_load_error_logged = False
 
@@ -4788,9 +4792,10 @@ def _rag_db() -> tuple:
         if not _rag_vec_load_error_logged:
             _rag_vec_load_error_logged = True
             print(
-                f"[RAG] sqlite-vec load FAILED — numpy brute-force fallback active "
-                f"(python {sys.version.split()[0]}, sqlite {sqlite3.sqlite_version}): "
-                f"{_rag_vec_load_error}"
+                f"[RAG] Vector search: numpy fallback — sqlite-vec doesn't load on this "
+                f"Python (python {sys.version.split()[0]}, sqlite {sqlite3.sqlite_version}: "
+                f"{_rag_vec_load_error}). Normal on Render: retrieval works the same, "
+                f"without the vec0 index."
             )
         return conn, False
 
@@ -5006,6 +5011,28 @@ def _job_mark_run(job: str, now: float) -> None:
         print(f"[SCHEDULER] Could not record run of {job}: {type(e).__name__}: {e}")
 
 
+def _job_claim(job: str, interval: float, now: float) -> bool:
+    """Atomically take this run of `job` if `interval` has passed since the
+    last one (True = go ahead; the stamp is already written). False on any
+    DB error, so a broken DB can't turn into an alert storm."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            claimed = conn.execute(
+                "INSERT INTO scheduled_jobs (job, last_run) VALUES (?, ?) "
+                "ON CONFLICT(job) DO UPDATE SET last_run = excluded.last_run "
+                "WHERE scheduled_jobs.last_run <= ?",
+                (job, now, now - interval),
+            ).rowcount
+            conn.commit()
+            return claimed == 1
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[SCHEDULER] Could not claim {job}: {type(e).__name__}: {e}")
+        return False
+
+
 def _ig_token_alert(text: str) -> None:
     """Token alerts bypass _alert_send_failure's 30-min mute: one a day,
     every day, until the token works again."""
@@ -5120,6 +5147,138 @@ def _ig_token_check_if_due(now: float | None = None) -> None:
         print(f"[TOKEN-CHECK] Check crashed: {type(e).__name__}: {e}")
 
 
+# ----- RAG health (audit finding 16) -----
+#
+# Retrieval used to fail silently: a model that didn't load meant
+# brain-only replies for the life of the process, with one log line, and
+# /healthz couldn't show it. Founder's rule (4 Oct 2026): the numpy fallback
+# is the normal path on Render, so an index with chunks is healthy either
+# way. Unhealthy: no embedding model (retrieval is off), an empty or
+# unreadable index, or the last retrieval failing (an error, or
+# RAG_RETRIEVAL_TIMEOUT_SECONDS). The keyed /healthz shows it; the founder
+# gets at most one Telegram alert per RAG_ALERT_INTERVAL_SECONDS, checked
+# two minutes after startup, after each hourly reindex and when a retrieval
+# fails — on a background thread, never in the reply path. The public /healthz stays
+# "ok": Render's health check must not restart the service over RAG.
+RAG_ALERT_JOB = "rag_health_alert"
+RAG_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
+# The startup check runs this long after the startup index step, on its own
+# timer: a process replaced during a deploy's switch-over never alerts, and
+# neither does a short-lived one (each test module imports the app).
+RAG_STARTUP_CHECK_DELAY_SECONDS = 120
+_rag_last_retrieval: dict = {"at": None, "error": None}
+
+
+def _rag_note_retrieval(error: str | None) -> None:
+    """Record how the latest retrieval went; a failure checks for the alert
+    on a background thread."""
+    _rag_last_retrieval.update(at=time.time(), error=error)
+    if error:
+        try:
+            threading.Thread(target=_rag_alert_if_unhealthy, args=("retrieval",), daemon=True).start()
+        except Exception as e:
+            print(f"[RAG] Couldn't start the health check: {type(e).__name__}: {e}")
+
+
+def _rag_health() -> dict:
+    """The RAG index's state for /healthz and the alert. Never raises."""
+    chunks, read_error = None, None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            chunks = conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            chunks = 0                       # never indexed
+        else:
+            read_error = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        read_error = f"{type(e).__name__}: {e}"
+    try:
+        conn, vec_loaded = _rag_db()
+        conn.close()
+    except Exception:
+        vec_loaded = False
+    last = dict(_rag_last_retrieval)
+    if _rag_embedder is None:
+        problem = "the embedding model isn't loaded, so retrieval is off"
+    elif read_error:
+        problem = f"the index can't be read ({read_error})"
+    elif not chunks:
+        problem = "the index has no chunks"
+    elif last["error"]:
+        problem = f"the last retrieval failed ({last['error']})"
+    else:
+        problem = None
+    return {
+        "healthy": problem is None,
+        "problem": problem,
+        "embedder_loaded": _rag_embedder is not None,
+        "chunks": chunks,
+        "vector_search": "sqlite-vec" if vec_loaded else "numpy fallback",
+        "last_retrieval": None if last["at"] is None else {
+            "at": datetime.fromtimestamp(last["at"], timezone.utc).isoformat(timespec="seconds"),
+            "ok": last["error"] is None,
+            "error": last["error"],
+        },
+    }
+
+
+def _rag_alert_if_unhealthy(when: str) -> None:
+    """One Telegram alert per RAG_ALERT_INTERVAL_SECONDS while RAG is
+    unhealthy (restart-safe: the stamp is in scheduled_jobs). Never raises."""
+    try:
+        health = _rag_health()
+        if health["healthy"]:
+            return
+        if not _job_claim(RAG_ALERT_JOB, RAG_ALERT_INTERVAL_SECONDS, time.time()):
+            print(f"[RAG] Unhealthy ({health['problem']}) — already alerted in the last 24h")
+            return
+        print(f"[RAG] Unhealthy ({health['problem']}) — alerting the founder ({when})")
+        if not TELEGRAM_CHAT_ID:
+            print("[RAG] Alert skipped: TELEGRAM_CHAT_ID not set")
+            return
+        chunks = "unknown" if health["chunks"] is None else health["chunks"]
+        _telegram_api("sendMessage", {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": (
+                "⚠️ Twin's product search (RAG) has a problem — the replies it affects "
+                "go out from brain.md only.\n"
+                f"Problem: {health['problem']}.\n"
+                f"Index: {chunks} chunks · vector search: {health['vector_search']}.\n\n"
+                "(At most one alert a day. The keyed /healthz shows the current state.)"
+            ),
+        })
+    except Exception as e:
+        print(f"[RAG] Health alert failed: {type(e).__name__}: {e}")
+
+
+def _rag_schedule_startup_check() -> None:
+    """Run _rag_alert_if_unhealthy("startup") RAG_STARTUP_CHECK_DELAY_SECONDS
+    from now on a daemon timer, so the hourly loop isn't held up. Never
+    raises."""
+    try:
+        timer = threading.Timer(RAG_STARTUP_CHECK_DELAY_SECONDS, _rag_alert_if_unhealthy, args=("startup",))
+        timer.daemon = True
+        timer.start()
+    except Exception as e:
+        print(f"[RAG] Couldn't schedule the startup health check: {type(e).__name__}: {e}")
+
+
+def _rag_log_vector_search() -> None:
+    """Startup: say once which vector search this process uses (_rag_db
+    prints the numpy-fallback line itself, once). Never raises."""
+    try:
+        conn, vec_loaded = _rag_db()
+        conn.close()
+        if vec_loaded:
+            print("[RAG] Vector search: sqlite-vec")
+    except Exception as e:
+        print(f"[RAG] Vector search check failed: {type(e).__name__}: {e}")
+
+
 def _rag_vec_table_missing() -> bool:
     """Does sqlite-vec load while the index has no rag_vec table? That's an
     index built when the extension couldn't load (Render's Python 3.14.3
@@ -5167,6 +5326,7 @@ def _start_rag_reindex_loop() -> None:
     re-index hourly as the fallback for missed Shopify webhooks. All of it
     runs on a daemon thread, so none of it delays boot."""
     def loop():
+        _rag_log_vector_search()
         count, dim, meta_model = 0, None, None
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -5198,6 +5358,7 @@ def _start_rag_reindex_loop() -> None:
             _rag_rebuild_vec_table(count)
         else:
             print(f"[RAG] Existing index found ({count} chunks, {dim}d, {meta_model}) — hourly refresh scheduled")
+        _rag_schedule_startup_check()
         while True:
             time.sleep(RAG_REINDEX_INTERVAL_SECONDS)
             # The daily Instagram token check rides this hourly tick; it
@@ -5205,6 +5366,7 @@ def _start_rag_reindex_loop() -> None:
             # (restart-safe via scheduled_jobs).
             _ig_token_check_if_due()
             _rag_reindex("hourly")
+            _rag_alert_if_unhealthy("hourly")
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
@@ -5244,6 +5406,7 @@ def _rag_retrieve(message: str) -> str:
     worker.join(cap)
     if worker.is_alive():
         print(f"[RAG] Retrieval took longer than {cap:.1f}s — skipped (brain-only)")
+        _rag_note_retrieval(f"it took longer than {cap:.1f}s")
         return ""
     return result.get("text", "")
 
@@ -5261,6 +5424,7 @@ def _rag_retrieve_now(message: str) -> str:
         t0 = time.time()
         q = _rag_embed([message])
         if q is None:
+            _rag_note_retrieval("the query embedding failed")
             return ""
         import numpy as np
         qv = np.asarray(q[0], dtype=np.float32)
@@ -5292,6 +5456,7 @@ def _rag_retrieve_now(message: str) -> str:
                 candidates = scored[:RAG_CANDIDATES]
         finally:
             conn.close()
+        _rag_note_retrieval(None)   # the search worked, whatever it found
 
         if not candidates:
             return ""
@@ -5322,6 +5487,7 @@ def _rag_retrieve_now(message: str) -> str:
         return RAG_CONTEXT_HEADER + "\n\n" + "\n\n".join(picked)
     except Exception as e:
         print(f"[RAG] Retrieval failed (falling back to brain-only): {type(e).__name__}: {e}")
+        _rag_note_retrieval(f"{type(e).__name__}: {e}")
         return ""
 
 
@@ -6352,6 +6518,11 @@ def healthz():
         # boot-time result. error carries the classified failure reason
         # when loaded=false (see _rag_db); null while loading works.
         "sqlite_vec": _healthz_sqlite_vec_status(),
+        # RAG index state (audit finding 16): healthy = embedding model
+        # loaded, chunks > 0 and the last retrieval worked; the numpy
+        # fallback counts as healthy. Keyed view only — the public answer
+        # never turns 503 over RAG.
+        "rag": _rag_health(),
         "total_logged": total_logged,
         "total_orders": total_orders,
         "total_instagram": total_instagram,
