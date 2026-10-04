@@ -4981,12 +4981,52 @@ def _ig_token_check_if_due(now: float | None = None) -> None:
         print(f"[TOKEN-CHECK] Check crashed: {type(e).__name__}: {e}")
 
 
+def _rag_vec_table_missing() -> bool:
+    """Does sqlite-vec load while the index has no rag_vec table? That's an
+    index built when the extension couldn't load (Render's Python 3.14.3
+    build, before the 3.13 pin): retrieval then fails with "no such table:
+    rag_vec" — brain-only replies — until a reindex creates the table.
+    Never raises: on any error it says False, which keeps today's
+    behaviour."""
+    try:
+        conn, vec_loaded = _rag_db()
+        try:
+            if not vec_loaded:
+                return False
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rag_vec'"
+            ).fetchone() is None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[RAG] Vector-table check failed ({type(e).__name__}: {e}) — no startup rebuild")
+        return False
+
+
+def _rag_rebuild_vec_table(count: int) -> None:
+    """One rebuild for _rag_vec_table_missing, on the startup thread. If it
+    fails, the old index stays (a failed reindex never wipes it), retrieval
+    stays brain-only as before, and the hourly reindex tries again. Never
+    raises, so the hourly loop (and the token check riding it) survives."""
+    print(f"[RAG] sqlite-vec loads but the index ({count} chunks) has no rag_vec table — rebuilding it once")
+    try:
+        rebuilt = _rag_reindex("startup-vec-missing")
+    except Exception as e:
+        print(f"[RAG] Startup rebuild crashed: {type(e).__name__}: {e}")
+        rebuilt = 0
+    if not rebuilt:
+        print("[RAG] Startup rebuild failed — keeping the existing index; retrieval stays "
+              "brain-only until the hourly reindex")
+
+
 def _start_rag_reindex_loop() -> None:
     """Startup: index immediately if the table is empty, unreachable, or
     was built under a different embedding dimension (a model swap makes
     old vectors unusable — better an eager rebuild than every query
-    failing the vec0 dimension check). Then re-index hourly as the
-    fallback for missed Shopify webhooks."""
+    failing the vec0 dimension check), or once more if sqlite-vec loads
+    but the index has no vector table (_rag_vec_table_missing). Then
+    re-index hourly as the fallback for missed Shopify webhooks. All of it
+    runs on a daemon thread, so none of it delays boot."""
     def loop():
         count, dim, meta_model = 0, None, None
         try:
@@ -5015,6 +5055,8 @@ def _start_rag_reindex_loop() -> None:
             # aren't comparable across models even at equal size.
             print(f"[RAG] Index built by {meta_model!r}, expected {RAG_EMBED_MODEL_NAME!r} — rebuilding")
             _rag_reindex("startup-model-change")
+        elif _rag_vec_table_missing():
+            _rag_rebuild_vec_table(count)
         else:
             print(f"[RAG] Existing index found ({count} chunks, {dim}d, {meta_model}) — hourly refresh scheduled")
         while True:
