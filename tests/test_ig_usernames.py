@@ -1,6 +1,7 @@
 """Instagram usernames in the founder's notices (PR 5b).
 
-The LEAD, DRAFT, ESCALATE and paused / rate-limit forward notices show
+The LEAD, DRAFT, ESCALATE, paused / rate-limit forward, ORDER / RESTOCK,
+photo and media notices show
 "https://instagram.com/username (sender 1784…)" instead of the bare
 numeric id — a link to the Instagram profile, never "@username", which
 Telegram would link to a Telegram account of that name. The username
@@ -106,6 +107,14 @@ class Base(unittest.TestCase):
             glam._process_instagram_event({
                 "sender": {"id": SENDER}, "recipient": {"id": "page"},
                 "timestamp": 1, "message": {"mid": f"u.{uuid.uuid4().hex}", "text": text},
+            })
+
+    def media(self, att_type, payload=None):
+        att = {"type": att_type, "payload": payload or {"url": "https://lookaside.example/x"}}
+        with redirect_stdout(io.StringIO()):
+            glam._process_instagram_event({
+                "sender": {"id": SENDER}, "recipient": {"id": "page"},
+                "timestamp": 1, "message": {"mid": f"u.{uuid.uuid4().hex}", "attachments": [att]},
             })
 
 
@@ -259,11 +268,42 @@ class NoticesNameTheSender(Base):
         self.assertIn(f"From: {PROFILE} ({SENDER})", card)
         self.assertNotIn("@glam.tester_1", card)
 
-    def test_order_heads_up_is_unchanged(self):
+    # ORDER / RESTOCK heads-ups, photo and media notices (4 Oct 2026 brief;
+    # until then the ORDER heads-up showed the id only).
+    def test_order_heads_up(self):
         self.dm("where is my order #1234?", "AUTO", "I've passed this to the team 🤍", tag="ORDER")
-        notices = [e for e in self.events if e[0] == "notice"]
-        self.assertEqual(notices, [("notice", "ORDER", f"Instagram DM — sender {SENDER}")])
-        self.assertEqual(self.lookups(), [])
+        self.assertEqual(self.kinds(), ["send", "lookup", "notice"])
+        self.assertEqual(self.events[2], ("notice", "ORDER", f"Instagram DM — {LABEL}"))
+
+    def test_restock_heads_up(self):
+        self.dm("notify me when kawaii is back", "AUTO", "Kawaii is sold out right now 🤍", tag="RESTOCK")
+        self.assertEqual(self.kinds(), ["send", "lookup", "notice"])
+        self.assertEqual(self.events[2], ("notice", "RESTOCK", f"Instagram DM — {LABEL}"))
+
+    def test_photo(self):
+        self.media("image")
+        self.assertEqual(self.kinds(), ["send", "lookup", "telegram"])
+        self.assertEqual(self.events[0][1], glam.INSTAGRAM_PHOTO_REPLY)
+        self.assertTrue(self.events[2][1].startswith(f"📷 Instagram photo from {LABEL}\n"), self.events[2][1])
+
+    def test_voice_note(self):
+        self.media("audio")
+        self.assertEqual(self.kinds(), ["send", "lookup", "telegram"])
+        self.assertEqual(self.events[0][1], glam.INSTAGRAM_MEDIA_REPLY)
+        self.assertTrue(self.events[2][1].startswith(f"🎤 Instagram voice note from {LABEL}\n"), self.events[2][1])
+
+    def test_story_mention_gets_no_reply_and_a_linked_notice(self):
+        self.media("story_mention")
+        self.assertEqual(self.kinds(), ["lookup", "telegram"])
+        self.assertTrue(self.events[1][1].startswith(f"📣 Instagram story mention from {LABEL}\n"), self.events[1][1])
+
+    def test_a_failed_lookup_leaves_these_notices_as_they_were(self):
+        self.lookup_result = requests.ConnectionError("graph.instagram.com unreachable")
+        self.dm("where is my order #1234?", "AUTO", "I've passed this to the team 🤍", tag="ORDER")
+        self.media("image")
+        self.assertIn(("notice", "ORDER", f"Instagram DM — sender {SENDER}"), self.events)
+        (photo,) = [e[1] for e in self.events if e[0] == "telegram"]
+        self.assertTrue(photo.startswith(f"📷 Instagram photo from sender {SENDER}\n"), photo)
 
 
 if __name__ == "__main__":
