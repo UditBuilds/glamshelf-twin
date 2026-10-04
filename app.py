@@ -43,6 +43,7 @@ from pricing_rules import (
     BULK_RATE_INR,
     INTENT_COMMIT,
     bulk_quantity_note,
+    bulk_trays_asked,
     detect_bulk_commit_quantity,
     resolve_pricing_action,
 )
@@ -3140,6 +3141,19 @@ def send_telegram_notification(
             f'"{reply}"\n\n'
             "→ Message them personally. Twin keeps answering them meanwhile (no pause)."
         )
+    elif classification == "BULK":
+        # Instagram: a question about 20+ trays / 200+ pairs (founder
+        # decision, 3 Oct 2026). Twin's reply promised them nothing.
+        text = (
+            "🟢 LEAD — bulk question (20+ trays / 200+ pairs)\n\n"
+            f"{sender_block}"
+            "They said:\n"
+            f'"{customer_message}"\n\n'
+            "Twin replied:\n"
+            f'"{reply}"\n\n'
+            f"→ Message them personally from {approve_destination} if you want to. "
+            "Twin didn't promise a follow-up (no pause)."
+        )
     elif classification in ("ORDER", "RESTOCK"):
         # Instagram heads-up for an AUTO reply Twin can't fully back up
         # (audit T1-6): it can't see orders, and there's no waitlist.
@@ -5087,7 +5101,10 @@ get_live_policies()
 # runs alongside the LLM classification and can only UPGRADE the result to
 # ESCALATE; it never downgrades an LLM decision. The phrase list is
 # deliberately short and founder-confirmed — do not extend it with soft
-# signals (tone, sentiment, non-Hindi anger); those stay with the LLM.
+# signals (tone, sentiment); those stay with the LLM. The one exception is
+# the founder's own (30 Sep 2026): an angry complaint — all caps,
+# "ridiculous", "no one replies" — always escalates, legal threat or not
+# (_ANGER_PHRASES_RE / _caps_complaint below, audit finding 11).
 #
 # Rollback: set ESCALATION_PREFILTER_DISABLED=1 in the environment and
 # restart. Do not edit brain.md to compensate for filter behavior.
@@ -5311,8 +5328,52 @@ def _ig_is_lead(message: str, classification: str, reply: str, tag: str) -> bool
     return classification == "AUTO" and bool(reply) and bool(_LEAD_RE.search(message or ""))
 
 
+# Angry complaints (founder decision, 30 Sep 2026): always ESCALATE, with or
+# without a legal threat. The audit's "THIS IS RIDICULOUS. ordered 12 days
+# ago, emailed you twice, NO ONE REPLIES. worst brand ever" went to DRAFT 1
+# of 3 times (finding 11). Explicit phrases first; a caps-lock run counts
+# only next to a complaint word, so "PRICE OF GS1?" typed in capitals or
+# "OMG THESE ARE SO CUTE" isn't one. Not legal: the customer gets the
+# handoff line, as for any other escalation.
+_ANGER_PHRASES_RE = re.compile(
+    r"\b(?:ridiculous|pathetic|disgusting|unacceptable|fed up)\b"
+    r"|\bworst (?:brand|service|company|experience|customer service|shopping)\b"
+    r"|\b(?:no ?one|nobody|no body)\s+(?:is\s+|was\s+|has\s+|ever\s+)?"
+    r"(?:repl(?:y|ies|ied|ying)|respond(?:s|ed|ing)?|answer(?:s|ed|ing)?|getting back)\b"
+    r"|\bno (?:reply|response|answer)s? (?:from|yet|till|at all|since)\b"
+    r"|\bkoi (?:reply|jawab|response) (?:nahi|nhi|nahin)\b",
+    re.IGNORECASE,
+)
+_CAPS_EXEMPT_WORDS = frozenset({
+    "GS1", "GS2", "GS3", "COD", "UPI", "MUA", "ID", "OK", "DM", "IG", "INR", "RS",
+    "AWB", "RTO", "POD", "GST", "MRP", "PR", "UGC", "OTP", "SMS", "PM", "AM",
+})
+_COMPLAINT_WORD_RE = re.compile(
+    r"\b(?:ordered|refunds?|money back|waiting|waited|days|weeks?|worst|fake|fraud|scam|cheat\w*"
+    r"|complain\w*|problem|issue|damaged|broken|wrong|never|still|ignor\w*"
+    r"|not (?:received|delivered|arrived))\b",
+    re.IGNORECASE,
+)
+
+
+def _caps_complaint(message: str) -> bool:
+    """Three or more words in a row typed in capitals (brand codes aside)
+    in a message that also names a problem."""
+    run = best = 0
+    for token in re.findall(r"[A-Za-z0-9']+", message or ""):
+        letters = re.sub(r"[^A-Za-z]", "", token)
+        if len(letters) >= 2 and letters.isupper() and token.upper() not in _CAPS_EXEMPT_WORDS:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best >= 3 and bool(_COMPLAINT_WORD_RE.search(message or ""))
+
+
 def _escalation_prefilter_hit(message: str) -> str | None:
-    """Return the matched high-risk phrase, or None.
+    """Return the matched high-risk phrase, or None: a legal threat or a
+    social-media threat (_ESCALATION_PREFILTER_PATTERNS), else an angry
+    complaint (_ANGER_PHRASES_RE, or "caps-lock complaint").
 
     Returns None unconditionally when ESCALATION_PREFILTER_DISABLED is
     set (rollback switch — read per call so a Render env change takes
@@ -5321,7 +5382,12 @@ def _escalation_prefilter_hit(message: str) -> str | None:
     if (os.environ.get("ESCALATION_PREFILTER_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
         return None
     m = _ESCALATION_PREFILTER_PATTERNS.search(message or "")
-    return m.group(0) if m else None
+    if m:
+        return m.group(0)
+    m = _ANGER_PHRASES_RE.search(message or "")
+    if m:
+        return m.group(0)
+    return "caps-lock complaint" if _caps_complaint(message) else None
 
 
 def _bulk_commit_prefilter_hit(message: str) -> int | None:
@@ -7669,12 +7735,17 @@ def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) 
     return sent
 
 
-def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
+def _ig_output_guard(sender_id: str, classification: str, reply: str,
+                     founder_notice: bool = False) -> str:
     """Output guard for Instagram AUTO replies (audit T1-4): run the pure
     checks in output_guard.py before an AUTO reply is sent. Returns "" when
     it may go out, else the rule(s) that fired — the caller then routes it
     to DRAFT+APPROVE (handoff line to the customer, draft plus this reason
     to the founder). The text is never rewritten.
+
+    `founder_notice`: a founder notice goes out with this reply
+    (_ig_founder_told), which is what makes "they'll reply to you here" or
+    "Udit will message you personally" true (rule 7, audit finding 6).
 
     Allowed ₹ amounts: the product prices in _inventory_cache — from the
     last successful Shopify fetch, or before one, from ALLOWED_PRICES_PATH
@@ -7694,7 +7765,7 @@ def _ig_output_guard(sender_id: str, classification: str, reply: str) -> str:
     prices = _inventory_cache.get("prices") or set()
     if not prices:
         print("[OUTPUT-GUARD] No product prices (Shopify, saved file and brain.md all unavailable) — only the fixed ₹ amounts are allowed")
-    reasons = output_guard.check_reply(reply, prices)
+    reasons = output_guard.check_reply(reply, prices, founder_notice=founder_notice)
     if not reasons:
         return ""
     note = "; ".join(reasons)
@@ -7801,7 +7872,9 @@ def _ig_draft_handoff(sender_id: str, timestamp: str) -> bool:
         )
         return False
     print(f"[INSTAGRAM-DRAFT] {sender_id} already got the handoff line recently — not repeating it")
-    if _ig_output_guard(sender_id, "AUTO", IG_DRAFT_ACK_LINE):
+    # The founder gets this draft, so the ack line's "the team will reply
+    # here" is true (founder_notice).
+    if _ig_output_guard(sender_id, "AUTO", IG_DRAFT_ACK_LINE, founder_notice=True):
         print(f"[INSTAGRAM-DRAFT] Acknowledgement to {sender_id} held by the output guard — nothing sent")
         return False
     _ig_send_draft_line(sender_id, timestamp, IG_DRAFT_ACK_LINE, "DRAFT_ACK", "Acknowledgement")
@@ -7945,6 +8018,16 @@ def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: boo
     print(f"[INSTAGRAM-LEAD] {sender_id}'s answer waits for approval; founder notified, no pause")
 
 
+def _ig_founder_told(message: str, classification: str, reply: str, tag: str) -> bool:
+    """Does a founder notice go out with this AUTO reply — an ORDER /
+    RESTOCK heads-up (_ig_fyi_topic) or a LEAD notice (_ig_is_lead)? Only
+    then is a follow-up line like "they'll reply to you here" true, so the
+    output guard lets it through (rule 7, audit finding 6).
+
+    Shared with graph.py's route node so the two stay in parity."""
+    return bool(_ig_fyi_topic(message, tag)) or _ig_is_lead(message, classification, reply, tag)
+
+
 def _ig_fyi_topic(message: str, tag: str) -> str:
     """"ORDER" / "RESTOCK" when an AUTO Instagram reply needs a founder
     heads-up, else "". The model's tag decides; narrow regex backstops catch
@@ -7976,6 +8059,28 @@ def _ig_send_fyi(sender_id: str, text: str, reply: str, topic: str, sent: bool) 
         )
     except Exception as tg_err:
         print(f"[INSTAGRAM-TG] {topic} notice failed: {type(tg_err).__name__}: {tg_err}")
+
+
+def _ig_send_bulk_lead(sender_id: str, text: str, shown: str) -> None:
+    """🟢 LEAD notice for a question about 20+ trays / 200+ pairs, rate or
+    availability (pricing_rules.bulk_trays_asked; founder decision, 3 Oct
+    2026). Only tells the founder: the customer's reply is unchanged, and
+    it doesn't count as a founder notice for output-guard rule 7, so a
+    follow-up promise in that reply is still held. `shown` is what the
+    customer got. A bulk commit escalates instead and never gets here.
+
+    Shared with graph.py's dispatch_auto so the two stay in parity."""
+    if bulk_trays_asked(text) is None:
+        return
+    try:
+        send_telegram_notification(
+            "BULK", text, shown,
+            sender_info=f"Instagram DM — sender {sender_id}",
+            channel="Instagram",
+            customer_id=sender_id,
+        )
+    except Exception as tg_err:
+        print(f"[INSTAGRAM-TG] BULK lead notice failed: {type(tg_err).__name__}: {tg_err}")
 
 
 def _ig_rate_limited(sender_id: str, text: str, timestamp: str, limit: str) -> None:
@@ -8251,8 +8356,14 @@ def _process_instagram_event(event: dict) -> None:
         # Output guard (audit T1-4): an AUTO reply that trips a rule is held
         # for approval instead of sent — before the LEAD check, so a
         # tester's AUTO reply is guarded too (the draft branch below still
-        # sends their LEAD notice).
-        guard_note = _ig_output_guard(sender_id, classification, reply)
+        # sends their LEAD notice). It's told whether a founder notice goes
+        # out with the reply, which is what makes a follow-up line true
+        # (rule 7, audit finding 6).
+        tag = _parse_twin_tag(_raw)
+        guard_note = _ig_output_guard(
+            sender_id, classification, reply,
+            founder_notice=_ig_founder_told(text, classification, reply, tag),
+        )
         if guard_note:
             classification = "DRAFT+APPROVE"
 
@@ -8260,7 +8371,6 @@ def _process_instagram_event(event: dict) -> None:
         # their answer (or brain.md's invite / LEAD line), a LEAD notice and
         # no 4h lockout (audit T1-5) — unless something more serious (legal,
         # press, health, a prefilter hit) is going on; see _ig_is_lead.
-        tag = _parse_twin_tag(_raw)
         if _ig_is_lead(text, classification, reply, tag):
             _ig_lead(sender_id, text, timestamp, reply if classification == "AUTO" else "")
             return
@@ -8322,6 +8432,8 @@ def _process_instagram_event(event: dict) -> None:
             topic = _ig_fyi_topic(text, tag)
             if topic:
                 _ig_send_fyi(sender_id, text, reply, topic, sent)
+            # A 20+ tray question: a LEAD notice for the founder.
+            _ig_send_bulk_lead(sender_id, text, reply if sent else f"(send FAILED) {reply}")
 
         elif classification == "DRAFT+APPROVE":
             # Same buttoned approval flow WhatsApp uses, keyed on the IG
@@ -8356,6 +8468,9 @@ def _process_instagram_event(event: dict) -> None:
             # A tester whose answer waits for approval is still a LEAD: the
             # founder gets the LEAD notice too (audit finding #4).
             _ig_lead_draft_notice(sender_id, text, tag, handoff_sent)
+            # A 20+ tray question whose answer waits for approval is still
+            # a bulk lead.
+            _ig_send_bulk_lead(sender_id, text, "(waiting for your approval — see the 🟡 draft)")
             # Log the pending draft with a NULL reply — the draft text is never
             # stored here, so an un-approved draft can't appear in conversation
             # context as if the customer received it. _load_instagram_history

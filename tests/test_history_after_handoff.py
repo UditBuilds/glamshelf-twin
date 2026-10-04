@@ -56,7 +56,9 @@ LIVE_PRICES = {249, 299, 499, 599, 849}
 RETURN_MSG = "hi i want to return my GS2 tray, didnt like how it looks on me"
 RETURN_DRAFT = "We accept returns within 14 days of delivery — email glamshelfstore@gmail.com with your order ID 🤍"
 FOLLOW_UP = "ok so what do i do now?"
-FOLLOW_UP_REPLY = "The team has your return request and will reply to you here 🤍"
+# A plain answer: a follow-up promise ("the team will reply to you here")
+# on a plain AUTO reply is held by output guard rule 7 (finding 6).
+FOLLOW_UP_REPLY = "Just email glamshelfstore@gmail.com with your order ID to start the return 🤍"
 
 
 def model_output(classification, reply="", tag=""):
@@ -323,10 +325,14 @@ class AcknowledgementTest(HandlerTestCase):
         self.assertIn("Output guard held", self.drafts()[1]["text"])
 
     def test_the_acknowledgement_goes_through_the_output_guard(self):
-        self.assertEqual(glam.output_guard.check_reply(ACK, set(LIVE_PRICES)), [])
+        # The ack only ever goes out next to a founder draft (rule 7's
+        # founder_notice); without one its "the team will reply here" is held.
+        self.assertEqual(glam.output_guard.check_reply(ACK, set(LIVE_PRICES), founder_notice=True), [])
+        self.assertTrue(glam.output_guard.check_reply(ACK, set(LIVE_PRICES)))
         self.dm(RETURN_MSG, model_output("DRAFT+APPROVE", RETURN_DRAFT))
         real_check = glam.output_guard.check_reply
-        hold_the_ack = lambda reply, prices: ["rule 9 (test)"] if reply == ACK else real_check(reply, prices)
+        hold_the_ack = lambda reply, prices, **kw: (
+            ["rule 9 (test)"] if reply == ACK else real_check(reply, prices, **kw))
         with patch.object(glam.output_guard, "check_reply", hold_the_ack):
             out = self.dm(FOLLOW_UP, model_output("DRAFT+APPROVE", "Just email us your order ID 🤍"))
         self.assertEqual(self.sends, [HANDOFF])                    # held: nothing new sent

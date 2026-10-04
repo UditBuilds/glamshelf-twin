@@ -116,10 +116,6 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             "Sure thing — refunds are initiated within 24–48 hours once a return is received and "
             "approved, and reach UPI or bank accounts in 5–7 working days. Email glamshelfstore@gmail.com "
             "with your order ID and we'll get it started 🤍",
-            "We accept returns within 14 days of delivery, as long as the lashes are unused and in their "
-            "original packaging — refunds are initiated within 24–48 hours once we receive and approve "
-            "the return. Just email glamshelfstore@gmail.com with your order ID and the team will take it "
-            "from there 🤍",
             "Once a refund is approved, we initiate it within 24–48 hours — it reaches UPI/bank accounts "
             "in 5–7 working days and cards in 7–10 working days. If you share your order ID, I'll pass it "
             "to the team to check on yours 🤍",
@@ -154,6 +150,20 @@ class HonestPolicyStatementsAreSent(unittest.TestCase):
             "GS2 is ₹849 for a tray of 10 pairs — that works out to about ₹85 per pair, and each pair is "
             "reusable 5–7 times. Free shipping applies since it's above ₹799",
         ])
+
+
+class FollowUpPromiseHeldByRule7(unittest.TestCase):
+    def test_policy_statement_passes_rule_2_but_the_follow_up_promise_is_held(self):
+        # PR 47's first AFTER run. Rule 2 still approves the refund timeline;
+        # "the team will take it from there" is a follow-up promise on a plain
+        # AUTO reply, held by rule 7 since finding 6.
+        text = ("We accept returns within 14 days of delivery, as long as the lashes are unused and in "
+                "their original packaging — refunds are initiated within 24–48 hours once we receive and "
+                "approve the return. Just email glamshelfstore@gmail.com with your order ID and the team "
+                "will take it from there 🤍")
+        self.assertEqual(rule2(text), [])
+        self.assertEqual(output_guard.check_reply(text, LIVE_PRICES),
+                         ["rule 7 (follow-up promise): the team will take it from there"])
 
 
 class FalsePromisesStayHeld(unittest.TestCase):
