@@ -93,7 +93,9 @@ class PromptCarriesTheConversion(unittest.TestCase):
 
     def test_25_trays_gets_the_bulk_rate(self):
         prompt = glam.build_user_message("is 25 trays bulk?", "")
-        self.assertIn("25 trays. That is 20+ trays, so the ₹749/tray bulk rate applies.", prompt)
+        self.assertIn("25 trays. That is 20+ trays, so the ₹749/tray bulk rate applies. With the rate, "
+                      'say word for word: "and shipping is free, since an order that size is well above ₹799".',
+                      prompt)
 
     def test_the_note_sits_outside_the_customer_text(self):
         prompt = glam.build_user_message("need 20 pairs", "")
@@ -211,6 +213,59 @@ class FreeShippingThresholdOnly(unittest.TestCase):
 
     def test_threshold_less_claims_stay_held(self):
         for text in ("Orders ship free 🤍", "Free shipping kicks in soon 🤍", "Shipping is free on this one 🤍"):
+            with self.subTest(text=text):
+                self.assertIn("rule 2", " ".join(guard(text)))
+
+
+class BulkQuoteUsesTheApprovedLine(unittest.TestCase):
+    """"is 25 trays bulk?" (live test, 4 Oct 2026): the model wrote "shipping
+    is free at that size" and the guard held the answer, so the customer got
+    the handoff line. brain.md and the quantity note now give the line to use
+    word for word; the guard is unchanged."""
+
+    LINE = "and shipping is free, since an order that size is well above ₹799"
+
+    def test_the_output_contract_names_the_line(self):
+        rule = next(l for l in BRAIN.splitlines()
+                    if l.startswith("- **Bulk rate always ships with the free-shipping fact:**"))
+        self.assertIn(f'Say it in these words, word for word: "{self.LINE}"', rule)
+        self.assertIn('"shipping is free at that size"', rule)
+
+    def test_it_stays_english_in_a_hinglish_reply(self):
+        for start in ("- **Language mirroring:**", "- **Language:**"):
+            with self.subTest(start=start):
+                line = next(l for l in BRAIN.splitlines() if l.startswith(start))
+                self.assertIn("the bulk free-shipping line", line)
+
+    def test_qualifies_template(self):
+        heading = '**Bulk / MUA pricing — "is 25 trays bulk?" / "does 30 trays qualify?"'
+        self.assertIn("🟢 AUTO", next(l for l in BRAIN.splitlines() if l.startswith(heading)))
+        t = re.search(r'^> "(.+?)"$', BRAIN.split(heading, 1)[1], re.M).group(1)
+        self.assertEqual(t, "Yes — 25 trays qualifies for our bulk rate of ₹749/tray (20+ trays, 200+ pairs) — "
+                            f"{self.LINE} 🤍")
+        self.assertEqual(guard(t), [])
+
+    def test_every_bulk_quote_template_uses_the_line_and_is_sent(self):
+        quoted = [q for q in re.findall(r'^> "(.+?)"$', BRAIN, re.M) if "₹749/tray" in q]
+        self.assertGreaterEqual(len(quoted), 2)
+        for q in quoted:
+            with self.subTest(q=q):
+                self.assertIn(self.LINE, q)
+                self.assertEqual(guard(q), [])
+
+    def test_the_note_carries_the_line_only_for_20_plus_trays(self):
+        from pricing_rules import BULK_FREE_SHIPPING_LINE, bulk_quantity_note
+        self.assertEqual(BULK_FREE_SHIPPING_LINE, self.LINE)
+        self.assertIn(f'"{self.LINE}"', bulk_quantity_note("need 300 pairs, bulk rate?"))
+        self.assertNotIn("shipping", bulk_quantity_note("need 20 pairs"))
+        self.assertNotIn("shipping", bulk_quantity_note("3 trays for my salon"))
+
+    def test_the_live_wordings_are_still_held(self):
+        # The guard isn't loosened: these went to a draft before and still do.
+        for text in (
+            "Yes — 25 trays qualifies for our bulk rate of ₹749/tray, and shipping is free at that size 🤍",
+            "Yes, 25 trays qualifies for our bulk rate of ₹749/tray — and shipping is free 🤍",
+        ):
             with self.subTest(text=text):
                 self.assertIn("rule 2", " ".join(guard(text)))
 
