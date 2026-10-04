@@ -10,11 +10,11 @@ AI customer support agent for **The Glam Shelf**, a live Indian D2C false-eyelas
 
 Every incoming message on WhatsApp or Instagram is classified into one of three paths:
 
-**AUTO** — Routine questions the twin can answer confidently: pricing, shipping timelines, product recommendations, return policies, payment methods. The reply goes out immediately. No founder involvement.
+**AUTO** — Routine questions the twin can answer confidently: pricing, shipping timelines, product recommendations, payment methods. The reply goes out immediately. No founder involvement.
 
-**DRAFT+APPROVE** — The twin drafts a reply but isn't confident enough to send alone. The founder gets it on Telegram with one-tap buttons: ✅ Send, ✏️ Edit, or ⛔ Skip. The draft itself goes out only when the founder acts; meanwhile, on Instagram, the customer gets a short handoff line ("I've passed this to the team — they'll reply to you here 🤍").
+**DRAFT+APPROVE** — The twin drafts a reply but isn't confident enough to send alone, e.g. return and exchange requests, damaged or wrong items, payment taken with no order. The founder gets it on Telegram with one-tap buttons: ✅ Send, ✏️ Edit, or ⛔ Skip. The draft itself goes out only when the founder acts; meanwhile, on Instagram, the customer gets a short handoff line ("I've passed this to the team — they'll reply to you here 🤍").
 
-**ESCALATE** — Situations that need human judgment: refund disputes, damage claims, angry customers, legal threats, bulk negotiations. The founder is paged on Telegram and the twin pauses itself for that customer for 4 hours (lift it early from Telegram with ▶️ Resume bot or `#resume <id>`). On Instagram the customer gets the same handoff line — or, for an allergic reaction, advice to stop using the product and see a doctor — except legal threats and press enquiries, which get no automated reply. On WhatsApp a normal escalation sends nothing; a stock holding reply goes out only when the model's output was unusable.
+**ESCALATE** — Situations that need human judgment: refund complaints, legal threats, allergic reactions, press enquiries, abusive or repeatedly frustrated customers, and a customer placing a 20+ tray order or pushing below the price floor. The founder is paged on Telegram and the twin pauses itself for that customer for 4 hours (lift it early from Telegram with ▶️ Resume bot or `#resume <id>`). On Instagram the customer gets the same handoff line — or, for an allergic reaction, advice to stop using the product and see a doctor — except legal threats and press enquiries, which get no automated reply. On WhatsApp a normal escalation sends nothing; a stock holding reply goes out only when the model's output was unusable.
 
 People testing the assistant get their question answered like any customer's, or a one-line invite to ask one; anyone asking to get it for their own brand gets a friendly one-liner. Either way the founder gets a LEAD notice on Telegram, even when the answer waits for approval — and there's no pause.
 
@@ -22,7 +22,7 @@ People testing the assistant get their question answered like any customer's, or
 
 ## How it stays accurate
 
-The twin uses a **RAG retrieval layer** built on `fastembed` with ONNX embeddings. Behind every reply, it searches a per-SKU product knowledge base — materials, band types, lash lengths, care instructions — and injects relevant facts into the prompt before generating a response. This means the twin doesn't guess about product details. If a customer asks "are GS1 lashes suitable for hooded eyes?", it retrieves the actual GS1 specs and answers from real data, not training memory.
+The twin uses a **RAG retrieval layer** built on `fastembed` with ONNX embeddings, stored in SQLite with `sqlite-vec`. When a message mentions a product or policy topic, it retrieves the two closest chunks from the storefront's product descriptions and its returns, shipping and terms pages, and adds them to the prompt. Retrieved product text is marketing copy, so the prompt allows it for specs (pairs, length, style) only; `brain.md` stays the authority on everything else.
 
 Stock status and product descriptions come from the live Shopify storefront feed (cached for up to 5 minutes) and are injected into every call. Prices are quoted from `brain.md`; the live storefront prices feed the output guard instead, so a ₹ amount that doesn't match the store is held for the founder rather than sent.
 
@@ -48,7 +48,7 @@ Stock status and product descriptions come from the live Shopify storefront feed
 |-------|-----------|
 | App | Python (Flask + gunicorn) |
 | Hosting | Render |
-| Text replies | DeepSeek v3 |
+| Text replies | DeepSeek (`deepseek-chat`) |
 | Image understanding | Claude Sonnet on WhatsApp (reads order screenshots, eye photos). On Instagram Twin can't read photos yet: it asks for the customer's eye shape or the occasion instead and alerts the founder |
 | WhatsApp | WATI Business API (channel currently paused) |
 | Instagram | Meta Instagram Graph API |
