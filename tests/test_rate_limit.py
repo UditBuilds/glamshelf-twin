@@ -1,6 +1,6 @@
 """LLM rate limits (audit T1-3).
 
-  - per sender: 8 messages to the model per rolling 10 minutes, 40 per
+  - per sender: 15 messages to the model per rolling 10 minutes, 40 per
     IST calendar day; all senders: LLM_DAILY_CAP per IST day (default 500)
   - counted in the llm_usage SQLite table, so limits survive restarts
   - over a limit: one "Thanks! The team will reply to you here shortly."
@@ -81,18 +81,18 @@ class RateLimitTestCase(unittest.TestCase):
 
 
 class Admission(RateLimitTestCase):
-    def test_eight_per_ten_minutes_then_refused(self):
-        verdicts = [glam._llm_admission("Instagram", S1, now=NOW + i) for i in range(9)]
-        self.assertEqual(verdicts[:8], [None] * 8)
-        self.assertEqual(verdicts[8], glam.LIMIT_SENDER_WINDOW)
+    def test_fifteen_per_ten_minutes_then_refused(self):
+        verdicts = [glam._llm_admission("Instagram", S1, now=NOW + i) for i in range(16)]
+        self.assertEqual(verdicts[:15], [None] * 15)
+        self.assertEqual(verdicts[15], glam.LIMIT_SENDER_WINDOW)
 
     def test_refused_messages_are_not_counted(self):
-        for i in range(12):
+        for i in range(20):
             glam._llm_admission("Instagram", S1, now=NOW + i)
-        self.assertEqual(db_rows("SELECT COUNT(*) FROM llm_usage WHERE sender_id = ?", (S1,)), [(8,)])
+        self.assertEqual(db_rows("SELECT COUNT(*) FROM llm_usage WHERE sender_id = ?", (S1,)), [(15,)])
 
     def test_window_rolls_off_after_ten_minutes(self):
-        seed_usage(S1, [NOW - glam.RATE_LIMIT_WINDOW_SECONDS - 1 - i for i in range(8)])
+        seed_usage(S1, [NOW - glam.RATE_LIMIT_WINDOW_SECONDS - 1 - i for i in range(15)])
         self.assertIsNone(glam._llm_admission("Instagram", S1, now=NOW))
 
     def test_forty_per_ist_day(self):
@@ -106,10 +106,10 @@ class Admission(RateLimitTestCase):
         self.assertIsNone(glam._llm_admission("Instagram", S1, now=NOW))
 
     def test_one_sender_does_not_block_another(self):
-        for i in range(8):
+        for i in range(15):
             glam._llm_admission("Instagram", S1, now=NOW + i)
-        self.assertEqual(glam._llm_admission("Instagram", S1, now=NOW + 8), glam.LIMIT_SENDER_WINDOW)
-        self.assertIsNone(glam._llm_admission("Instagram", S2, now=NOW + 9))
+        self.assertEqual(glam._llm_admission("Instagram", S1, now=NOW + 15), glam.LIMIT_SENDER_WINDOW)
+        self.assertIsNone(glam._llm_admission("Instagram", S2, now=NOW + 16))
 
     def test_global_daily_cap_from_env_counts_both_channels(self):
         os.environ["LLM_DAILY_CAP"] = "3"
@@ -203,8 +203,8 @@ class OverLimitHandling(RateLimitTestCase):
 
 
 class EndToEnd(RateLimitTestCase):
-    """Ten quick messages from one sender: eight reach the model, the
-    ninth gets the notice, the tenth gets nothing."""
+    """Seventeen quick messages from one sender: fifteen reach the model,
+    the sixteenth gets the notice, the seventeenth gets nothing."""
 
     def setUp(self):
         super().setUp()
@@ -235,20 +235,25 @@ class EndToEnd(RateLimitTestCase):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            for i in range(10):
+            for i in range(17):
                 glam._process_instagram_event({
                     "sender": {"id": S1}, "recipient": {"id": "page"},
                     "timestamp": i, "message": {"mid": "", "text": f"question {i}"},
                 })
-        self.assertEqual(len(named(self.calls, "ask_claude")), 8)
+        self.assertEqual(len(named(self.calls, "ask_claude")), 15)
         sends = named(self.calls, "_send_instagram_reply")
-        self.assertEqual(len(sends), 9)
+        self.assertEqual(len(sends), 16)
         self.assertEqual(sends[-1][1], (S1, glam.RATE_LIMIT_NOTICE))
-        self.assertEqual(len(named(self.calls, "_telegram_api")), 1)
+        # Since audit finding 8: each refused message is forwarded to the
+        # founder (replacing the once-a-day sender alert).
+        forwards = named(self.calls, "_telegram_api")
+        self.assertEqual(len(forwards), 2)
+        self.assertIn('"question 15"', forwards[0][1][1]["text"])
+        self.assertIn('"question 16"', forwards[1][1][1]["text"])
         limited_rows = db_rows(
             "SELECT message_text, reply_text FROM instagram_logs WHERE source = 'RATE_LIMITED_IG' ORDER BY id"
         )
-        self.assertEqual(limited_rows, [("question 8", glam.RATE_LIMIT_NOTICE), ("question 9", None)])
+        self.assertEqual(limited_rows, [("question 15", glam.RATE_LIMIT_NOTICE), ("question 16", None)])
 
     def test_whatsapp(self):
         os.environ["WATI_WEBHOOK_VERIFY_DISABLED"] = "1"
@@ -268,15 +273,15 @@ class EndToEnd(RateLimitTestCase):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            for i in range(10):
+            for i in range(17):
                 resp = client.post("/webhook", json={
                     "type": "text", "waId": WA_ID, "senderName": "T",
                     "text": f"question {i}", "id": "",
                 })
                 self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(named(self.calls, "ask_claude")), 8)
+        self.assertEqual(len(named(self.calls, "ask_claude")), 15)
         sends = named(self.calls, "send_whatsapp_reply")
-        self.assertEqual(len(sends), 9)
+        self.assertEqual(len(sends), 16)
         self.assertEqual(sends[-1][1], (WA_ID, glam.RATE_LIMIT_NOTICE))
         self.assertEqual(
             db_rows("SELECT reply_text FROM message_logs WHERE status = 'RATE_LIMITED' ORDER BY id"),
