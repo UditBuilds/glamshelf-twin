@@ -408,9 +408,11 @@ def dispatch_draft(state: TwinState) -> TwinState:
     reply = state["reply"]
 
     app._ig_draft_handoff(sender_id, state.get("timestamp", ""))
+    # The username comes after the handoff line — same as production.
+    username = app._ig_username(sender_id)
     sent_with_buttons = app.send_draft_for_approval(
         customer_number=sender_id,
-        customer_name="",
+        customer_name=app._ig_profile_link(username) if username else "",
         customer_message=text,
         reply_text=reply,
         channel="Instagram",
@@ -421,7 +423,8 @@ def dispatch_draft(state: TwinState) -> TwinState:
         try:
             app.send_telegram_notification(
                 state["decision"], text, reply,
-                sender_info=f"Instagram DM — sender {sender_id}", channel="Instagram",
+                sender_info=f"Instagram DM — {app._ig_sender_label(sender_id)}",
+                channel="Instagram",
             )
         except Exception as tg_err:
             print(
