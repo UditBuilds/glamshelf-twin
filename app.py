@@ -1871,6 +1871,13 @@ def _init_db() -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scheduled_jobs (job TEXT PRIMARY KEY, last_run REAL NOT NULL)"
         )
+        # Instagram usernames for the founder's notices (_ig_username): a
+        # cache, so a sender is looked up at most once a week, or once an
+        # hour after a failed lookup (username NULL).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ig_usernames "
+            "(sender_id TEXT PRIMARY KEY, username TEXT, fetched_at REAL NOT NULL)"
+        )
         # Message ids Meta returned for Twin's Instagram sends, so their
         # echoes aren't mistaken for Udit's replies after a restart (audit
         # T2-11). Pruned after a week by _record_ig_sent_mid.
@@ -8123,6 +8130,89 @@ def instagram_webhook():
         return jsonify({"status": "ok"}), 200
 
 
+# Instagram usernames in the founder's notices (PR 5b). The numeric sender
+# id is all the webhook carries; Meta's User Profile API gives the
+# username of someone who has messaged the account. Looked up only when a
+# notice is built, which is always after the customer's reply went out, so
+# a slow or failed lookup can delay a notice but never a reply. At most
+# IG_USERNAME_TIMEOUT_SECONDS (less when the reply budget is nearly spent,
+# none at all under IG_USERNAME_MIN_BUDGET_SECONDS), cached in ig_usernames
+# for a week (an hour after a failure), and the notice falls back to the id
+# alone. Kill switch: IG_USERNAME_LOOKUP_DISABLED=1.
+IG_USERNAME_TIMEOUT_SECONDS = 3
+IG_USERNAME_MIN_BUDGET_SECONDS = 1
+IG_USERNAME_TTL_SECONDS = 7 * 24 * 60 * 60
+IG_USERNAME_RETRY_SECONDS = 60 * 60
+_IG_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+
+def _ig_username(sender_id: str) -> str:
+    """The sender's Instagram username, or "" when unknown. Never raises."""
+    if not sender_id or not sender_id.isdigit() or not INSTAGRAM_PAGE_ACCESS_TOKEN:
+        return ""
+    if (os.environ.get("IG_USERNAME_LOOKUP_DISABLED") or "").strip().lower() in ("1", "true", "yes"):
+        return ""
+    now = time.time()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT username, fetched_at FROM ig_usernames WHERE sender_id = ?", (sender_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[IG-USERNAME] Cache read failed for {sender_id}: {type(e).__name__}: {e}")
+        row = None
+    if row is not None:
+        username, fetched_at = row
+        if now - fetched_at < (IG_USERNAME_TTL_SECONDS if username else IG_USERNAME_RETRY_SECONDS):
+            return username or ""
+    if _budget_left() < IG_USERNAME_MIN_BUDGET_SECONDS:
+        print(f"[IG-USERNAME] No time left in the reply budget — {sender_id} shown by id")
+        return ""
+    username = ""
+    try:
+        resp = requests.get(
+            f"{INSTAGRAM_API_BASE}/{sender_id}",
+            params={"fields": "username", "access_token": INSTAGRAM_PAGE_ACCESS_TOKEN},
+            timeout=_budget_timeout(IG_USERNAME_TIMEOUT_SECONDS, floor=IG_USERNAME_MIN_BUDGET_SECONDS),
+        )
+        if resp.ok:
+            found = str((resp.json() or {}).get("username") or "")
+            if _IG_USERNAME_RE.fullmatch(found):
+                username = found
+            else:
+                print(f"[IG-USERNAME] No usable username for {sender_id}")
+        else:
+            print(f"[IG-USERNAME] Lookup for {sender_id}: HTTP {resp.status_code} "
+                  f"{_redact_secrets(resp.text[:200])}")
+    except Exception as e:
+        print(f"[IG-USERNAME] Lookup for {sender_id} failed: {type(e).__name__}: {_redact_secrets(e)}")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute(
+                "INSERT INTO ig_usernames (sender_id, username, fetched_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(sender_id) DO UPDATE SET username = excluded.username, "
+                "fetched_at = excluded.fetched_at",
+                (sender_id, username or None, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[IG-USERNAME] Cache write failed for {sender_id}: {type(e).__name__}: {e}")
+    return username
+
+
+def _ig_sender_label(sender_id: str) -> str:
+    """How the founder's notices name an Instagram sender: "@username
+    (sender 1784…)", or "sender 1784…" when the username isn't known."""
+    username = _ig_username(sender_id)
+    return f"@{username} (sender {sender_id})" if username else f"sender {sender_id}"
+
+
 def _ig_pipeline_failure(sender_id: str, text: str, timestamp: str, error: str) -> bool:
     """The reply pipeline failed for this Instagram DM — DeepSeek error or
     timeout, brain.md unreadable, unusable model output — with no
@@ -8348,7 +8438,7 @@ def _ig_escalate(
     try:
         send_telegram_notification(
             "ESCALATE", text, draft_reply,
-            sender_info=f"Instagram DM — sender {sender_id}",
+            sender_info=f"Instagram DM — {_ig_sender_label(sender_id)}",
             channel="Instagram",
             customer_id=sender_id,
             holding_reply_sent=sent,
@@ -8398,7 +8488,7 @@ def _ig_lead(sender_id: str, text: str, timestamp: str, reply: str) -> bool:
     try:
         send_telegram_notification(
             "LEAD", text, shown,
-            sender_info=f"Instagram DM — sender {sender_id}",
+            sender_info=f"Instagram DM — {_ig_sender_label(sender_id)}",
             channel="Instagram",
             customer_id=sender_id,
         )
@@ -8437,7 +8527,7 @@ def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: boo
     try:
         send_telegram_notification(
             "LEAD", text, shown,
-            sender_info=f"Instagram DM — sender {sender_id}",
+            sender_info=f"Instagram DM — {_ig_sender_label(sender_id)}",
             channel="Instagram",
             customer_id=sender_id,
         )
@@ -8503,7 +8593,7 @@ def _ig_send_bulk_lead(sender_id: str, text: str, shown: str) -> None:
     try:
         send_telegram_notification(
             "BULK", text, shown,
-            sender_info=f"Instagram DM — sender {sender_id}",
+            sender_info=f"Instagram DM — {_ig_sender_label(sender_id)}",
             channel="Instagram",
             customer_id=sender_id,
         )
@@ -8625,7 +8715,7 @@ def _ig_forward_to_founder(sender_id: str, text: str, headline: str, outcome: st
         "chat_id": TELEGRAM_CHAT_ID,
         "text": (
             f"{headline}\n\n"
-            f"From: Instagram DM — sender {sender_id}\n\n"
+            f"From: Instagram DM — {_ig_sender_label(sender_id)}\n\n"
             f"They said:\n\"{text}\"\n\n"
             f"{outcome}.\n"
             f"→ Reply from your Instagram DMs"
@@ -9096,8 +9186,6 @@ def _process_instagram_event(event: dict) -> None:
                 )
                 return
 
-        ig_sender_info = f"Instagram DM — sender {sender_id}"
-
         # Classification gate. AUTO ships the reply immediately;
         # DRAFT+APPROVE waits for a Telegram button tap; ESCALATE pages the
         # founder, pauses the thread and — unlike WhatsApp — sends the
@@ -9138,9 +9226,12 @@ def _process_instagram_event(event: dict) -> None:
             # notification if the buttoned send fails so Udit always gets
             # *some* heads-up about the pending draft.
             handoff_sent = _ig_draft_handoff(sender_id, timestamp)
+            # The username lookup comes after the handoff line, so it can't
+            # delay what the customer gets.
+            username = _ig_username(sender_id)
             sent_with_buttons = send_draft_for_approval(
                 customer_number=sender_id,
-                customer_name="",
+                customer_name=f"@{username}" if username else "",
                 customer_message=text,
                 reply_text=reply,
                 channel="Instagram",
@@ -9151,7 +9242,8 @@ def _process_instagram_event(event: dict) -> None:
                 try:
                     send_telegram_notification(
                         classification, text, reply,
-                        sender_info=ig_sender_info, channel="Instagram",
+                        sender_info=f"Instagram DM — {_ig_sender_label(sender_id)}",
+                        channel="Instagram",
                     )
                 except Exception as tg_err:
                     print(
