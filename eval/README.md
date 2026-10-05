@@ -152,6 +152,10 @@ It runs only on `founder-written` rows. The as-sent rows are degenerate in this 
 ideal *is* the recorded answer, so the judge would be comparing a string to itself and scoring
 a free Pass.
 
+The recorded answers (`actual_answer`) stay exactly as sent, so 7 of them quote prices that have
+since changed (trays at ₹699, free shipping above ₹699, older single-pair, duo and trio prices) — on
+purpose, since calibration grades those exact texts against the founder's verdicts.
+
 What calibration actually caught, in order:
 
 | Judge + rubric | Agreement with founder (26 labelled rows) |
