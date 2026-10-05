@@ -8575,13 +8575,14 @@ def _ig_send_fyi(sender_id: str, text: str, reply: str, topic: str, sent: bool) 
     answer (audit T1-6): an order / tracking / delivery question (Twin
     can't see orders) or a restock request (there's no waitlist). This is
     what makes "I've passed this to the team" true on an AUTO reply — the
-    reply still goes out immediately, nobody waits for an approval.
+    reply still goes out immediately, nobody waits for an approval. Called
+    after the reply's send, so the username lookup can't delay it.
 
     Shared with graph.py's dispatch_auto so the two stay in parity."""
     try:
         send_telegram_notification(
             topic, text, reply if sent else f"(send FAILED) {reply}",
-            sender_info=f"Instagram DM — sender {sender_id}",
+            sender_info=f"Instagram DM — {_ig_sender_label(sender_id)}",
             channel="Instagram",
             customer_id=sender_id,
         )
@@ -8863,10 +8864,11 @@ def _handle_instagram_photo(sender_id: str, timestamp: str) -> None:
     if not TELEGRAM_CHAT_ID:
         print("[INSTAGRAM] Photo notice skipped: TELEGRAM_CHAT_ID not set")
         return
+    # After the reply's send, so the username lookup can't delay it.
     _telegram_api("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": (
-            f"📷 Instagram photo from sender {sender_id}\n"
+            f"📷 Instagram photo from {_ig_sender_label(sender_id)}\n"
             f"Twin can't view photos, so it asked them for their eye shape "
             f"or the occasion{'' if sent else ' — but that reply FAILED to send'}.\n"
             f"Open the DM to see the photo."
@@ -8975,9 +8977,11 @@ def _handle_instagram_media(sender_id: str, kind: str, timestamp: str) -> None:
     if not TELEGRAM_CHAT_ID:
         print("[INSTAGRAM] Media notice skipped: TELEGRAM_CHAT_ID not set")
         return
+    # After the reply's send, so the username lookup can't delay it.
     _telegram_api("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": f"{icon} Instagram {what} from sender {sender_id}\n{outcome}.\nOpen the DM to see it.",
+        "text": (f"{icon} Instagram {what} from {_ig_sender_label(sender_id)}\n"
+                 f"{outcome}.\nOpen the DM to see it."),
     })
 
 

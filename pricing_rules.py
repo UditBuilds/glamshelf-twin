@@ -33,6 +33,9 @@ HARD_MONEY_THRESHOLD_INR = 1500
 # quantity in pairs is converted before any bulk decision (audit finding 3:
 # "20 pairs" got the 20+ tray quote).
 PAIRS_PER_TRAY = 10
+# brain.md's free-shipping line for a bulk quote (Output Contract), which
+# the model must use word for word.
+BULK_FREE_SHIPPING_LINE = "and shipping is free, since an order that size is well above ₹799"
 
 INTENT_ASK = "ask"
 INTENT_COMMIT = "commit"
@@ -178,7 +181,11 @@ def bulk_quantity_note(message: str) -> str:
     if pairs:
         line += " (trays come in 10 pairs each)"
     if total >= BULK_MIN_TRAYS:
-        verdict = f"That is 20+ trays, so the ₹{BULK_RATE_INR}/tray bulk rate applies."
+        # The free-shipping fact in brain.md's own words: the model's
+        # paraphrases ("shipping is free at that size") are held by the
+        # output guard (rule 2), which turns the answer into a handoff.
+        verdict = (f"That is 20+ trays, so the ₹{BULK_RATE_INR}/tray bulk rate applies. With the rate, "
+                   f"say word for word: \"{BULK_FREE_SHIPPING_LINE}\".")
     else:
         verdict = (f"That is under 20 trays (200 pairs), so the ₹{BULK_RATE_INR} bulk rate "
                    "does NOT apply — the regular tray price does.")
