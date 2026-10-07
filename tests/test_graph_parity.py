@@ -401,33 +401,42 @@ class GraphParityTestCase(unittest.TestCase):
         new = self._run("new", llm_response=maybe)
         self._assert_parity(old, new)
 
-    def test_empty_auto_reply_goes_to_the_founder_as_a_draft(self):
-        # Audit finding 1: the production handler never answers a message
-        # it processed with silence. An empty AUTO reply goes to the founder
-        # as a draft and the customer gets the handoff line — the same way
-        # an output-guard hold works.
-        #
-        # graph.py LAGS here by founder decision (it isn't live, and this
-        # fix doesn't touch it): its triage still drops the message. This is
-        # the one case where the two deliberately differ, so the new path's
-        # drop is recorded below instead of asserting parity.
-        empty = json.dumps({"classification": "AUTO", "reply": ""})
-        old = self._run("old", llm_response=empty)
-        (send,) = named(old, "_send_instagram_reply")
+    def _assert_empty_reply_drafted(self, calls):
+        """Audit finding 1's shape: the customer gets the handoff line, the
+        founder an empty draft, nothing is paused."""
+        (send,) = named(calls, "_send_instagram_reply")
         self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
-        (draft,) = named(old, "send_draft_for_approval")
+        (draft,) = named(calls, "send_draft_for_approval")
         self.assertEqual(draft[2]["customer_message"], MSG)
         self.assertEqual(draft[2]["reply_text"], "")
         self.assertEqual(draft[2]["channel"], "Instagram")
-        handoff_log, pending_log = named(old, "_log_instagram")
+        handoff_log, pending_log = named(calls, "_log_instagram")
         self.assertEqual(handoff_log[1], (SENDER, "", glam.BRAIN_HOLDING_LINE, str(TIMESTAMP)))
         self.assertEqual(handoff_log[2], {"source": "DRAFT_HANDOFF_IG"})
         self.assertEqual(pending_log[1], (SENDER, MSG, None, str(TIMESTAMP)))
         self.assertEqual(pending_log[2], {"source": "DRAFT_PENDING_IG"})
-        self.assertEqual(named(old, "_pause_number"), [])
+        self.assertEqual(named(calls, "_pause_number"), [])
+
+    def test_empty_auto_reply_goes_to_the_founder_as_a_draft(self):
+        # Audit finding 1: a processed message is never answered with
+        # silence. An empty AUTO reply goes to the founder as a draft and
+        # the customer gets the handoff line — the same way an output-guard
+        # hold works. graph.py's triage used to drop it; both now agree.
+        empty = json.dumps({"classification": "AUTO", "reply": ""})
+        old = self._run("old", llm_response=empty)
+        self._assert_empty_reply_drafted(old)
 
         new = self._run("new", llm_response=empty)
-        self.assertEqual([c for c in effects(new) if c[0] != "ask_claude"], [])  # graph.py: still dropped
+        self._assert_parity(old, new)
+
+    def test_empty_draft_reply_goes_to_the_founder_as_a_draft(self):
+        # Same rule for an empty DRAFT+APPROVE reply.
+        empty = json.dumps({"classification": "DRAFT+APPROVE", "reply": ""})
+        old = self._run("old", llm_response=empty)
+        self._assert_empty_reply_drafted(old)
+
+        new = self._run("new", llm_response=empty)
+        self._assert_parity(old, new)
 
     def test_fallback_holding_send_failure_still_pages(self):
         # If the holding line can't be delivered, the page must still fire

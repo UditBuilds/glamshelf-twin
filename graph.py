@@ -3,13 +3,15 @@
 This module makes the twin's implicit message pipeline EXPLICIT as a graph:
 
     intake -> retrieve -> hydrate -> generate -> triage -> dispatch_*
-       \\ (gate hit)                                 \\ (deliberately empty reply)
-        `-> END                                       `-> END
+       \\ (gate hit)
+        `-> END
 
 dispatch_* is dispatch_auto / _draft / _escalate / _lead, or
 dispatch_failure when the pipeline itself failed (LLM error, unusable
 output) with no escalation signal: the customer still gets the brain's
-holding line (audit T1-8).
+holding line (audit T1-8). Every message that reaches triage is
+dispatched — an empty AUTO or DRAFT+APPROVE reply goes to the founder as
+a draft (audit finding 1), as in production.
 
 Every node DELEGATES to the existing production function in app.py — the
 RAG layer, the brain.md prompt assembly, the DeepSeek call, the prefilters,
@@ -92,7 +94,7 @@ class TwinState(TypedDict, total=False):
     reply: str               # drafted customer-facing text
 
     # -- triage --
-    decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL | DROP (final)
+    decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL (final)
     tag: str       # the model's optional JSON "tag" (LEAD/SAFETY/LEGAL/PRESS/ORDER/RESTOCK), "" if none
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
     pipeline_error: str  # hydrate/generate failure detail (routing + audit)
@@ -269,13 +271,13 @@ def triage(state: TwinState) -> TwinState:
     for >=20 trays, or a committed amount over the Rs.1,500 Hard Money
     Threshold, via resolve_pricing_action).
 
-    Empty classification/reply drops with no dispatch — EXCEPT when the
-    verdict is ESCALATE. Founder decision (July 17, 2026): an escalation
+    An empty classification/reply never drops the message. An ESCALATE
+    verdict survives it — founder decision (July 17, 2026): an escalation
     verdict must survive regardless of what happens downstream, so an
     ESCALATE with unusable reply text (JSON parse failure, empty reply
-    field, or a failed LLM call after a prefilter hit) still escalates
-    instead of dropping; dispatch_escalate decides what the customer gets
-    (holding line, safety line, or silence for legal/press). Production
+    field, or a failed LLM call after a prefilter hit) still escalates;
+    dispatch_escalate decides what the customer gets (holding line, safety
+    line, or silence for legal/press). Production
     (_process_instagram_event) implements the same rule — parity holds.
 
     A tester / brand owner / question about the AI service decides LEAD
@@ -284,8 +286,9 @@ def triage(state: TwinState) -> TwinState:
 
     Without an escalation verdict, a pipeline failure or an unusable
     classification routes to FAIL -> dispatch_failure (holding line +
-    founder alert, audit T1-8); only a deliberately empty AUTO / DRAFT
-    reply drops.
+    founder alert, audit T1-8), and an empty AUTO / DRAFT+APPROVE reply
+    decides DRAFT+APPROVE -> dispatch_draft: the founder gets it as a draft
+    and the customer the handoff line (audit finding 1), as in production.
     """
     classification = state.get("llm_classification", "")
     reply = state.get("reply", "")
@@ -344,12 +347,18 @@ def triage(state: TwinState) -> TwinState:
             # line + founder alert, same as production (audit T1-8).
             return {"decision": "FAIL", "failure_detail": state.get("failure_detail", "")}
         if classification in ("AUTO", "DRAFT+APPROVE"):
-            # A deliberately empty reply (brain.md's stay-silent rule).
+            # Never silence (audit finding 1): an empty reply goes to the
+            # founder as a draft, the same way an output-guard hold does,
+            # and the customer gets the handoff line (or, inside its
+            # window, the one-time acknowledgement) — same as production.
             print(
-                f"[INSTAGRAM] Twin returned empty result "
-                f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                f"[INSTAGRAM] Twin returned an empty {classification} reply for "
+                f"{state['sender_id']} — sending the message to the founder as a draft"
             )
-            return {"decision": "DROP"}
+            return {
+                "decision": "DRAFT+APPROVE", "reply": "", "fallback_escalation": False,
+                "tag": tag, "guard_note": guard_note,
+            }
         print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
         return {
             "decision": "FAIL",
@@ -501,6 +510,7 @@ def _route_after_hydrate(state: TwinState) -> str:
 
 
 def _route_after_triage(state: TwinState) -> str:
+    # triage always decides; "drop" (-> END) only guards an unexpected value.
     return {
         "AUTO": "auto",
         "DRAFT+APPROVE": "draft",

@@ -9185,8 +9185,7 @@ def _process_instagram_event(event: dict) -> None:
                 # founder as a draft, the same way an output-guard hold does,
                 # and the customer gets the handoff line (or, inside its
                 # window, the one-time acknowledgement) — see
-                # _ig_draft_handoff. Instagram handler only: graph.py's
-                # triage still drops it.
+                # _ig_draft_handoff. graph.py's triage does the same.
                 print(
                     f"[INSTAGRAM] Twin returned an empty {classification} reply for "
                     f"{sender_id} — sending the message to the founder as a draft"
