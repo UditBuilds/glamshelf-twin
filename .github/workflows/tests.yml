@@ -14,8 +14,16 @@ concurrency:
 
 jobs:
   test:
+    # The suite runs on both Instagram reply paths: "0" is the legacy
+    # handler (production's default), "1" hands text DMs to graph.py.
+    name: test (TWIN_USE_LANGGRAPH=${{ matrix.twin_use_langgraph }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      # Both results are needed: one failing leg must not cancel the other.
+      fail-fast: false
+      matrix:
+        twin_use_langgraph: ["0", "1"]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -52,4 +60,6 @@ jobs:
           HTTP_PROXY: http://127.0.0.1:9
           HTTPS_PROXY: http://127.0.0.1:9
           NO_PROXY: localhost,127.0.0.1
+          # Which reply path answers Instagram text DMs (the matrix above).
+          TWIN_USE_LANGGRAPH: ${{ matrix.twin_use_langgraph }}
         run: python -m unittest discover tests
