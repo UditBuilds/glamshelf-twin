@@ -42,12 +42,25 @@ langgraph-glamshelf-twin.md):
     deterministic floors that can only tighten the LLM's call, never
     loosen it.
 
-  * One deliberate ordering difference from draft_reply_logic: there the
-    prefilters are COMPUTED before the LLM call and APPLIED after; here
-    both happen in the triage node (after generate). Both prefilters are
-    pure functions of the message text plus one env flag read per call,
-    so the result is identical — moving them keeps every classification
-    decision in a single node instead of smearing triage across two.
+  * Two deliberate ordering differences from draft_reply_logic:
+
+    - The prefilters. There they are COMPUTED before the LLM call and
+      APPLIED after; here both happen in the triage node (after generate).
+      Both prefilters are pure functions of the message text plus one env
+      flag read per call, so the result is identical — moving them keeps
+      every classification decision in a single node instead of smearing
+      triage across two.
+
+    - The RAG lookup. There _rag_retrieve runs last, after the brain.md
+      check, the brain, live inventory and live policies; here the retrieve
+      node runs before hydrate. The prompt is the same. What differs: when
+      brain.md is missing or unreadable, the graph still runs a lookup (up
+      to RAG_RETRIEVAL_TIMEOUT_SECONDS; it updates the RAG health record,
+      and a failed one may start the RAG alert check) where production
+      stops first — the customer and founder get the same either way — and
+      the log lines come out in a different order. The reply budget doesn't
+      change anything: the Shopify calls and the lookup each keep their
+      full cap in either order. Founder decision (7 Oct 2026): keep it.
 """
 
 import json
