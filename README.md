@@ -1,5 +1,7 @@
 # Glam Shelf Twin
 
+[![Tests](https://github.com/UditBuilds/glamshelf-twin/actions/workflows/tests.yml/badge.svg)](https://github.com/UditBuilds/glamshelf-twin/actions/workflows/tests.yml)
+
 AI customer support agent for **The Glam Shelf**, a live Indian D2C false-eyelash brand. It handles real customer conversations on Instagram — replies automatically where it can and flags the founder when it can't, answering from per-SKU product data.
 
 **Channel status:** Instagram is live. The WhatsApp channel (via WATI) is built but **currently paused**.
