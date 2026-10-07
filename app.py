@@ -9593,6 +9593,43 @@ def _use_langgraph() -> bool:
     return _twin_graph is not None
 
 
+_twin_graph_error = None   # why graph.py didn't load, for the keyed /healthz
+
+
+def _load_twin_graph() -> None:
+    """Startup only (called just below, the last thing this module does
+    before the __main__ block): import graph.py when TWIN_USE_LANGGRAPH is
+    ON. Never raises. If graph.py or langgraph fails to import for any
+    reason, the error goes to the log and the keyed /healthz, Instagram
+    replies stay on the legacy path, and startup carries on.
+
+    graph.py does `import app`. Under gunicorn this module IS sys.modules
+    ["app"], so that import returns it. Under `python app.py` this module is
+    __main__, and the import would load a second copy of app.py: a second
+    DB init, backup loop and embedding model, with its own _seen_ids and
+    reply budget, which graph nodes would then use. So this module is
+    registered as "app" first."""
+    global _twin_graph, _twin_graph_error
+    if not _langgraph_flag_on():
+        return
+    try:
+        sys.modules.setdefault("app", sys.modules[__name__])
+        import graph
+    except Exception as e:
+        _twin_graph_error = f"{type(e).__name__}: {e}"
+        print("=" * 60)
+        print(f"[LANGGRAPH] TWIN_USE_LANGGRAPH=1 but graph.py FAILED to load: {_twin_graph_error}")
+        print("[LANGGRAPH] Instagram replies stay on the legacy path (see the keyed /healthz)")
+        traceback.print_exc()
+        print("=" * 60)
+        return
+    _twin_graph = graph
+    print("[LANGGRAPH] TWIN_USE_LANGGRAPH=1: graph.py answers Instagram text DMs")
+
+
+_load_twin_graph()
+
+
 if __name__ == "__main__":
     # Local dev entry point — Render uses gunicorn (see Procfile) and never hits this block.
     port = int(os.environ.get("PORT", 5000))
