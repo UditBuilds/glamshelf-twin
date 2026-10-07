@@ -8598,7 +8598,8 @@ def _ig_send_bulk_lead(sender_id: str, text: str, shown: str) -> None:
     follow-up promise in that reply is still held. `shown` is what the
     customer got. A bulk commit escalates instead and never gets here.
 
-    Shared with graph.py's dispatch_auto so the two stay in parity."""
+    Shared with graph.py's dispatch_auto and dispatch_draft so the two
+    stay in parity."""
     if bulk_trays_asked(text) is None:
         return
     try:

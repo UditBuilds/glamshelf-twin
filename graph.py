@@ -409,8 +409,9 @@ def dispatch_auto(state: TwinState) -> TwinState:
 def dispatch_draft(state: TwinState) -> TwinState:
     """DRAFT+APPROVE: the customer gets the handoff line (app._ig_draft_handoff,
     audit T2-14) and the founder a buttoned Telegram approval, plus a LEAD
-    notice when a tester's answer is the one waiting (audit finding 4); the
-    drafted reply itself doesn't reach the customer here. Same calls in the
+    notice when a tester's answer is the one waiting (audit finding 4) and
+    a bulk LEAD notice for a 20+ tray question; the drafted reply itself
+    doesn't reach the customer here. Same calls in the
     same order as production's draft branch. The approval continuation
     (pending_drafts table + /telegram-callback) lives outside the graph —
     see the Obsidian note on why this isn't a LangGraph interrupt()."""
@@ -445,6 +446,9 @@ def dispatch_draft(state: TwinState) -> TwinState:
     # A tester whose answer waits for approval is still a LEAD — same
     # helper as production, told whether the handoff line went out now.
     app._ig_lead_draft_notice(sender_id, text, state.get("tag", ""), handoff_sent)
+    # A 20+ tray question whose answer waits for approval is still a bulk
+    # lead — same helper as production.
+    app._ig_send_bulk_lead(sender_id, text, "(waiting for your approval — see the 🟡 draft)")
     app._log_instagram(sender_id, text, None, state.get("timestamp", ""), source="DRAFT_PENDING_IG")
     print(f"[INSTAGRAM-DRAFT] Notified founder for {sender_id} (buttons={sent_with_buttons})")
 

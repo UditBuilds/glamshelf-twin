@@ -10,7 +10,8 @@ first, so a test can't pass because both sides are wrong the same way.
 Recorded effects: ask_claude (LLM call incl. the fully assembled system
 prompt), _send_instagram_reply, send_draft_for_approval,
 send_telegram_notification, _pause_number, _log_instagram,
-_persist_seen_id, _alert_send_failure.
+_persist_seen_id, _alert_send_failure, _ig_rate_limited, _ig_unanswered,
+_ig_username (the Graph API username lookup).
 
 The escalation prefilters (_escalation_prefilter_hit,
 _bulk_commit_prefilter_hit) are deliberately NOT stubbed — they are pure
@@ -71,6 +72,9 @@ EFFECT_FNS = {
     "_alert_send_failure",
     "_ig_rate_limited",
     "_ig_unanswered",
+    # A Graph API call in production; recording it pins the draft branch's
+    # order (handoff line, then username, then the draft).
+    "_ig_username",
 }
 
 
@@ -141,6 +145,7 @@ class GraphParityTestCase(unittest.TestCase):
             patch.object(glam, "_rag_retrieve", recorder("_rag_retrieve", CANNED_RAG)),
             patch.object(glam, "ask_claude", recorder("ask_claude", llm_response, exc=llm_exception)),
             patch.object(glam, "_send_instagram_reply", recorder("_send_instagram_reply", send_result)),
+            patch.object(glam, "_ig_username", recorder("_ig_username", "")),
             patch.object(glam, "send_draft_for_approval", recorder("send_draft_for_approval", buttons_ok)),
             patch.object(glam, "send_telegram_notification", recorder("send_telegram_notification")),
             patch.object(glam, "_pause_number", recorder("_pause_number")),
@@ -602,6 +607,59 @@ class GraphParityTestCase(unittest.TestCase):
 
         new = self._run(
             "new", llm_response=self._tester_draft("LEAD"), message=msg, handoff_window=True)
+        self._assert_parity(old, new)
+
+    # ---- a 20+ tray question whose answer waits for approval ----
+
+    BULK_WAITING = "(waiting for your approval — see the 🟡 draft)"
+
+    def test_drafted_bulk_question_gets_the_bulk_notice(self):
+        # A question, not a commit: the bulk-commit prefilter would
+        # escalate a commit instead.
+        msg = "whats ur rate for 30 trays of GS2?"
+        self.assertEqual(glam.bulk_trays_asked(msg), 30)
+        self.assertIsNone(glam._bulk_commit_prefilter_hit(msg))
+        bulk = json.dumps({"classification": "DRAFT+APPROVE", "reply": "Let me check GS2 stock for 30 trays 🤍"})
+        old = self._run("old", llm_response=bulk, message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
+        self.assertEqual(len(named(old, "send_draft_for_approval")), 1)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1], ("BULK", msg, self.BULK_WAITING))
+        self.assertEqual(tg[2]["customer_id"], SENDER)
+        self.assertEqual(named(old, "_log_instagram")[-1][2], {"source": "DRAFT_PENDING_IG"})
+        self.assertEqual(named(old, "_pause_number"), [])
+
+        new = self._run("new", llm_response=bulk, message=msg)
+        self._assert_parity(old, new)
+
+    def test_draft_branch_calls_happen_in_the_live_order(self):
+        # Every notice at once — a tester asking about 30 trays, buttons
+        # failing — so parity pins the whole draft branch's order: handoff
+        # line, username, draft, plain fallback, LEAD, BULK, pending row.
+        # Each notice looks up the sender's username for its label.
+        msg = "udit asked me to test ur bot — whats the rate for 30 trays?"
+        old = self._run("old", llm_response=self._tester_draft(""), message=msg, buttons_ok=False)
+        self.assertEqual(
+            [c[0] for c in effects(old)],
+            [
+                "ask_claude",
+                "_send_instagram_reply", "_log_instagram",   # handoff line
+                "_ig_username",
+                "send_draft_for_approval",
+                "_ig_username", "send_telegram_notification",  # plain fallback
+                "_ig_username", "send_telegram_notification",  # LEAD
+                "_ig_username", "send_telegram_notification",  # BULK
+                "_log_instagram",                              # DRAFT_PENDING_IG
+            ],
+        )
+        fallback, lead, bulk = named(old, "send_telegram_notification")
+        self.assertEqual(fallback[1][0], "DRAFT+APPROVE")
+        self.assertEqual(lead[1], ("LEAD", msg, glam.BRAIN_HOLDING_LINE))
+        self.assertEqual(bulk[1], ("BULK", msg, self.BULK_WAITING))
+        self.assertEqual(named(old, "_log_instagram")[-1][2], {"source": "DRAFT_PENDING_IG"})
+
+        new = self._run("new", llm_response=self._tester_draft(""), message=msg, buttons_ok=False)
         self._assert_parity(old, new)
 
     # ---- order / restock heads-up on AUTO replies (audit T1-6) ----
