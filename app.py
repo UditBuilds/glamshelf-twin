@@ -6530,6 +6530,10 @@ def healthz():
         # fallback counts as healthy. Keyed view only — the public answer
         # never turns 503 over RAG.
         "rag": _rag_health(),
+        # Which pipeline answers Instagram text DMs (TWIN_USE_LANGGRAPH), and
+        # why graph.py didn't load when the flag is ON but it failed.
+        "reply_path": "langgraph" if _use_langgraph() else "legacy",
+        **({"langgraph_error": _twin_graph_error} if _twin_graph_error else {}),
         "total_logged": total_logged,
         "total_orders": total_orders,
         "total_instagram": total_instagram,
@@ -9112,6 +9116,16 @@ def _process_instagram_event(event: dict) -> None:
             _handle_instagram_media(sender_id, media, timestamp)
             return
 
+        # TWIN_USE_LANGGRAPH=1: graph.py answers the text DM from here on,
+        # starting at the rate limit below. gates_done, because the gates
+        # above already ran: graph.py repeating the dedup check would drop
+        # the message as its own duplicate.
+        if _use_langgraph():
+            _twin_graph.handle_instagram_message(
+                sender_id, text, msg_id=msg_id, timestamp=timestamp, gates_done=True,
+            )
+            return
+
         # LLM rate limits (audit T1-3) — after the takeover gates, so a
         # paused or human-handled sender never uses budget or gets a notice.
         limit = _llm_admission("Instagram", sender_id)
@@ -9568,6 +9582,66 @@ def dashboard_data():
         print(f"[DASHBOARD] error: {type(e).__name__}: {e}")
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+# ===== LangGraph reply path (TWIN_USE_LANGGRAPH) =====
+#
+# graph.py runs the Instagram text pipeline as a LangGraph graph whose nodes
+# call this module's functions. TWIN_USE_LANGGRAPH=1 makes
+# _process_instagram_event hand a text DM to it, after the handler's own
+# gates and media handling. OFF is the default: graph and langgraph are then
+# never imported, and the live path only asks _use_langgraph(), which says no.
+_twin_graph = None   # the graph module, once loaded at startup
+
+
+def _langgraph_flag_on() -> bool:
+    """TWIN_USE_LANGGRAPH is ON only when it is exactly "1"; unset or any
+    other value is OFF. Read at startup, never per message."""
+    return os.environ.get("TWIN_USE_LANGGRAPH") == "1"
+
+
+def _use_langgraph() -> bool:
+    """Does graph.py answer Instagram text DMs? Only when the flag is ON and
+    graph.py loaded. The one switch on the live path; tests patch it to pin
+    either path."""
+    return _twin_graph is not None
+
+
+_twin_graph_error = None   # why graph.py didn't load, for the keyed /healthz
+
+
+def _load_twin_graph() -> None:
+    """Startup only (called just below, the last thing this module does
+    before the __main__ block): import graph.py when TWIN_USE_LANGGRAPH is
+    ON. Never raises. If graph.py or langgraph fails to import for any
+    reason, the error goes to the log and the keyed /healthz, Instagram
+    replies stay on the legacy path, and startup carries on.
+
+    graph.py does `import app`. Under gunicorn this module IS sys.modules
+    ["app"], so that import returns it. Under `python app.py` this module is
+    __main__, and the import would load a second copy of app.py: a second
+    DB init, backup loop and embedding model, with its own _seen_ids and
+    reply budget, which graph nodes would then use. So this module is
+    registered as "app" first."""
+    global _twin_graph, _twin_graph_error
+    if not _langgraph_flag_on():
+        return
+    try:
+        sys.modules.setdefault("app", sys.modules[__name__])
+        import graph
+    except Exception as e:
+        _twin_graph_error = f"{type(e).__name__}: {e}"
+        print("=" * 60)
+        print(f"[LANGGRAPH] TWIN_USE_LANGGRAPH=1 but graph.py FAILED to load: {_twin_graph_error}")
+        print("[LANGGRAPH] Instagram replies stay on the legacy path (see the keyed /healthz)")
+        traceback.print_exc()
+        print("=" * 60)
+        return
+    _twin_graph = graph
+    print("[LANGGRAPH] TWIN_USE_LANGGRAPH=1: graph.py answers Instagram text DMs")
+
+
+_load_twin_graph()
 
 
 if __name__ == "__main__":
