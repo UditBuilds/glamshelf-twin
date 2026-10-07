@@ -8519,7 +8519,7 @@ def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: boo
     the customer actually got. Same signals as _ig_is_lead (the LEAD tag or
     the _LEAD_RE backstop), and the same serious signals outrank it.
 
-    Instagram handler only — graph.py's dispatch_draft doesn't call it."""
+    Shared with graph.py's dispatch_draft so the two stay in parity."""
     if tag != "LEAD" and not _LEAD_RE.search(text or ""):
         return
     if _escalation_prefilter_hit(text) or _bulk_commit_prefilter_hit(text) is not None:
@@ -8598,7 +8598,8 @@ def _ig_send_bulk_lead(sender_id: str, text: str, shown: str) -> None:
     follow-up promise in that reply is still held. `shown` is what the
     customer got. A bulk commit escalates instead and never gets here.
 
-    Shared with graph.py's dispatch_auto so the two stay in parity."""
+    Shared with graph.py's dispatch_auto and dispatch_draft so the two
+    stay in parity."""
     if bulk_trays_asked(text) is None:
         return
     try:
@@ -9185,8 +9186,7 @@ def _process_instagram_event(event: dict) -> None:
                 # founder as a draft, the same way an output-guard hold does,
                 # and the customer gets the handoff line (or, inside its
                 # window, the one-time acknowledgement) — see
-                # _ig_draft_handoff. Instagram handler only: graph.py's
-                # triage still drops it.
+                # _ig_draft_handoff. graph.py's triage does the same.
                 print(
                     f"[INSTAGRAM] Twin returned an empty {classification} reply for "
                     f"{sender_id} — sending the message to the founder as a draft"

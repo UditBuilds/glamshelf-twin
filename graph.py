@@ -3,13 +3,15 @@
 This module makes the twin's implicit message pipeline EXPLICIT as a graph:
 
     intake -> retrieve -> hydrate -> generate -> triage -> dispatch_*
-       \\ (gate hit)                                 \\ (deliberately empty reply)
-        `-> END                                       `-> END
+       \\ (gate hit)
+        `-> END
 
 dispatch_* is dispatch_auto / _draft / _escalate / _lead, or
 dispatch_failure when the pipeline itself failed (LLM error, unusable
 output) with no escalation signal: the customer still gets the brain's
-holding line (audit T1-8).
+holding line (audit T1-8). Every message that reaches triage is
+dispatched — an empty AUTO or DRAFT+APPROVE reply goes to the founder as
+a draft (audit finding 1), as in production.
 
 Every node DELEGATES to the existing production function in app.py — the
 RAG layer, the brain.md prompt assembly, the DeepSeek call, the prefilters,
@@ -40,12 +42,28 @@ langgraph-glamshelf-twin.md):
     deterministic floors that can only tighten the LLM's call, never
     loosen it.
 
-  * One deliberate ordering difference from draft_reply_logic: there the
-    prefilters are COMPUTED before the LLM call and APPLIED after; here
-    both happen in the triage node (after generate). Both prefilters are
-    pure functions of the message text plus one env flag read per call,
-    so the result is identical — moving them keeps every classification
-    decision in a single node instead of smearing triage across two.
+  * Two deliberate ordering differences from draft_reply_logic:
+
+    - The prefilters. There they are COMPUTED before the LLM call and
+      APPLIED after; here both happen in the triage node (after generate).
+      Both prefilters are pure functions of the message text plus one env
+      flag read per call, so the result is identical — moving them keeps
+      every classification decision in a single node instead of smearing
+      triage across two.
+
+    - The RAG lookup. There _rag_retrieve runs last, after the brain.md
+      check, the brain, live inventory and live policies; here the retrieve
+      node runs before hydrate. The prompt is the same. What differs: when
+      brain.md is missing or unreadable, the graph still runs a lookup (up
+      to RAG_RETRIEVAL_TIMEOUT_SECONDS; it updates the RAG health record,
+      and a failed one may start the RAG alert check) where production
+      stops first — the customer and founder get the same either way — and
+      the log lines come out in a different order. For a message handled
+      on its own, the Shopify calls and the lookup each keep their full cap
+      in either order. But one webhook request runs all its events under
+      one reply budget, so for a later event in a multi-event request the
+      order decides which call a nearly spent budget cuts short. Founder
+      decision (7 Oct 2026): keep it.
 """
 
 import json
@@ -92,7 +110,7 @@ class TwinState(TypedDict, total=False):
     reply: str               # drafted customer-facing text
 
     # -- triage --
-    decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL | DROP (final)
+    decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL (final)
     tag: str       # the model's optional JSON "tag" (LEAD/SAFETY/LEGAL/PRESS/ORDER/RESTOCK), "" if none
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
     pipeline_error: str  # hydrate/generate failure detail (routing + audit)
@@ -269,13 +287,13 @@ def triage(state: TwinState) -> TwinState:
     for >=20 trays, or a committed amount over the Rs.1,500 Hard Money
     Threshold, via resolve_pricing_action).
 
-    Empty classification/reply drops with no dispatch — EXCEPT when the
-    verdict is ESCALATE. Founder decision (July 17, 2026): an escalation
+    An empty classification/reply never drops the message. An ESCALATE
+    verdict survives it — founder decision (July 17, 2026): an escalation
     verdict must survive regardless of what happens downstream, so an
     ESCALATE with unusable reply text (JSON parse failure, empty reply
-    field, or a failed LLM call after a prefilter hit) still escalates
-    instead of dropping; dispatch_escalate decides what the customer gets
-    (holding line, safety line, or silence for legal/press). Production
+    field, or a failed LLM call after a prefilter hit) still escalates;
+    dispatch_escalate decides what the customer gets (holding line, safety
+    line, or silence for legal/press). Production
     (_process_instagram_event) implements the same rule — parity holds.
 
     A tester / brand owner / question about the AI service decides LEAD
@@ -284,8 +302,9 @@ def triage(state: TwinState) -> TwinState:
 
     Without an escalation verdict, a pipeline failure or an unusable
     classification routes to FAIL -> dispatch_failure (holding line +
-    founder alert, audit T1-8); only a deliberately empty AUTO / DRAFT
-    reply drops.
+    founder alert, audit T1-8), and an empty AUTO / DRAFT+APPROVE reply
+    decides DRAFT+APPROVE -> dispatch_draft: the founder gets it as a draft
+    and the customer the handoff line (audit finding 1), as in production.
     """
     classification = state.get("llm_classification", "")
     reply = state.get("reply", "")
@@ -344,12 +363,18 @@ def triage(state: TwinState) -> TwinState:
             # line + founder alert, same as production (audit T1-8).
             return {"decision": "FAIL", "failure_detail": state.get("failure_detail", "")}
         if classification in ("AUTO", "DRAFT+APPROVE"):
-            # A deliberately empty reply (brain.md's stay-silent rule).
+            # Never silence (audit finding 1): an empty reply goes to the
+            # founder as a draft, the same way an output-guard hold does,
+            # and the customer gets the handoff line (or, inside its
+            # window, the one-time acknowledgement) — same as production.
             print(
-                f"[INSTAGRAM] Twin returned empty result "
-                f"(classification={classification!r}, reply_len={len(reply)}); not sending"
+                f"[INSTAGRAM] Twin returned an empty {classification} reply for "
+                f"{state['sender_id']} — sending the message to the founder as a draft"
             )
-            return {"decision": "DROP"}
+            return {
+                "decision": "DRAFT+APPROVE", "reply": "", "fallback_escalation": False,
+                "tag": tag, "guard_note": guard_note,
+            }
         print(f"[INSTAGRAM] Unusable model output (classification={classification!r})")
         return {
             "decision": "FAIL",
@@ -399,15 +424,18 @@ def dispatch_auto(state: TwinState) -> TwinState:
 
 def dispatch_draft(state: TwinState) -> TwinState:
     """DRAFT+APPROVE: the customer gets the handoff line (app._ig_draft_handoff,
-    audit T2-14) and the founder a buttoned Telegram approval; the drafted
-    reply itself doesn't reach the customer here. The approval continuation
+    audit T2-14) and the founder a buttoned Telegram approval, plus a LEAD
+    notice when a tester's answer is the one waiting (audit finding 4) and
+    a bulk LEAD notice for a 20+ tray question; the drafted reply itself
+    doesn't reach the customer here. Same calls in the
+    same order as production's draft branch. The approval continuation
     (pending_drafts table + /telegram-callback) lives outside the graph —
     see the Obsidian note on why this isn't a LangGraph interrupt()."""
     sender_id = state["sender_id"]
     text = state["text"]
     reply = state["reply"]
 
-    app._ig_draft_handoff(sender_id, state.get("timestamp", ""))
+    handoff_sent = app._ig_draft_handoff(sender_id, state.get("timestamp", ""))
     # The username comes after the handoff line — same as production.
     username = app._ig_username(sender_id)
     sent_with_buttons = app.send_draft_for_approval(
@@ -431,6 +459,12 @@ def dispatch_draft(state: TwinState) -> TwinState:
                 f"[INSTAGRAM-TG] Fallback notification failed: "
                 f"{type(tg_err).__name__}: {tg_err}"
             )
+    # A tester whose answer waits for approval is still a LEAD — same
+    # helper as production, told whether the handoff line went out now.
+    app._ig_lead_draft_notice(sender_id, text, state.get("tag", ""), handoff_sent)
+    # A 20+ tray question whose answer waits for approval is still a bulk
+    # lead — same helper as production.
+    app._ig_send_bulk_lead(sender_id, text, "(waiting for your approval — see the 🟡 draft)")
     app._log_instagram(sender_id, text, None, state.get("timestamp", ""), source="DRAFT_PENDING_IG")
     print(f"[INSTAGRAM-DRAFT] Notified founder for {sender_id} (buttons={sent_with_buttons})")
 
@@ -501,6 +535,7 @@ def _route_after_hydrate(state: TwinState) -> str:
 
 
 def _route_after_triage(state: TwinState) -> str:
+    # triage always decides; "drop" (-> END) only guards an unexpected value.
     return {
         "AUTO": "auto",
         "DRAFT+APPROVE": "draft",

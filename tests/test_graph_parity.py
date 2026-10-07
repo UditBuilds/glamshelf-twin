@@ -10,7 +10,8 @@ first, so a test can't pass because both sides are wrong the same way.
 Recorded effects: ask_claude (LLM call incl. the fully assembled system
 prompt), _send_instagram_reply, send_draft_for_approval,
 send_telegram_notification, _pause_number, _log_instagram,
-_persist_seen_id, _alert_send_failure.
+_persist_seen_id, _alert_send_failure, _ig_rate_limited, _ig_unanswered,
+_ig_username (the Graph API username lookup).
 
 The escalation prefilters (_escalation_prefilter_hit,
 _bulk_commit_prefilter_hit) are deliberately NOT stubbed — they are pure
@@ -71,6 +72,9 @@ EFFECT_FNS = {
     "_alert_send_failure",
     "_ig_rate_limited",
     "_ig_unanswered",
+    # A Graph API call in production; recording it pins the draft branch's
+    # order (handoff line, then username, then the draft).
+    "_ig_username",
 }
 
 
@@ -102,11 +106,15 @@ class GraphParityTestCase(unittest.TestCase):
         udit_recent=False,
         llm_exception=None,
         limited=None,
+        handoff_window=False,
     ):
         """Run one implementation ("old" or "new") fully stubbed; return
         the recorded call list of (fn_name, args, kwargs) tuples.
         `llm_exception`, when set, makes the ask_claude stub raise after
-        recording the call (simulates a DeepSeek outage)."""
+        recording the call (simulates a DeepSeek outage).
+        `handoff_window` puts the sender inside the handoff-line window
+        (got the line, not yet the acknowledgement) — stubbed, since
+        _log_instagram writes no rows here."""
         calls = []
 
         def recorder(name, ret=None, exc=None):
@@ -137,12 +145,18 @@ class GraphParityTestCase(unittest.TestCase):
             patch.object(glam, "_rag_retrieve", recorder("_rag_retrieve", CANNED_RAG)),
             patch.object(glam, "ask_claude", recorder("ask_claude", llm_response, exc=llm_exception)),
             patch.object(glam, "_send_instagram_reply", recorder("_send_instagram_reply", send_result)),
+            patch.object(glam, "_ig_username", recorder("_ig_username", "")),
             patch.object(glam, "send_draft_for_approval", recorder("send_draft_for_approval", buttons_ok)),
             patch.object(glam, "send_telegram_notification", recorder("send_telegram_notification")),
             patch.object(glam, "_pause_number", recorder("_pause_number")),
             patch.object(glam, "_log_instagram", recorder("_log_instagram")),
             patch.object(glam, "_alert_send_failure", recorder("_alert_send_failure")),
         ]
+        if handoff_window:
+            patches += [
+                patch.object(glam, "_ig_handoff_sent_recently", recorder("_ig_handoff_sent_recently", True)),
+                patch.object(glam, "_ig_ack_sent_recently", recorder("_ig_ack_sent_recently", False)),
+            ]
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
@@ -401,33 +415,42 @@ class GraphParityTestCase(unittest.TestCase):
         new = self._run("new", llm_response=maybe)
         self._assert_parity(old, new)
 
-    def test_empty_auto_reply_goes_to_the_founder_as_a_draft(self):
-        # Audit finding 1: the production handler never answers a message
-        # it processed with silence. An empty AUTO reply goes to the founder
-        # as a draft and the customer gets the handoff line — the same way
-        # an output-guard hold works.
-        #
-        # graph.py LAGS here by founder decision (it isn't live, and this
-        # fix doesn't touch it): its triage still drops the message. This is
-        # the one case where the two deliberately differ, so the new path's
-        # drop is recorded below instead of asserting parity.
-        empty = json.dumps({"classification": "AUTO", "reply": ""})
-        old = self._run("old", llm_response=empty)
-        (send,) = named(old, "_send_instagram_reply")
+    def _assert_empty_reply_drafted(self, calls):
+        """Audit finding 1's shape: the customer gets the handoff line, the
+        founder an empty draft, nothing is paused."""
+        (send,) = named(calls, "_send_instagram_reply")
         self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
-        (draft,) = named(old, "send_draft_for_approval")
+        (draft,) = named(calls, "send_draft_for_approval")
         self.assertEqual(draft[2]["customer_message"], MSG)
         self.assertEqual(draft[2]["reply_text"], "")
         self.assertEqual(draft[2]["channel"], "Instagram")
-        handoff_log, pending_log = named(old, "_log_instagram")
+        handoff_log, pending_log = named(calls, "_log_instagram")
         self.assertEqual(handoff_log[1], (SENDER, "", glam.BRAIN_HOLDING_LINE, str(TIMESTAMP)))
         self.assertEqual(handoff_log[2], {"source": "DRAFT_HANDOFF_IG"})
         self.assertEqual(pending_log[1], (SENDER, MSG, None, str(TIMESTAMP)))
         self.assertEqual(pending_log[2], {"source": "DRAFT_PENDING_IG"})
-        self.assertEqual(named(old, "_pause_number"), [])
+        self.assertEqual(named(calls, "_pause_number"), [])
+
+    def test_empty_auto_reply_goes_to_the_founder_as_a_draft(self):
+        # Audit finding 1: a processed message is never answered with
+        # silence. An empty AUTO reply goes to the founder as a draft and
+        # the customer gets the handoff line — the same way an output-guard
+        # hold works. graph.py's triage used to drop it; both now agree.
+        empty = json.dumps({"classification": "AUTO", "reply": ""})
+        old = self._run("old", llm_response=empty)
+        self._assert_empty_reply_drafted(old)
 
         new = self._run("new", llm_response=empty)
-        self.assertEqual([c for c in effects(new) if c[0] != "ask_claude"], [])  # graph.py: still dropped
+        self._assert_parity(old, new)
+
+    def test_empty_draft_reply_goes_to_the_founder_as_a_draft(self):
+        # Same rule for an empty DRAFT+APPROVE reply.
+        empty = json.dumps({"classification": "DRAFT+APPROVE", "reply": ""})
+        old = self._run("old", llm_response=empty)
+        self._assert_empty_reply_drafted(old)
+
+        new = self._run("new", llm_response=empty)
+        self._assert_parity(old, new)
 
     def test_fallback_holding_send_failure_still_pages(self):
         # If the holding line can't be delivered, the page must still fire
@@ -520,6 +543,123 @@ class GraphParityTestCase(unittest.TestCase):
         self.assertEqual(send[1], (SENDER, json.loads(AUTO_JSON)["reply"]))
 
         new = self._run("new", llm_response=AUTO_JSON, message=msg)
+        self._assert_parity(old, new)
+
+    # ---- a tester whose answer waits for approval (audit finding 4) ----
+
+    TESTER_DRAFT_REPLY = "We accept returns within 14 days of delivery 🤍"
+
+    def _tester_draft(self, tag):
+        return json.dumps({"classification": "DRAFT+APPROVE", "reply": self.TESTER_DRAFT_REPLY, "tag": tag})
+
+    def _assert_drafted_with_lead_notice(self, calls, msg, customer_got, shown):
+        """The draft waits for approval as usual; the founder also gets a
+        LEAD notice showing what the customer actually got. No pause."""
+        (send,) = named(calls, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, customer_got))
+        (draft,) = named(calls, "send_draft_for_approval")
+        self.assertEqual(draft[2]["reply_text"], self.TESTER_DRAFT_REPLY)
+        (tg,) = named(calls, "send_telegram_notification")
+        self.assertEqual(tg[1], ("LEAD", msg, shown))
+        self.assertEqual(tg[2]["customer_id"], SENDER)
+        self.assertEqual(named(calls, "_log_instagram")[-1][2], {"source": "DRAFT_PENDING_IG"})
+        self.assertEqual(named(calls, "_pause_number"), [])
+
+    def test_tester_tagged_lead_whose_answer_is_drafted_gets_the_lead_notice(self):
+        # No tester words in this message: the model's LEAD tag alone (it
+        # knows the thread) makes it a lead.
+        msg = "how do u handle returns?"
+        self.assertIsNone(glam._LEAD_RE.search(msg))
+        old = self._run("old", llm_response=self._tester_draft("LEAD"), message=msg)
+        self._assert_drafted_with_lead_notice(
+            old, msg, glam.BRAIN_HOLDING_LINE, shown=glam.BRAIN_HOLDING_LINE)
+
+        new = self._run("new", llm_response=self._tester_draft("LEAD"), message=msg)
+        self._assert_parity(old, new)
+
+    def test_tester_caught_by_the_backstop_whose_answer_is_drafted_gets_the_lead_notice(self):
+        # Untagged: only the _LEAD_RE backstop flags it. The model drafts
+        # it directly — an AUTO answer would take the LEAD path instead.
+        msg = "hey udit sent me here, whats ur return policy?"
+        self.assertIsNotNone(glam._LEAD_RE.search(msg))
+        old = self._run("old", llm_response=self._tester_draft(""), message=msg)
+        self._assert_drafted_with_lead_notice(
+            old, msg, glam.BRAIN_HOLDING_LINE, shown=glam.BRAIN_HOLDING_LINE)
+
+        new = self._run("new", llm_response=self._tester_draft(""), message=msg)
+        self._assert_parity(old, new)
+
+    def test_drafted_tester_inside_the_handoff_window(self):
+        # Inside the window the customer gets the one-time acknowledgement,
+        # not the handoff line, so _ig_draft_handoff returns False and the
+        # LEAD notice says nothing new was sent. This is what shows the
+        # graph passes handoff_sent through rather than assuming True.
+        msg = "how do u handle returns?"
+        old = self._run(
+            "old", llm_response=self._tester_draft("LEAD"), message=msg, handoff_window=True)
+        self._assert_drafted_with_lead_notice(
+            old, msg, glam.IG_DRAFT_ACK_LINE,
+            shown="(nothing new — they got the handoff line recently)")
+        ack_log, pending_log = named(old, "_log_instagram")
+        self.assertEqual(ack_log[1], (SENDER, "", glam.IG_DRAFT_ACK_LINE, str(TIMESTAMP)))
+        self.assertEqual(ack_log[2], {"source": "DRAFT_ACK_IG"})
+        self.assertEqual(pending_log[1], (SENDER, msg, None, str(TIMESTAMP)))
+
+        new = self._run(
+            "new", llm_response=self._tester_draft("LEAD"), message=msg, handoff_window=True)
+        self._assert_parity(old, new)
+
+    # ---- a 20+ tray question whose answer waits for approval ----
+
+    BULK_WAITING = "(waiting for your approval — see the 🟡 draft)"
+
+    def test_drafted_bulk_question_gets_the_bulk_notice(self):
+        # A question, not a commit: the bulk-commit prefilter would
+        # escalate a commit instead.
+        msg = "whats ur rate for 30 trays of GS2?"
+        self.assertEqual(glam.bulk_trays_asked(msg), 30)
+        self.assertIsNone(glam._bulk_commit_prefilter_hit(msg))
+        bulk = json.dumps({"classification": "DRAFT+APPROVE", "reply": "Let me check GS2 stock for 30 trays 🤍"})
+        old = self._run("old", llm_response=bulk, message=msg)
+        (send,) = named(old, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, glam.BRAIN_HOLDING_LINE))
+        self.assertEqual(len(named(old, "send_draft_for_approval")), 1)
+        (tg,) = named(old, "send_telegram_notification")
+        self.assertEqual(tg[1], ("BULK", msg, self.BULK_WAITING))
+        self.assertEqual(tg[2]["customer_id"], SENDER)
+        self.assertEqual(named(old, "_log_instagram")[-1][2], {"source": "DRAFT_PENDING_IG"})
+        self.assertEqual(named(old, "_pause_number"), [])
+
+        new = self._run("new", llm_response=bulk, message=msg)
+        self._assert_parity(old, new)
+
+    def test_draft_branch_calls_happen_in_the_live_order(self):
+        # Every notice at once — a tester asking about 30 trays, buttons
+        # failing — so parity pins the whole draft branch's order: handoff
+        # line, username, draft, plain fallback, LEAD, BULK, pending row.
+        # Each notice looks up the sender's username for its label.
+        msg = "udit asked me to test ur bot — whats the rate for 30 trays?"
+        old = self._run("old", llm_response=self._tester_draft(""), message=msg, buttons_ok=False)
+        self.assertEqual(
+            [c[0] for c in effects(old)],
+            [
+                "ask_claude",
+                "_send_instagram_reply", "_log_instagram",   # handoff line
+                "_ig_username",
+                "send_draft_for_approval",
+                "_ig_username", "send_telegram_notification",  # plain fallback
+                "_ig_username", "send_telegram_notification",  # LEAD
+                "_ig_username", "send_telegram_notification",  # BULK
+                "_log_instagram",                              # DRAFT_PENDING_IG
+            ],
+        )
+        fallback, lead, bulk = named(old, "send_telegram_notification")
+        self.assertEqual(fallback[1][0], "DRAFT+APPROVE")
+        self.assertEqual(lead[1], ("LEAD", msg, glam.BRAIN_HOLDING_LINE))
+        self.assertEqual(bulk[1], ("BULK", msg, self.BULK_WAITING))
+        self.assertEqual(named(old, "_log_instagram")[-1][2], {"source": "DRAFT_PENDING_IG"})
+
+        new = self._run("new", llm_response=self._tester_draft(""), message=msg, buttons_ok=False)
         self._assert_parity(old, new)
 
     # ---- order / restock heads-up on AUTO replies (audit T1-6) ----
