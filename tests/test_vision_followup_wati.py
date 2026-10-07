@@ -54,7 +54,8 @@ Infrastructure retry — read this before touching it:
 
 Run:  python -m unittest tests.test_vision_followup_wati
       (needs DEEPSEEK_API_KEY and a reachable api.deepseek.com — otherwise
-       the two live tests skip; set VISION_FOLLOWUP_REPEAT to change runs,
+       the two live tests skip; SKIP_LIVE_MODEL_TESTS=1 skips them too, as
+       CI does; set VISION_FOLLOWUP_REPEAT to change runs,
        VISION_FOLLOWUP_API_RETRIES to change the infrastructure retry budget)
 """
 
@@ -157,6 +158,9 @@ class VisionFollowUpReconstruction(unittest.TestCase):
     def setUp(self):
         os.environ["WATI_WEBHOOK_VERIFY_DISABLED"] = "1"
         self.addCleanup(os.environ.pop, "WATI_WEBHOOK_VERIFY_DISABLED", None)
+        # Checked first, so CI (fake key) never even opens the probe connection.
+        if os.environ.get("SKIP_LIVE_MODEL_TESTS") == "1":
+            self.skipTest("SKIP_LIVE_MODEL_TESTS=1 — live reply-model tests switched off")
         if not os.environ.get("DEEPSEEK_API_KEY"):
             self.skipTest("DEEPSEEK_API_KEY not set — reply model unavailable")
         if not deepseek_reachable():

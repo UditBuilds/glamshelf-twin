@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          # Placeholders, not real keys. The repo is public and no GitHub
+          # secrets are used.
+          DEEPSEEK_API_KEY: ci-placeholder-deepseek-key
+          ANTHROPIC_API_KEY: ci-placeholder-anthropic-key
+          SECRET_KEY: ci-placeholder-secret-key
+          APP_PASSWORD: ci-placeholder-app-password
+          DASHBOARD_KEY: ci-placeholder-dashboard-key
+          # Empty, so the app skips the GitHub DB restore and backup loop.
+          GITHUB_TOKEN: ""
+          GITHUB_REPO: ""
+          # The two live DeepSeek tests skip instead of running on a fake key.
+          SKIP_LIVE_MODEL_TESTS: "1"
+          # No fastembed model download: RAG stays off, as in an offline
+          # local run.
+          HF_HUB_OFFLINE: "1"
+          # Every HTTP call (requests, httpx) goes to a closed local port, so
+          # nothing in the test run leaves the runner. Test step only: pip
+          # install above needs the network.
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          NO_PROXY: localhost,127.0.0.1
+        run: python -m unittest discover tests
