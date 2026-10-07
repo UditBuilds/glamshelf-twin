@@ -2,7 +2,7 @@
 
 This module makes the twin's implicit message pipeline EXPLICIT as a graph:
 
-    intake -> retrieve -> hydrate -> generate -> triage -> dispatch_*
+    intake -> generate -> triage -> dispatch_*
        \\ (gate hit)
         `-> END
 
@@ -13,10 +13,13 @@ holding line (audit T1-8). Every message that reaches triage is
 dispatched — an empty AUTO or DRAFT+APPROVE reply goes to the founder as
 a draft (audit finding 1), as in production.
 
-Every node DELEGATES to the existing production function in app.py — the
-RAG layer, the brain.md prompt assembly, the DeepSeek call, the prefilters,
-and the Instagram/Telegram dispatch are not rebuilt here. The graph is the
-routing skeleton; app.py remains the single source of behavior. Parity with
+Every node DELEGATES to the existing production function in app.py.
+generate is app.draft_reply_logic itself, called with the arguments the
+live handler passes: the brain.md prompt with live inventory, policies and
+RAG context, the DeepSeek call and its retry, and the prefilters are the
+production code, in production's order. The Instagram/Telegram dispatch
+uses the production helpers too. The graph is the routing skeleton;
+app.py remains the single source of behavior. Parity with
 _process_instagram_event (app.py) is enforced by tests/test_graph_parity.py.
 
 NOT YET WIRED INTO PRODUCTION. app.py does not import this module. To swap
@@ -41,29 +44,6 @@ langgraph-glamshelf-twin.md):
     values stored in DB log rows. The PATTERN is what carried over —
     deterministic floors that can only tighten the LLM's call, never
     loosen it.
-
-  * Two deliberate ordering differences from draft_reply_logic:
-
-    - The prefilters. There they are COMPUTED before the LLM call and
-      APPLIED after; here both happen in the triage node (after generate).
-      Both prefilters are pure functions of the message text plus one env
-      flag read per call, so the result is identical — moving them keeps
-      every classification decision in a single node instead of smearing
-      triage across two.
-
-    - The RAG lookup. There _rag_retrieve runs last, after the brain.md
-      check, the brain, live inventory and live policies; here the retrieve
-      node runs before hydrate. The prompt is the same. What differs: when
-      brain.md is missing or unreadable, the graph still runs a lookup (up
-      to RAG_RETRIEVAL_TIMEOUT_SECONDS; it updates the RAG health record,
-      and a failed one may start the RAG alert check) where production
-      stops first — the customer and founder get the same either way — and
-      the log lines come out in a different order. For a message handled
-      on its own, the Shopify calls and the lookup each keep their full cap
-      in either order. But one webhook request runs all its events under
-      one reply budget, so for a later event in a multi-event request the
-      order decides which call a nearly spent budget cuts short. Founder
-      decision (7 Oct 2026): keep it.
 """
 
 import json
@@ -100,23 +80,17 @@ class TwinState(TypedDict, total=False):
     order_context: str  # _lookup_recent_order line, "" if no match
     history: list       # prior IG exchanges (oldest first), [] if none
 
-    # -- retrieve --
-    retrieved_context: str  # [RETRIEVED CONTEXT] block, "" on gate miss
-
-    # -- hydrate --
-    system_prompt: str  # brain.md + live inventory + policies + RAG
-
-    # -- generate --
+    # -- generate (draft_reply_logic's return, or its error) --
     raw_response: str        # LLM output after fence stripping
-    llm_classification: str  # model's own call, before triage overrides
+    llm_classification: str  # its call (prefilters applied), before triage overrides
     reply: str               # drafted customer-facing text
+    pipeline_error: str      # "<ExcType>: <msg>" when draft_reply_logic raised
 
     # -- triage --
     decision: str  # AUTO | DRAFT+APPROVE | ESCALATE | LEAD | FAIL (final)
     tag: str       # the model's optional JSON "tag" (LEAD/SAFETY/LEGAL/PRESS/ORDER/RESTOCK), "" if none
     fallback_escalation: bool  # ESCALATE verdict with unusable LLM output
-    pipeline_error: str  # hydrate/generate failure detail (routing + audit)
-    failure_detail: str  # "<ExcType>: <msg>" / unusable-output text, for dispatch_failure
+    failure_detail: str  # the pipeline error / unusable-output text, for dispatch_failure
     guard_note: str  # output-guard rule(s) that held an AUTO reply for approval (audit T1-4)
 
     # -- dispatch --
@@ -126,7 +100,7 @@ class TwinState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 # Nodes. Each is a plain function State -> partial State. Side effects
 # (DB writes, network sends) live only in intake (dedup persist) and the
-# dispatch nodes — retrieve/hydrate/generate/triage only read.
+# dispatch nodes — generate/triage only read.
 # ---------------------------------------------------------------------------
 
 
@@ -179,121 +153,46 @@ def intake(state: TwinState) -> TwinState:
     }
 
 
-def retrieve(state: TwinState) -> TwinState:
-    """RAG retrieval as its own node. _rag_retrieve never raises and
-    returns "" on any miss, so this node cannot fail the graph."""
-    return {"retrieved_context": app._rag_retrieve(state["text"])}
-
-
-def hydrate(state: TwinState) -> TwinState:
-    """Assemble the system prompt exactly as draft_reply_logic does:
-    live inventory PREPENDED (stock visible at the very top), brain.md,
-    then live policies and RAG context APPENDED (brain rules keep prompt
-    priority). A failure (e.g. brain.md missing) no longer aborts the
-    graph: it routes straight to triage, where a deterministic escalation
-    verdict can still dispatch (July 17 decision — the verdict survives
-    regardless of what happens downstream). Without a prefilter hit,
-    triage drops the message, matching the production handler's
-    catch-and-return.
-    """
-    try:
-        if not app.BRAIN_FILE.exists():
-            raise FileNotFoundError(f"brain file not found at {app.BRAIN_FILE}")
-
-        brain = app._load_brain_cached()
-
-        live_stock = app.get_live_inventory()
-        if live_stock:
-            brain = live_stock + "\n\n" + brain
-
-        live_policies = app.get_live_policies()
-        if live_policies:
-            brain = brain + "\n\n" + live_policies
-
-        retrieved = state.get("retrieved_context", "")
-        if retrieved:
-            brain = brain + "\n\n" + retrieved
-    except Exception as e:
-        print(f"[GRAPH] Twin pipeline failed in hydrate: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return {
-            "pipeline_error": f"hydrate: {type(e).__name__}: {e}",
-            "failure_detail": f"{type(e).__name__}: {e}",
-        }
-
-    return {"system_prompt": brain}
-
-
 def generate(state: TwinState) -> TwinState:
-    """LLM call + JSON parse. Parse failure — and now the LLM call itself
-    failing — leaves classification/reply empty; triage decides whether
-    that drops (no escalation signal) or dispatches the fallback
-    escalation (deterministic verdict present)."""
+    """The reply: app.draft_reply_logic itself, with the arguments the live
+    handler passes. That is the brain.md prompt with live inventory,
+    policies and RAG context, the DeepSeek call with its retry (an
+    unusable answer twice becomes ESCALATE with an empty reply), and both
+    prefilters, all in production's order.
+
+    If it raises (brain.md missing, DeepSeek down, the reply budget spent),
+    the error is recorded and triage runs anyway, which is what the
+    handler's except branch does: a prefilter hit still escalates with an
+    empty reply (July 17 decision: the verdict survives regardless of what
+    happens downstream), anything else gets the holding line and a founder
+    alert (audit T1-8)."""
     try:
-        raw = app.ask_claude(
-            state["system_prompt"],
-            state["text"],
-            state.get("order_context", ""),
-            history=state.get("history"),
-            source="Instagram DM",
+        classification, reply, raw = app.draft_reply_logic(
+            state["text"], state.get("order_context", ""),
+            history=state.get("history"), source="Instagram DM",
         )
     except Exception as e:
-        print(f"[GRAPH] Twin pipeline failed in generate: {type(e).__name__}: {e}")
+        print(f"[INSTAGRAM] Twin pipeline failed: {type(e).__name__}: {e}")
         traceback.print_exc()
-        return {
-            "pipeline_error": f"generate: {type(e).__name__}: {e}",
-            "failure_detail": f"{type(e).__name__}: {e}",
-            "raw_response": "",
-            "llm_classification": "",
-            "reply": "",
-        }
-
-    classification, reply = app._parse_twin_reply(raw)
-
-    # Same retry-then-escalate as draft_reply_logic. Kept in step with it
-    # deliberately: test_graph_parity asserts the two paths agree, and an
-    # unparseable 200 must not drop a customer silently on either.
-    if not classification and not reply:
-        print("[TWIN] Unusable model output — retrying the call once before falling back")
-        try:
-            retry_raw = app.ask_claude(
-                state["system_prompt"],
-                state["text"],
-                state.get("order_context", ""),
-                history=state.get("history"),
-                source="Instagram DM",
-            )
-        except Exception as exc:  # noqa: BLE001 - the fallback below is the whole point
-            print(f"[TWIN] Retry call failed: {type(exc).__name__}: {exc}")
-            retry_raw = ""
-        if retry_raw:
-            raw = retry_raw
-            classification, reply = app._parse_twin_reply(raw)
-
-        if not classification and not reply:
-            # ESCALATE with an EMPTY reply on purpose — triage's
-            # `if not classification or not reply:` gate is what sets
-            # fallback_escalation=True, and that flag is what actually
-            # ships the holding reply to the customer.
-            print(
-                "[TWIN] Retry also unusable — escalating so the founder is "
-                "notified and the customer gets the holding reply"
-            )
-            classification = "ESCALATE"
-            reply = ""
+        return {"pipeline_error": f"{type(e).__name__}: {e}"}
 
     return {"raw_response": raw, "llm_classification": classification, "reply": reply}
 
 
 def triage(state: TwinState) -> TwinState:
-    """The decision node: deterministic floors over the LLM's call.
+    """The decision node: deterministic floors over the reply's call, in the
+    order _process_instagram_event applies them after draft_reply_logic.
 
     Both prefilters are UPGRADE-ONLY — they can force ESCALATE, never
     downgrade it. Thresholds are the founder-confirmed production ones:
     the high-risk phrase list (lawyer / consumer court / police / refund
     karo / social-media threat) and the bulk-commit rule (commit signal
     for >=20 trays, or a committed amount over the Rs.1,500 Hard Money
-    Threshold, via resolve_pricing_action).
+    Threshold, via resolve_pricing_action). draft_reply_logic has already
+    applied and logged both on a drafted reply, so the check here changes
+    nothing then. It matters when generate failed: as in the handler's
+    except branch, a hit still escalates with an empty reply, and nothing
+    extra is logged.
 
     An empty classification/reply never drops the message. An ESCALATE
     verdict survives it — founder decision (July 17, 2026): an escalation
@@ -317,22 +216,12 @@ def triage(state: TwinState) -> TwinState:
     classification = state.get("llm_classification", "")
     reply = state.get("reply", "")
 
-    prefilter_phrase = app._escalation_prefilter_hit(state["text"])
-    bulk_commit_qty = app._bulk_commit_prefilter_hit(state["text"])
-
-    if prefilter_phrase and classification != "ESCALATE":
-        print(
-            f"[PREFILTER] Forcing ESCALATE (was {classification or 'unparsed'!r}) — "
-            f"matched high-risk phrase {prefilter_phrase!r}"
-        )
-        classification = "ESCALATE"
-
-    if bulk_commit_qty is not None and classification != "ESCALATE":
-        print(
-            f"[PREFILTER] Forcing ESCALATE (was {classification or 'unparsed'!r}) — "
-            f"bulk commit signal for {bulk_commit_qty} trays "
-            f"(Rule 3b-i / Hard Money Threshold, resolve_pricing_action)"
-        )
+    # The prefilters, silently: draft_reply_logic logged any hit already,
+    # and the handler's except branch re-checks without a log line.
+    if classification != "ESCALATE" and (
+        app._escalation_prefilter_hit(state["text"])
+        or app._bulk_commit_prefilter_hit(state["text"]) is not None
+    ):
         classification = "ESCALATE"
 
     # Output guard (audit T1-4): an AUTO reply that trips a rule is held
@@ -367,9 +256,9 @@ def triage(state: TwinState) -> TwinState:
                 "tag": tag,
             }
         if state.get("pipeline_error"):
-            # hydrate/generate raised and no prefilter escalated: holding
+            # draft_reply_logic raised and no prefilter escalated: holding
             # line + founder alert, same as production (audit T1-8).
-            return {"decision": "FAIL", "failure_detail": state.get("failure_detail", "")}
+            return {"decision": "FAIL", "failure_detail": state["pipeline_error"]}
         if classification in ("AUTO", "DRAFT+APPROVE"):
             # Never silence (audit finding 1): an empty reply goes to the
             # founder as a draft, the same way an output-guard hold does,
@@ -536,12 +425,6 @@ def _route_after_intake(state: TwinState) -> str:
     return "drop" if state.get("drop_reason") else "continue"
 
 
-def _route_after_hydrate(state: TwinState) -> str:
-    # A hydrate failure skips the LLM call entirely but still reaches
-    # triage: the deterministic prefilters can escalate without a prompt.
-    return "error" if state.get("pipeline_error") else "generate"
-
-
 def _route_after_triage(state: TwinState) -> str:
     # triage always decides; "drop" (-> END) only guards an unexpected value.
     return {
@@ -561,8 +444,6 @@ def build_graph():
     g = StateGraph(TwinState)
 
     g.add_node("intake", intake)
-    g.add_node("retrieve", retrieve)
-    g.add_node("hydrate", hydrate)
     g.add_node("generate", generate)
     g.add_node("triage", triage)
     g.add_node("dispatch_auto", dispatch_auto)
@@ -574,13 +455,10 @@ def build_graph():
     g.add_edge(START, "intake")
     g.add_conditional_edges(
         "intake", _route_after_intake,
-        {"continue": "retrieve", "drop": END},
+        {"continue": "generate", "drop": END},
     )
-    g.add_edge("retrieve", "hydrate")
-    g.add_conditional_edges(
-        "hydrate", _route_after_hydrate,
-        {"generate": "generate", "error": "triage"},
-    )
+    # A failed generate still reaches triage: the prefilters can escalate
+    # without a model reply.
     g.add_edge("generate", "triage")
     g.add_conditional_edges(
         "triage", _route_after_triage,
@@ -629,10 +507,10 @@ def handle_instagram_message(
             "timestamp": timestamp, "gates_done": gates_done,
         })
     except Exception as e:
-        print(f"[GRAPH] Twin pipeline failed: {type(e).__name__}: {e}")
+        # Production's handler catch-all, log line included: alert only,
+        # since a reply may or may not have gone out before the error.
+        print(f"[INSTAGRAM] Event handler error: {type(e).__name__}: {e}")
         traceback.print_exc()
-        # Mirrors production's handler catch-all: alert only, since a
-        # reply may or may not have gone out before the error.
         app._alert_send_failure(
             "Instagram", f"{type(e).__name__}: {e}", sender_id or "(unknown)",
             kind="pipeline", holding_sent=None,
