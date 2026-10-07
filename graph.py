@@ -22,11 +22,18 @@ uses the production helpers too. The graph is the routing skeleton;
 app.py remains the single source of behavior. Parity with
 _process_instagram_event (app.py) is enforced by tests/test_graph_parity.py.
 
-NOT YET WIRED INTO PRODUCTION. app.py does not import this module. To swap
-it in, _process_instagram_event would keep its transport-level steps 1-2
-(page-echo / HUMAN_UDIT_IG detection, is_echo drop, empty-text/sender
-checks) and then call handle_instagram_message() instead of the rest of its
-body. Until then the graph is exercised only by the parity test suite.
+WIRED BEHIND TWIN_USE_LANGGRAPH, OFF BY DEFAULT. With TWIN_USE_LANGGRAPH=1
+(exactly "1"), app.py imports this module once at startup
+(_load_twin_graph) and _process_instagram_event hands each text DM to
+handle_instagram_message(..., gates_done=True). The handler keeps
+everything up to and including its photo / media branch: page-echo and
+manual-reply detection (HUMAN_UDIT_IG), the is_echo drop, non-text events,
+dedup, the pause gate, the human-handling check, photos and other media.
+The graph starts at the rate limit and only ever sees text. With the flag
+OFF, the default, app.py never imports this module or langgraph and the
+legacy handler answers everything. If the import fails, replies stay on
+the legacy path. The keyed /healthz shows which path is answering
+("reply_path") and any import error ("langgraph_error").
 
 Design notes (full write-ups in the Obsidian vault,
 langgraph-glamshelf-twin.md):
@@ -54,8 +61,11 @@ from langgraph.graph import StateGraph, START, END
 
 # The production module. Nodes call app.<fn> at invoke time (late attribute
 # lookup), so test monkeypatches on app apply to the graph automatically.
-# Importing app runs its startup block (DB init/restore, RAG model load) —
-# same cost the existing test suite already pays.
+# When app.py loads this module (flag ON), this returns the running app:
+# under gunicorn it is sys.modules["app"], and under `python app.py`
+# _load_twin_graph registers __main__ as "app" first. Otherwise it is an
+# ordinary import, and the first import of app runs its startup block (DB
+# init/restore, RAG model load), the same cost every test module pays.
 import app
 
 
