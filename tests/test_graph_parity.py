@@ -102,11 +102,15 @@ class GraphParityTestCase(unittest.TestCase):
         udit_recent=False,
         llm_exception=None,
         limited=None,
+        handoff_window=False,
     ):
         """Run one implementation ("old" or "new") fully stubbed; return
         the recorded call list of (fn_name, args, kwargs) tuples.
         `llm_exception`, when set, makes the ask_claude stub raise after
-        recording the call (simulates a DeepSeek outage)."""
+        recording the call (simulates a DeepSeek outage).
+        `handoff_window` puts the sender inside the handoff-line window
+        (got the line, not yet the acknowledgement) — stubbed, since
+        _log_instagram writes no rows here."""
         calls = []
 
         def recorder(name, ret=None, exc=None):
@@ -143,6 +147,11 @@ class GraphParityTestCase(unittest.TestCase):
             patch.object(glam, "_log_instagram", recorder("_log_instagram")),
             patch.object(glam, "_alert_send_failure", recorder("_alert_send_failure")),
         ]
+        if handoff_window:
+            patches += [
+                patch.object(glam, "_ig_handoff_sent_recently", recorder("_ig_handoff_sent_recently", True)),
+                patch.object(glam, "_ig_ack_sent_recently", recorder("_ig_ack_sent_recently", False)),
+            ]
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
@@ -529,6 +538,70 @@ class GraphParityTestCase(unittest.TestCase):
         self.assertEqual(send[1], (SENDER, json.loads(AUTO_JSON)["reply"]))
 
         new = self._run("new", llm_response=AUTO_JSON, message=msg)
+        self._assert_parity(old, new)
+
+    # ---- a tester whose answer waits for approval (audit finding 4) ----
+
+    TESTER_DRAFT_REPLY = "We accept returns within 14 days of delivery 🤍"
+
+    def _tester_draft(self, tag):
+        return json.dumps({"classification": "DRAFT+APPROVE", "reply": self.TESTER_DRAFT_REPLY, "tag": tag})
+
+    def _assert_drafted_with_lead_notice(self, calls, msg, customer_got, shown):
+        """The draft waits for approval as usual; the founder also gets a
+        LEAD notice showing what the customer actually got. No pause."""
+        (send,) = named(calls, "_send_instagram_reply")
+        self.assertEqual(send[1], (SENDER, customer_got))
+        (draft,) = named(calls, "send_draft_for_approval")
+        self.assertEqual(draft[2]["reply_text"], self.TESTER_DRAFT_REPLY)
+        (tg,) = named(calls, "send_telegram_notification")
+        self.assertEqual(tg[1], ("LEAD", msg, shown))
+        self.assertEqual(tg[2]["customer_id"], SENDER)
+        self.assertEqual(named(calls, "_log_instagram")[-1][2], {"source": "DRAFT_PENDING_IG"})
+        self.assertEqual(named(calls, "_pause_number"), [])
+
+    def test_tester_tagged_lead_whose_answer_is_drafted_gets_the_lead_notice(self):
+        # No tester words in this message: the model's LEAD tag alone (it
+        # knows the thread) makes it a lead.
+        msg = "how do u handle returns?"
+        self.assertIsNone(glam._LEAD_RE.search(msg))
+        old = self._run("old", llm_response=self._tester_draft("LEAD"), message=msg)
+        self._assert_drafted_with_lead_notice(
+            old, msg, glam.BRAIN_HOLDING_LINE, shown=glam.BRAIN_HOLDING_LINE)
+
+        new = self._run("new", llm_response=self._tester_draft("LEAD"), message=msg)
+        self._assert_parity(old, new)
+
+    def test_tester_caught_by_the_backstop_whose_answer_is_drafted_gets_the_lead_notice(self):
+        # Untagged: only the _LEAD_RE backstop flags it. The model drafts
+        # it directly — an AUTO answer would take the LEAD path instead.
+        msg = "hey udit sent me here, whats ur return policy?"
+        self.assertIsNotNone(glam._LEAD_RE.search(msg))
+        old = self._run("old", llm_response=self._tester_draft(""), message=msg)
+        self._assert_drafted_with_lead_notice(
+            old, msg, glam.BRAIN_HOLDING_LINE, shown=glam.BRAIN_HOLDING_LINE)
+
+        new = self._run("new", llm_response=self._tester_draft(""), message=msg)
+        self._assert_parity(old, new)
+
+    def test_drafted_tester_inside_the_handoff_window(self):
+        # Inside the window the customer gets the one-time acknowledgement,
+        # not the handoff line, so _ig_draft_handoff returns False and the
+        # LEAD notice says nothing new was sent. This is what shows the
+        # graph passes handoff_sent through rather than assuming True.
+        msg = "how do u handle returns?"
+        old = self._run(
+            "old", llm_response=self._tester_draft("LEAD"), message=msg, handoff_window=True)
+        self._assert_drafted_with_lead_notice(
+            old, msg, glam.IG_DRAFT_ACK_LINE,
+            shown="(nothing new — they got the handoff line recently)")
+        ack_log, pending_log = named(old, "_log_instagram")
+        self.assertEqual(ack_log[1], (SENDER, "", glam.IG_DRAFT_ACK_LINE, str(TIMESTAMP)))
+        self.assertEqual(ack_log[2], {"source": "DRAFT_ACK_IG"})
+        self.assertEqual(pending_log[1], (SENDER, msg, None, str(TIMESTAMP)))
+
+        new = self._run(
+            "new", llm_response=self._tester_draft("LEAD"), message=msg, handoff_window=True)
         self._assert_parity(old, new)
 
     # ---- order / restock heads-up on AUTO replies (audit T1-6) ----

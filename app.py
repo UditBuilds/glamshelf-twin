@@ -8519,7 +8519,7 @@ def _ig_lead_draft_notice(sender_id: str, text: str, tag: str, handoff_sent: boo
     the customer actually got. Same signals as _ig_is_lead (the LEAD tag or
     the _LEAD_RE backstop), and the same serious signals outrank it.
 
-    Instagram handler only — graph.py's dispatch_draft doesn't call it."""
+    Shared with graph.py's dispatch_draft so the two stay in parity."""
     if tag != "LEAD" and not _LEAD_RE.search(text or ""):
         return
     if _escalation_prefilter_hit(text) or _bulk_commit_prefilter_hit(text) is not None:
