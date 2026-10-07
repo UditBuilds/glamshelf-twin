@@ -6530,6 +6530,10 @@ def healthz():
         # fallback counts as healthy. Keyed view only — the public answer
         # never turns 503 over RAG.
         "rag": _rag_health(),
+        # Which pipeline answers Instagram text DMs (TWIN_USE_LANGGRAPH), and
+        # why graph.py didn't load when the flag is ON but it failed.
+        "reply_path": "langgraph" if _use_langgraph() else "legacy",
+        **({"langgraph_error": _twin_graph_error} if _twin_graph_error else {}),
         "total_logged": total_logged,
         "total_orders": total_orders,
         "total_instagram": total_instagram,
