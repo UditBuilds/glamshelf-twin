@@ -9112,6 +9112,16 @@ def _process_instagram_event(event: dict) -> None:
             _handle_instagram_media(sender_id, media, timestamp)
             return
 
+        # TWIN_USE_LANGGRAPH=1: graph.py answers the text DM from here on,
+        # starting at the rate limit below. gates_done, because the gates
+        # above already ran: graph.py repeating the dedup check would drop
+        # the message as its own duplicate.
+        if _use_langgraph():
+            _twin_graph.handle_instagram_message(
+                sender_id, text, msg_id=msg_id, timestamp=timestamp, gates_done=True,
+            )
+            return
+
         # LLM rate limits (audit T1-3) — after the takeover gates, so a
         # paused or human-handled sender never uses budget or gets a notice.
         limit = _llm_admission("Instagram", sender_id)

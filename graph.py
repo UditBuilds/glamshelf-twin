@@ -92,6 +92,8 @@ class TwinState(TypedDict, total=False):
     text: str           # the customer's message text (non-empty)
     msg_id: str         # Meta `mid` for dedup; "" skips dedup
     timestamp: str      # stringified event timestamp, for log rows
+    gates_done: bool    # caller already ran the dedup/pause/human gates (declared,
+                        # or LangGraph would drop it from the input)
 
     # -- intake --
     drop_reason: str    # set => pipeline stops (duplicate/paused/human)
@@ -136,28 +138,34 @@ def intake(state: TwinState) -> TwinState:
     delivery must not re-run the pause/human checks or reload context),
     then the in-memory pause gate, then the DB-backed human-handling net,
     then the LLM rate limit (so paused/human-handled senders never use budget).
+
+    With gates_done, intake starts at the rate limit: _process_instagram_event
+    hands a text DM over just before its own rate limit, after running the
+    first three gates itself. Repeating dedup would drop the message as its
+    own duplicate; repeating the other two would query the DB twice.
     """
     sender_id = state["sender_id"]
     msg_id = state.get("msg_id", "")
 
-    if msg_id and msg_id in app._seen_ids:
-        print(f"[INSTAGRAM] Skipped: duplicate mid {msg_id}")
-        return {"drop_reason": "duplicate_mid"}
-    if msg_id:
-        app._seen_ids.add(msg_id)
-        app._persist_seen_id(msg_id)
+    if not state.get("gates_done"):
+        if msg_id and msg_id in app._seen_ids:
+            print(f"[INSTAGRAM] Skipped: duplicate mid {msg_id}")
+            return {"drop_reason": "duplicate_mid"}
+        if msg_id:
+            app._seen_ids.add(msg_id)
+            app._persist_seen_id(msg_id)
 
-    # Not answered, but logged and forwarded to the founder (and maybe the
-    # one-time line) — same helper as production (audit findings 8, 19).
-    if app._is_paused(sender_id):
-        print(f"[PAUSED] Not answering — auto-pause active for IG sender {sender_id}")
-        app._ig_unanswered(sender_id, state["text"], state.get("timestamp", ""), "paused")
-        return {"drop_reason": "paused"}
+        # Not answered, but logged and forwarded to the founder (and maybe the
+        # one-time line) — same helper as production (audit findings 8, 19).
+        if app._is_paused(sender_id):
+            print(f"[PAUSED] Not answering — auto-pause active for IG sender {sender_id}")
+            app._ig_unanswered(sender_id, state["text"], state.get("timestamp", ""), "paused")
+            return {"drop_reason": "paused"}
 
-    if app._udit_replied_recently_ig(sender_id):
-        print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — not answering")
-        app._ig_unanswered(sender_id, state["text"], state.get("timestamp", ""), "human_handling")
-        return {"drop_reason": "human_handling"}
+        if app._udit_replied_recently_ig(sender_id):
+            print(f"[HUMAN_HANDLING_IG] Udit replied to {sender_id} on Instagram recently — not answering")
+            app._ig_unanswered(sender_id, state["text"], state.get("timestamp", ""), "human_handling")
+            return {"drop_reason": "human_handling"}
 
     # LLM rate limits (audit T1-3) — same gate and helper as production.
     limit = app._llm_admission("Instagram", sender_id)
@@ -598,21 +606,28 @@ twin_graph = build_graph()
 
 
 def handle_instagram_message(
-    sender_id: str, text: str, msg_id: str = "", timestamp: str = ""
+    sender_id: str, text: str, msg_id: str = "", timestamp: str = "",
+    *, gates_done: bool = False,
 ) -> dict | None:
     """Graph-driven equivalent of _process_instagram_event's body AFTER its
     transport-level checks (page-echo / HUMAN_UDIT_IG detection, is_echo
     drop, empty text/sender skips). Callers pass a validated customer DM;
     `timestamp` is the already-stringified event timestamp.
 
+    gates_done=True is how _process_instagram_event calls it when
+    TWIN_USE_LANGGRAPH=1: it has already run the dedup, pause and
+    human-handling gates and handled photos and other media, so intake
+    starts at the rate limit. The default runs every gate.
+
     Never raises — mirrors the existing handler's absorb-into-logs
     contract so one bad message can't break a webhook batch. Returns the
     final graph state, or None if the pipeline threw.
     """
     try:
-        return twin_graph.invoke(
-            {"sender_id": sender_id, "text": text, "msg_id": msg_id, "timestamp": timestamp}
-        )
+        return twin_graph.invoke({
+            "sender_id": sender_id, "text": text, "msg_id": msg_id,
+            "timestamp": timestamp, "gates_done": gates_done,
+        })
     except Exception as e:
         print(f"[GRAPH] Twin pipeline failed: {type(e).__name__}: {e}")
         traceback.print_exc()
