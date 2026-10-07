@@ -161,6 +161,8 @@ class GraphParityTestCase(unittest.TestCase):
             for p in patches:
                 stack.enter_context(p)
             if target == "old":
+                # The legacy handler, whatever TWIN_USE_LANGGRAPH says.
+                stack.enter_context(patch.object(glam, "_use_langgraph", return_value=False))
                 glam._process_instagram_event({
                     "sender": {"id": sender},
                     "recipient": {"id": "recipient-page"},
