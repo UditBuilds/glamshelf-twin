@@ -9570,6 +9570,29 @@ def dashboard_data():
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
+# ===== LangGraph reply path (TWIN_USE_LANGGRAPH) =====
+#
+# graph.py runs the Instagram text pipeline as a LangGraph graph whose nodes
+# call this module's functions. TWIN_USE_LANGGRAPH=1 makes
+# _process_instagram_event hand a text DM to it, after the handler's own
+# gates and media handling. OFF is the default: graph and langgraph are then
+# never imported, and the live path only asks _use_langgraph(), which says no.
+_twin_graph = None   # the graph module, once loaded at startup
+
+
+def _langgraph_flag_on() -> bool:
+    """TWIN_USE_LANGGRAPH is ON only when it is exactly "1"; unset or any
+    other value is OFF. Read at startup, never per message."""
+    return os.environ.get("TWIN_USE_LANGGRAPH") == "1"
+
+
+def _use_langgraph() -> bool:
+    """Does graph.py answer Instagram text DMs? Only when the flag is ON and
+    graph.py loaded. The one switch on the live path; tests patch it to pin
+    either path."""
+    return _twin_graph is not None
+
+
 if __name__ == "__main__":
     # Local dev entry point — Render uses gunicorn (see Procfile) and never hits this block.
     port = int(os.environ.get("PORT", 5000))
