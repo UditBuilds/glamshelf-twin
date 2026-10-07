@@ -58,9 +58,12 @@ langgraph-glamshelf-twin.md):
       to RAG_RETRIEVAL_TIMEOUT_SECONDS; it updates the RAG health record,
       and a failed one may start the RAG alert check) where production
       stops first — the customer and founder get the same either way — and
-      the log lines come out in a different order. The reply budget doesn't
-      change anything: the Shopify calls and the lookup each keep their
-      full cap in either order. Founder decision (7 Oct 2026): keep it.
+      the log lines come out in a different order. For a message handled
+      on its own, the Shopify calls and the lookup each keep their full cap
+      in either order. But one webhook request runs all its events under
+      one reply budget, so for a later event in a multi-event request the
+      order decides which call a nearly spent budget cuts short. Founder
+      decision (7 Oct 2026): keep it.
 """
 
 import json
