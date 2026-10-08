@@ -42,6 +42,7 @@ needs it.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -80,8 +81,8 @@ DATA_FILE = Path(__file__).resolve().parent / "data" / "eval_set.json"
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 CHECKPOINT_DB = RUNS_DIR / "checkpoints.sqlite"
 
-# A run id becomes part of each thread id ("<run_id>:<row id>"), so keep it
-# to plain characters.
+# A run id becomes part of each thread id ("<run_id>:<row id>") and of the
+# command line's results file name, so keep it to plain characters.
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # Every function in app that can reach a real customer or the founder.
@@ -656,3 +657,80 @@ def summarize(results: list[dict], mode: str = "fresh") -> dict:
             ],
         }
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m eval.harness --run-id NAME [--review] [--judge groq]
+                              [--mode fresh|calibrate] [--limit N]
+
+    Always a resumable run: run the same command again to continue it.
+    Writes every result to eval/runs/<NAME>.json and prints the summary.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m eval.harness",
+        description=(
+            "Score the eval set as a resumable run. After a crash or a rate "
+            "limit, run the same command again to continue where it stopped."
+        ),
+    )
+    parser.add_argument("--run-id", required=True, metavar="NAME",
+                        help="names the run; the same NAME resumes it")
+    parser.add_argument("--review", action="store_true",
+                        help="pause Partial verdicts (and, in calibrate mode, "
+                             "disagreements with your recorded verdict) for "
+                             "your own verdict")
+    parser.add_argument("--judge", choices=sorted(JUDGES), default="groq")
+    parser.add_argument("--mode", choices=("fresh", "calibrate"), default="fresh")
+    parser.add_argument("--limit", type=_positive_int, metavar="N",
+                        help="score only the first N rows")
+    args = parser.parse_args(argv)
+
+    try:
+        report = run_eval(judge=args.judge, mode=args.mode, limit=args.limit,
+                          run_id=args.run_id, review=args.review)
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C, or stdin closed at a review prompt. Every finished step
+        # is saved, so the same command continues from here.
+        print(f"\nStopped. Run the same command again to continue "
+              f"run {args.run_id!r}.", file=sys.stderr)
+        return 130
+
+    if not report["rows_scored"]:
+        print(report.get("note", "no rows to score"))
+        return 0
+
+    out_file = RUNS_DIR / f"{args.run_id}.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(json.dumps(report, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+
+    overall = report["summary"]["overall"]
+    print(f"\nRun {args.run_id!r}: {report['rows_scored']} rows, "
+          f"{report['rows_reused']} reused from earlier runs.")
+    print("Judge: Pass {Pass}, Partial {Partial}, Fail {Fail}, Error {Error}; "
+          "pass rate {pass_rate}".format(**overall))
+    if args.review:
+        reviewed = sum(1 for r in report["results"] if "founder_verdict" in r)
+        print(f"Founder verdicts recorded: {reviewed}")
+    if overall["Error"]:
+        print(f"{overall['Error']} rows ended in Error. Run the same command "
+              "again to retry only those.")
+    print(f"Results: {out_file}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
