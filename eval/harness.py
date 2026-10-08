@@ -1,10 +1,12 @@
 """LangGraph eval harness for the Glam Shelf twin.
 
-Two nodes per row:
+Per row:
 
     generate  -> call app.draft_reply_logic() for a fresh reply
     judge     -> compare that reply to the founder's ideal answer,
                  return Pass / Partial / Fail + a one-line reason
+    review    -> only with review=True: pause on interrupt() so the
+                 founder can give their own verdict (see review_node)
 
 NOTHING HERE CAN SEND A CUSTOMER MESSAGE. Two independent reasons:
 
@@ -66,7 +68,9 @@ os.environ.setdefault("APP_PASSWORD", "eval")
 os.environ.setdefault("DASHBOARD_KEY", "eval")
 
 import requests  # noqa: E402
+from langchain_core.runnables import RunnableConfig  # noqa: E402
 from langgraph.graph import END, START, StateGraph  # noqa: E402
+from langgraph.types import Command, interrupt  # noqa: E402
 
 import app  # noqa: E402
 
@@ -245,6 +249,8 @@ class RowState(TypedDict, total=False):
     error: str
     seconds: float
 
+    founder_verdict: str  # set by review_node; verdict stays the judge's
+
 
 def generate_node(state: RowState) -> dict:
     """Produce the answer to be graded.
@@ -296,13 +302,68 @@ def judge_node(state: RowState) -> dict:
     return {"verdict": verdict, "reason": reason}
 
 
+REVIEW_VERDICTS = ("Pass", "Partial", "Fail")
+
+
+def _needs_review(state: RowState) -> bool:
+    """A Partial verdict, or (calibrate) the judge disagreeing with the
+    founder's recorded verdict. Error is not a verdict, so never reviewed."""
+    verdict = state.get("verdict")
+    if verdict == "Partial":
+        return True
+    human = state.get("human_verdict")
+    return (state.get("mode") == "calibrate" and bool(human)
+            and verdict in REVIEW_VERDICTS and verdict != human)
+
+
+def route_after_judge(state: RowState, config: RunnableConfig) -> str:
+    # Review is a setting of the run, not of the row, so it comes from the
+    # invoke config: a row resumed mid-graph follows the current --review.
+    # Without it (and always without a run_id) judge goes straight to END.
+    wanted = config.get("configurable", {}).get("review", False)
+    return "review" if wanted and _needs_review(state) else END
+
+
+def review_node(state: RowState) -> dict:
+    """Pause the row for the founder's verdict.
+
+    interrupt() saves the row and hands the payload to whoever drives the
+    graph (the command line asks Pass / Partial / Fail / skip). The row
+    resumes with Command(resume=<answer>), and this node runs again from
+    the top, with interrupt() now returning the answer. "skip" keeps the
+    judge's verdict and records no founder_verdict.
+    """
+    payload = {
+        "id": state.get("id"),
+        "question": state.get("question", ""),
+        "answer": state.get("fresh_answer", ""),
+        "ideal_answer": state.get("ideal_answer", ""),
+        "judge_verdict": state.get("verdict"),
+        "judge_reason": state.get("reason", ""),
+    }
+    if state.get("mode") == "calibrate":
+        payload["human_verdict"] = state.get("human_verdict")
+
+    answer = str(interrupt(payload)).strip().lower()
+    if answer == "skip":
+        return {}
+    for verdict in REVIEW_VERDICTS:
+        if answer == verdict.lower():
+            return {"founder_verdict": verdict}
+    raise ValueError(
+        f"review answer must be Pass, Partial, Fail or skip, not {answer!r}"
+    )
+
+
 def build_graph(checkpointer=None):
     g = StateGraph(RowState)
     g.add_node("generate", generate_node)
     g.add_node("judge", judge_node)
+    g.add_node("review", review_node)
     g.add_edge(START, "generate")
     g.add_edge("generate", "judge")
-    g.add_edge("judge", END)
+    g.add_conditional_edges("judge", route_after_judge, ["review", END])
+    g.add_edge("review", END)
     return g.compile(checkpointer=checkpointer)
 
 
@@ -343,8 +404,8 @@ def load_rows(category: str | None = None,
     return rows
 
 
-def _result_row(out: dict) -> dict:
-    return {
+def _result_row(out: dict, resumable: bool = False) -> dict:
+    result = {
         "id": out["id"],
         "channel": out["channel"],
         "category": out["category"],
@@ -357,10 +418,18 @@ def _result_row(out: dict) -> dict:
         "human_verdict": out.get("human_verdict"),
         "seconds": out.get("seconds", 0.0),
     }
+    if resumable:
+        # "verdict" stays the judge's, so the summary and judge_agreement
+        # still grade the judge. The founder's verdict sits beside it.
+        result["judge_verdict"] = result["verdict"]
+        if out.get("founder_verdict"):
+            result["founder_verdict"] = out["founder_verdict"]
+    return result
 
 
-def _row_config(run_id: str, row: dict) -> dict:
-    return {"configurable": {"thread_id": f"{run_id}:{row['id']}"}}
+def _row_config(run_id: str, row: dict, review: bool = False) -> dict:
+    return {"configurable": {"thread_id": f"{run_id}:{row['id']}",
+                             "review": review}}
 
 
 def _check_run_settings(graph, rows: list[dict], run_id: str,
@@ -380,17 +449,36 @@ def _check_run_settings(graph, rows: list[dict], run_id: str,
             )
 
 
+def _drive(graph, graph_input, config: dict,
+           ask: Optional[Callable[[dict], str]]) -> dict:
+    """Invoke the row, then answer each review pause until it reaches END."""
+    out = graph.invoke(graph_input, config, durability="sync")
+    while out.get("__interrupt__"):
+        answer = ask(out["__interrupt__"][0].value)
+        out = graph.invoke(Command(resume=answer), config, durability="sync")
+    return out
+
+
 def _run_row(graph, checkpointer, row: dict, judge: str, mode: str,
-             run_id: str) -> tuple[dict, bool]:
+             run_id: str, review: bool,
+             ask: Optional[Callable[[dict], str]]) -> tuple[dict, bool]:
     """Run one row on its own thread. Returns (final state, reused)."""
-    config = _row_config(run_id, row)
+    config = _row_config(run_id, row, review)
     snapshot = graph.get_state(config)
     saved = snapshot.values or {}
 
+    if snapshot.interrupts:
+        # Paused at review by an earlier run. The judge's verdict is real, so
+        # no model call is needed: ask again if this run reviews, otherwise
+        # report the judge's verdict and leave the row paused.
+        if not review:
+            return saved, True
+        resume = Command(resume=ask(snapshot.interrupts[0].value))
+        return _drive(graph, resume, config, ask), True
     if snapshot.next:
         # Cut off mid-graph (a crash, Ctrl+C): continue from the node that
         # did not finish. Nodes that finished are not run again.
-        return graph.invoke(None, config, durability="sync"), False
+        return _drive(graph, None, config, ask), False
     if saved.get("verdict") and saved["verdict"] != "Error":
         return saved, True
     if saved:
@@ -399,11 +487,13 @@ def _run_row(graph, checkpointer, row: dict, judge: str, mode: str,
         # stale "error" would send the judge straight back to Error.
         checkpointer.delete_thread(config["configurable"]["thread_id"])
     state: RowState = {**row, "judge": judge, "mode": mode}
-    return graph.invoke(state, config, durability="sync"), False
+    return _drive(graph, state, config, ask), False
 
 
 def _run_checkpointed(rows: list[dict], judge: str, mode: str, run_id: str,
-                      checkpointer) -> tuple[list[dict], int]:
+                      checkpointer, review: bool,
+                      ask: Optional[Callable[[dict], str]]
+                      ) -> tuple[list[dict], int]:
     opened = (nullcontext(checkpointer) if checkpointer is not None
               else _sqlite_checkpointer())
     with opened as saver:
@@ -411,16 +501,38 @@ def _run_checkpointed(rows: list[dict], judge: str, mode: str, run_id: str,
         _check_run_settings(graph, rows, run_id, judge, mode)
         results, reused = [], 0
         for row in rows:
-            out, was_reused = _run_row(graph, saver, row, judge, mode, run_id)
-            results.append(_result_row(out))
+            out, was_reused = _run_row(graph, saver, row, judge, mode,
+                                       run_id, review, ask)
+            results.append(_result_row(out, resumable=True))
             reused += was_reused
     return results, reused
+
+
+def ask_on_console(payload: dict) -> str:
+    """The command line's reviewer: show a paused row, read the verdict."""
+    rule = "=" * 72
+    print(f"\n{rule}\nREVIEW row {payload.get('id')}: "
+          f"the judge said {payload.get('judge_verdict')}\n{rule}")
+    print(f"QUESTION:\n{payload.get('question', '')}\n")
+    print(f"TWIN'S ANSWER:\n{payload.get('answer', '')}\n")
+    print(f"IDEAL ANSWER:\n{payload.get('ideal_answer', '')}\n")
+    print(f"JUDGE: {payload.get('judge_verdict')} - {payload.get('judge_reason', '')}")
+    if payload.get("human_verdict"):
+        print(f"FOUNDER'S RECORDED VERDICT: {payload['human_verdict']}")
+    choices = {c.lower(): c for c in (*REVIEW_VERDICTS, "skip")}
+    while True:
+        answer = input("Your verdict (Pass / Partial / Fail / skip): ").strip().lower()
+        if answer in choices:
+            return choices[answer]
+        print("Please type Pass, Partial, Fail or skip.")
 
 
 def run_eval(judge: str = "groq", category: str | None = None,
              mode: str = "fresh", limit: int | None = None,
              ideal_source: str | None = None,
-             run_id: str | None = None, checkpointer=None) -> dict:
+             run_id: str | None = None, checkpointer=None,
+             review: bool = False,
+             ask: Optional[Callable[[dict], str]] = None) -> dict:
     """Score the eval set. Returns the summary and one result per row.
 
     run_id makes the run resumable (see the module docstring): re-running
@@ -428,6 +540,12 @@ def run_eval(judge: str = "groq", category: str | None = None,
     run is exactly as before: no checkpointer, same result shape.
     checkpointer replaces eval/runs/checkpoints.sqlite, e.g. with
     InMemorySaver in the tests. It needs a run_id.
+
+    review=True (needs a run_id) pauses each row the judge scored Partial,
+    or, in calibrate mode, scored differently from human_verdict. ask gets
+    the paused row and returns "Pass", "Partial", "Fail" or "skip"; it
+    defaults to ask_on_console. With a run_id every result carries
+    judge_verdict, plus founder_verdict when the founder gave one.
     """
     # Installed here, not at module import time: importing this module
     # (e.g. transitively, from anything that isn't actually starting an
@@ -443,6 +561,10 @@ def run_eval(judge: str = "groq", category: str | None = None,
         )
     if checkpointer is not None and run_id is None:
         raise ValueError("a checkpointer needs a run_id")
+    if review and run_id is None:
+        raise ValueError("review needs a run_id: a paused row lives in the checkpointer")
+    if review and ask is None:
+        ask = ask_on_console
 
     # In calibrate mode the as-sent rows are degenerate: their ideal IS the
     # recorded answer, so the judge would be comparing a string to itself.
@@ -470,7 +592,7 @@ def run_eval(judge: str = "groq", category: str | None = None,
             results.append(_result_row(GRAPH.invoke(state)))
     else:
         results, rows_reused = _run_checkpointed(
-            rows, judge, mode, run_id, checkpointer
+            rows, judge, mode, run_id, checkpointer, review, ask
         )
         resumable = {"run_id": run_id, "rows_reused": rows_reused}
 
