@@ -9,4 +9,7 @@ uvicorn>=0.30
 openpyxl>=3.1          # one-time xlsx -> eval_set.json conversion
 groq>=0.11             # judge backend: "groq"
                        # judge backend: "ollama" uses plain HTTP via requests
+# Resumable runs (run_eval(run_id=...)). 3.1.1 needs langgraph-checkpoint
+# >=4.1.0,<5, the same range the root's langgraph==1.2.12 needs.
+langgraph-checkpoint-sqlite==3.1.1
 # langgraph and requests are already pinned in the root requirements.txt

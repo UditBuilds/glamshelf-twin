@@ -180,6 +180,58 @@ Two honest caveats:
   these columns. If eval ground truth is going to carry brand rules, the rule needs a column of
   its own.
 
+## Resuming a run, and reviewing verdicts yourself
+
+The HTTP route scores everything in one request, as before. The command line adds two things:
+
+- **Resuming.** `--run-id NAME` saves each row's progress in `eval/runs/checkpoints.sqlite`,
+  one LangGraph thread per row (`NAME:<row id>`). If the run stops (a crash, Ctrl+C, a Groq
+  rate limit), run the same command again. Rows that already have a verdict are reused with
+  no model call. Rows that ended in `Error` run again. A row that was cut off halfway continues
+  from the step where it stopped. A run id keeps its judge and mode, so the same id with
+  another `--judge` or `--mode` is refused. Use a new id for that.
+- **Review.** `--review` pauses each row the judge scored `Partial`. In `--mode calibrate` it
+  also pauses each row where the judge disagrees with your recorded verdict. For each one it
+  shows the question, the twin's answer, the ideal answer and the judge's verdict and reason,
+  then asks `Pass / Partial / Fail / skip`. The judge's prompt asks for Pass or Fail only, so
+  in `fresh` mode a Partial is rare (the Groq run above had none), and a review run may never
+  pause. In `calibrate` mode it pauses on every disagreement.
+  - Your answer is saved as `founder_verdict`.
+  - The judge's verdict stays in `verdict` (and `judge_verdict`), so the pass rate and
+    `judge_agreement` still measure the judge.
+  - `skip` keeps the judge's verdict and records nothing.
+  - If you stop at a prompt, the next `--review` run asks again without a model call.
+  - Review only covers rows judged in a `--review` run. A row that already finished without
+    it is not reopened.
+
+The full results are written to `eval/runs/NAME.json`. `eval/runs/` is gitignored because it
+holds model outputs. Never commit it.
+
+Install the eval requirements once. This adds `langgraph-checkpoint-sqlite`:
+
+```powershell
+venv\Scripts\python.exe -m pip install -r eval/requirements.txt
+```
+
+Then, in Windows PowerShell from the repo root:
+
+```powershell
+# A full scored run. If it stops, run the same line again to continue.
+venv\Scripts\python.exe -m eval.harness --run-id oct08
+
+# The same run, pausing each Partial verdict for your own verdict.
+venv\Scripts\python.exe -m eval.harness --run-id oct08-review --review
+
+# Calibrate the judge, reviewing only where it disagrees with your recorded verdict.
+venv\Scripts\python.exe -m eval.harness --run-id oct08-cal --mode calibrate --review
+
+# A five-row smoke test with the local judge.
+venv\Scripts\python.exe -m eval.harness --run-id smoke --judge ollama --limit 5
+```
+
+Every row that isn't reused calls the models: DeepSeek for the twin (`fresh` mode only), and
+the judge.
+
 ## Output
 
 ```jsonc
@@ -225,10 +277,11 @@ production SQLite.
 ```
 eval/
 ├── convert.py          # one-time xlsx -> eval_set.json
-├── harness.py          # LangGraph: generate -> judge, plus scoring
+├── harness.py          # LangGraph: generate -> judge (-> review), scoring, command line
 ├── api.py              # FastAPI: GET /health, POST /eval/run
 ├── requirements.txt    # eval-only deps; NOT installed on Render
-└── data/eval_set.json  # 73 scorable rows
+├── data/eval_set.json  # 73 scorable rows
+└── runs/               # resumable-run checkpoints and results; gitignored, never commit
 ```
 
 Local only. Not deployed, and nothing in `app.py` imports from this directory.

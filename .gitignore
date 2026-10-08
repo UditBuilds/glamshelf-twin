@@ -32,3 +32,6 @@ diff-review-fastembed-rag-2026-07-05.md
 # Local trace / test report files (audit T2-20) — never commit
 *-trace*.md
 *-test*.md
+
+# Eval run checkpoints and results: model outputs, never commit
+eval/runs/

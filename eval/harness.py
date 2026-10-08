@@ -1,10 +1,12 @@
 """LangGraph eval harness for the Glam Shelf twin.
 
-Two nodes per row:
+Per row:
 
     generate  -> call app.draft_reply_logic() for a fresh reply
     judge     -> compare that reply to the founder's ideal answer,
                  return Pass / Partial / Fail + a one-line reason
+    review    -> only with review=True: pause on interrupt() so the
+                 founder can give their own verdict (see review_node)
 
 NOTHING HERE CAN SEND A CUSTOMER MESSAGE. Two independent reasons:
 
@@ -26,17 +28,30 @@ _restore_db_from_github, _init_db, _start_backup_loop), so the env guard
 below blanks the GitHub credentials and points DB_PATH at a scratch file
 BEFORE the import. Without that, an eval run could pull down and re-push
 the production SQLite. Same pattern as tests/test_pause_gate.py.
+
+Resumable runs: run_eval(run_id=...) compiles the graph with a
+checkpointer and runs each row on its own thread, "<run_id>:<row id>".
+Re-running the same run_id reuses every row that already finished with a
+real verdict (no model call), runs "Error" rows again from scratch, and
+continues a row that was cut off mid-graph from the node where it
+stopped. Real runs keep their checkpoints in eval/runs/checkpoints.sqlite,
+which is gitignored because it holds model outputs. The SQLite
+checkpointer (langgraph-checkpoint-sqlite, eval/requirements.txt) is
+imported only when such a run starts, so importing this module never
+needs it.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import sys
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Callable, Optional, TypedDict
+from typing import Any, Callable, Iterator, Optional, TypedDict
 
 # ---------------------------------------------------------------------------
 # Env guard - must run before `import app`.
@@ -54,11 +69,21 @@ os.environ.setdefault("APP_PASSWORD", "eval")
 os.environ.setdefault("DASHBOARD_KEY", "eval")
 
 import requests  # noqa: E402
+from langchain_core.runnables import RunnableConfig  # noqa: E402
 from langgraph.graph import END, START, StateGraph  # noqa: E402
+from langgraph.types import Command, interrupt  # noqa: E402
 
 import app  # noqa: E402
 
 DATA_FILE = Path(__file__).resolve().parent / "data" / "eval_set.json"
+
+# Resumable runs. Model outputs live here, so the folder is gitignored.
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
+CHECKPOINT_DB = RUNS_DIR / "checkpoints.sqlite"
+
+# A run id becomes part of each thread id ("<run_id>:<row id>") and of the
+# command line's results file name, so keep it to plain characters.
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # Every function in app that can reach a real customer or the founder.
 _OUTBOUND = [
@@ -225,6 +250,8 @@ class RowState(TypedDict, total=False):
     error: str
     seconds: float
 
+    founder_verdict: str  # set by review_node; verdict stays the judge's
+
 
 def generate_node(state: RowState) -> dict:
     """Produce the answer to be graded.
@@ -276,17 +303,92 @@ def judge_node(state: RowState) -> dict:
     return {"verdict": verdict, "reason": reason}
 
 
-def build_graph():
+REVIEW_VERDICTS = ("Pass", "Partial", "Fail")
+
+
+def _needs_review(state: RowState) -> bool:
+    """A Partial verdict, or (calibrate) the judge disagreeing with the
+    founder's recorded verdict. Error is not a verdict, so never reviewed."""
+    verdict = state.get("verdict")
+    if verdict == "Partial":
+        return True
+    human = state.get("human_verdict")
+    return (state.get("mode") == "calibrate" and bool(human)
+            and verdict in REVIEW_VERDICTS and verdict != human)
+
+
+def route_after_judge(state: RowState, config: RunnableConfig) -> str:
+    # Review is a setting of the run, not of the row, so it comes from the
+    # invoke config: a row resumed mid-graph follows the current --review.
+    # Without it (and always without a run_id) judge goes straight to END.
+    wanted = config.get("configurable", {}).get("review", False)
+    return "review" if wanted and _needs_review(state) else END
+
+
+def review_node(state: RowState) -> dict:
+    """Pause the row for the founder's verdict.
+
+    interrupt() saves the row and hands the payload to whoever drives the
+    graph (the command line asks Pass / Partial / Fail / skip). The row
+    resumes with Command(resume=<answer>), and this node runs again from
+    the top, with interrupt() now returning the answer. "skip" keeps the
+    judge's verdict and records no founder_verdict.
+    """
+    payload = {
+        "id": state.get("id"),
+        "question": state.get("question", ""),
+        "answer": state.get("fresh_answer", ""),
+        "ideal_answer": state.get("ideal_answer", ""),
+        "judge_verdict": state.get("verdict"),
+        "judge_reason": state.get("reason", ""),
+    }
+    if state.get("mode") == "calibrate":
+        payload["human_verdict"] = state.get("human_verdict")
+
+    answer = str(interrupt(payload)).strip().lower()
+    if answer == "skip":
+        return {}
+    for verdict in REVIEW_VERDICTS:
+        if answer == verdict.lower():
+            return {"founder_verdict": verdict}
+    raise ValueError(
+        f"review answer must be Pass, Partial, Fail or skip, not {answer!r}"
+    )
+
+
+def build_graph(checkpointer=None):
     g = StateGraph(RowState)
     g.add_node("generate", generate_node)
     g.add_node("judge", judge_node)
+    g.add_node("review", review_node)
     g.add_edge(START, "generate")
     g.add_edge("generate", "judge")
-    g.add_edge("judge", END)
-    return g.compile()
+    g.add_conditional_edges("judge", route_after_judge, ["review", END])
+    g.add_edge("review", END)
+    return g.compile(checkpointer=checkpointer)
 
 
+# No checkpointer: what a run without a run_id uses.
 GRAPH = build_graph()
+
+
+@contextmanager
+def _sqlite_checkpointer() -> Iterator[Any]:
+    """Open the SQLite checkpointer at CHECKPOINT_DB, creating eval/runs/.
+
+    Imported here, not at module level: importing the harness (eval/api.py,
+    the tests, CI) must never need langgraph-checkpoint-sqlite.
+    """
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except ImportError as exc:
+        raise RuntimeError(
+            "Resumable runs need langgraph-checkpoint-sqlite. Install the eval "
+            "requirements: venv\\Scripts\\python.exe -m pip install -r eval/requirements.txt"
+        ) from exc
+    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as saver:
+        yield saver
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +405,149 @@ def load_rows(category: str | None = None,
     return rows
 
 
+def _result_row(out: dict, resumable: bool = False) -> dict:
+    result = {
+        "id": out["id"],
+        "channel": out["channel"],
+        "category": out["category"],
+        "question": out["question"],
+        "ideal_answer": out["ideal_answer"],
+        "fresh_answer": out.get("fresh_answer", ""),
+        "classification": out.get("classification", ""),
+        "verdict": out.get("verdict", "Error"),
+        "reason": out.get("reason", ""),
+        "human_verdict": out.get("human_verdict"),
+        "seconds": out.get("seconds", 0.0),
+    }
+    if resumable:
+        # "verdict" stays the judge's, so the summary and judge_agreement
+        # still grade the judge. The founder's verdict sits beside it.
+        result["judge_verdict"] = result["verdict"]
+        if out.get("founder_verdict"):
+            result["founder_verdict"] = out["founder_verdict"]
+    return result
+
+
+def _row_config(run_id: str, row: dict, review: bool = False) -> dict:
+    return {"configurable": {"thread_id": f"{run_id}:{row['id']}",
+                             "review": review}}
+
+
+def _check_run_settings(graph, rows: list[dict], run_id: str,
+                        judge: str, mode: str) -> None:
+    """Refuse to mix judges or modes within one run_id.
+
+    Reused rows keep the verdicts they were given, so a second judge on the
+    same run_id would silently blend two judges into one summary.
+    """
+    for row in rows:
+        saved = graph.get_state(_row_config(run_id, row)).values or {}
+        if saved and (saved.get("judge"), saved.get("mode")) != (judge, mode):
+            raise ValueError(
+                f"run {run_id!r} already has row {row['id']} with "
+                f"judge={saved.get('judge')!r} and mode={saved.get('mode')!r}. "
+                "Re-run it with those settings, or use a new run_id."
+            )
+
+
+def _drive(graph, graph_input, config: dict,
+           ask: Optional[Callable[[dict], str]]) -> dict:
+    """Invoke the row, then answer each review pause until it reaches END."""
+    out = graph.invoke(graph_input, config, durability="sync")
+    while out.get("__interrupt__"):
+        answer = ask(out["__interrupt__"][0].value)
+        out = graph.invoke(Command(resume=answer), config, durability="sync")
+    return out
+
+
+def _run_row(graph, checkpointer, row: dict, judge: str, mode: str,
+             run_id: str, review: bool,
+             ask: Optional[Callable[[dict], str]]) -> tuple[dict, bool]:
+    """Run one row on its own thread. Returns (final state, reused)."""
+    config = _row_config(run_id, row, review)
+    snapshot = graph.get_state(config)
+    saved = snapshot.values or {}
+
+    if snapshot.interrupts:
+        # Paused at review by an earlier run. The judge's verdict is real, so
+        # no model call is needed: ask again if this run reviews, otherwise
+        # report the judge's verdict and leave the row paused.
+        if not review:
+            return saved, True
+        resume = Command(resume=ask(snapshot.interrupts[0].value))
+        return _drive(graph, resume, config, ask), True
+    if snapshot.next:
+        # Cut off mid-graph (a crash, Ctrl+C): continue from the node that
+        # did not finish. Nodes that finished are not run again.
+        return _drive(graph, None, config, ask), False
+    if saved.get("verdict") and saved["verdict"] != "Error":
+        return saved, True
+    if saved:
+        # Ended in "Error": start the row over on a clean thread. Invoking a
+        # finished thread merges the new input over the old values, so a
+        # stale "error" would send the judge straight back to Error.
+        checkpointer.delete_thread(config["configurable"]["thread_id"])
+    state: RowState = {**row, "judge": judge, "mode": mode}
+    return _drive(graph, state, config, ask), False
+
+
+def _run_checkpointed(rows: list[dict], judge: str, mode: str, run_id: str,
+                      checkpointer, review: bool,
+                      ask: Optional[Callable[[dict], str]]
+                      ) -> tuple[list[dict], int]:
+    opened = (nullcontext(checkpointer) if checkpointer is not None
+              else _sqlite_checkpointer())
+    with opened as saver:
+        graph = build_graph(saver)
+        _check_run_settings(graph, rows, run_id, judge, mode)
+        results, reused = [], 0
+        for row in rows:
+            out, was_reused = _run_row(graph, saver, row, judge, mode,
+                                       run_id, review, ask)
+            results.append(_result_row(out, resumable=True))
+            reused += was_reused
+    return results, reused
+
+
+def ask_on_console(payload: dict) -> str:
+    """The command line's reviewer: show a paused row, read the verdict."""
+    rule = "=" * 72
+    print(f"\n{rule}\nREVIEW row {payload.get('id')}: "
+          f"the judge said {payload.get('judge_verdict')}\n{rule}")
+    print(f"QUESTION:\n{payload.get('question', '')}\n")
+    print(f"TWIN'S ANSWER:\n{payload.get('answer', '')}\n")
+    print(f"IDEAL ANSWER:\n{payload.get('ideal_answer', '')}\n")
+    print(f"JUDGE: {payload.get('judge_verdict')} - {payload.get('judge_reason', '')}")
+    if payload.get("human_verdict"):
+        print(f"FOUNDER'S RECORDED VERDICT: {payload['human_verdict']}")
+    choices = {c.lower(): c for c in (*REVIEW_VERDICTS, "skip")}
+    while True:
+        answer = input("Your verdict (Pass / Partial / Fail / skip): ").strip().lower()
+        if answer in choices:
+            return choices[answer]
+        print("Please type Pass, Partial, Fail or skip.")
+
+
 def run_eval(judge: str = "groq", category: str | None = None,
              mode: str = "fresh", limit: int | None = None,
-             ideal_source: str | None = None) -> dict:
+             ideal_source: str | None = None,
+             run_id: str | None = None, checkpointer=None,
+             review: bool = False,
+             ask: Optional[Callable[[dict], str]] = None) -> dict:
+    """Score the eval set. Returns the summary and one result per row.
+
+    run_id makes the run resumable (see the module docstring): re-running
+    the same run_id continues where the last one stopped. Without it the
+    run is exactly as before: no checkpointer, same result shape.
+    checkpointer replaces eval/runs/checkpoints.sqlite, e.g. with
+    InMemorySaver in the tests. It needs a run_id.
+
+    review=True (needs a run_id) pauses each row the judge scored Partial,
+    or, in calibrate mode, scored differently from human_verdict. ask gets
+    the paused row and returns "Pass", "Partial", "Fail" or "skip"; it
+    defaults to ask_on_console. With a run_id every result carries
+    judge_verdict, plus founder_verdict when the founder gave one.
+    """
     # Installed here, not at module import time: importing this module
     # (e.g. transitively, from anything that isn't actually starting an
     # eval run) must never touch app's send functions. See the Sep 2026
@@ -314,6 +556,16 @@ def run_eval(judge: str = "groq", category: str | None = None,
 
     if judge not in JUDGES:
         raise ValueError(f"unknown judge {judge!r}; expected one of {sorted(JUDGES)}")
+    if run_id is not None and not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            f"run_id {run_id!r} may only use letters, digits, '.', '_' and '-'"
+        )
+    if checkpointer is not None and run_id is None:
+        raise ValueError("a checkpointer needs a run_id")
+    if review and run_id is None:
+        raise ValueError("review needs a run_id: a paused row lives in the checkpointer")
+    if review and ask is None:
+        ask = ask_on_console
 
     # In calibrate mode the as-sent rows are degenerate: their ideal IS the
     # recorded answer, so the judge would be comparing a string to itself.
@@ -333,23 +585,17 @@ def run_eval(judge: str = "groq", category: str | None = None,
         }
 
     started = time.time()
-    results = []
-    for row in rows:
-        state: RowState = {**row, "judge": judge, "mode": mode}
-        out = GRAPH.invoke(state)
-        results.append({
-            "id": out["id"],
-            "channel": out["channel"],
-            "category": out["category"],
-            "question": out["question"],
-            "ideal_answer": out["ideal_answer"],
-            "fresh_answer": out.get("fresh_answer", ""),
-            "classification": out.get("classification", ""),
-            "verdict": out.get("verdict", "Error"),
-            "reason": out.get("reason", ""),
-            "human_verdict": out.get("human_verdict"),
-            "seconds": out.get("seconds", 0.0),
-        })
+    resumable: dict = {}
+    if run_id is None:
+        results = []
+        for row in rows:
+            state: RowState = {**row, "judge": judge, "mode": mode}
+            results.append(_result_row(GRAPH.invoke(state)))
+    else:
+        results, rows_reused = _run_checkpointed(
+            rows, judge, mode, run_id, checkpointer, review, ask
+        )
+        resumable = {"run_id": run_id, "rows_reused": rows_reused}
 
     return {
         "judge": judge,
@@ -357,6 +603,7 @@ def run_eval(judge: str = "groq", category: str | None = None,
         "mode": mode,
         "category": category,
         "ideal_source": ideal_source,
+        **resumable,
         "rows_scored": len(results),
         "elapsed_seconds": round(time.time() - started, 1),
         "summary": summarize(results, mode=mode),
@@ -410,3 +657,80 @@ def summarize(results: list[dict], mode: str = "fresh") -> dict:
             ],
         }
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m eval.harness --run-id NAME [--review] [--judge groq]
+                              [--mode fresh|calibrate] [--limit N]
+
+    Always a resumable run: run the same command again to continue it.
+    Writes every result to eval/runs/<NAME>.json and prints the summary.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m eval.harness",
+        description=(
+            "Score the eval set as a resumable run. After a crash or a rate "
+            "limit, run the same command again to continue where it stopped."
+        ),
+    )
+    parser.add_argument("--run-id", required=True, metavar="NAME",
+                        help="names the run; the same NAME resumes it")
+    parser.add_argument("--review", action="store_true",
+                        help="pause Partial verdicts (and, in calibrate mode, "
+                             "disagreements with your recorded verdict) for "
+                             "your own verdict")
+    parser.add_argument("--judge", choices=sorted(JUDGES), default="groq")
+    parser.add_argument("--mode", choices=("fresh", "calibrate"), default="fresh")
+    parser.add_argument("--limit", type=_positive_int, metavar="N",
+                        help="score only the first N rows")
+    args = parser.parse_args(argv)
+
+    try:
+        report = run_eval(judge=args.judge, mode=args.mode, limit=args.limit,
+                          run_id=args.run_id, review=args.review)
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C, or stdin closed at a review prompt. Every finished step
+        # is saved, so the same command continues from here.
+        print(f"\nStopped. Run the same command again to continue "
+              f"run {args.run_id!r}.", file=sys.stderr)
+        return 130
+
+    if not report["rows_scored"]:
+        print(report.get("note", "no rows to score"))
+        return 0
+
+    out_file = RUNS_DIR / f"{args.run_id}.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(json.dumps(report, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+
+    overall = report["summary"]["overall"]
+    print(f"\nRun {args.run_id!r}: {report['rows_scored']} rows, "
+          f"{report['rows_reused']} reused from earlier runs.")
+    print("Judge: Pass {Pass}, Partial {Partial}, Fail {Fail}, Error {Error}; "
+          "pass rate {pass_rate}".format(**overall))
+    if args.review:
+        reviewed = sum(1 for r in report["results"] if "founder_verdict" in r)
+        print(f"Founder verdicts recorded: {reviewed}")
+    if overall["Error"]:
+        print(f"{overall['Error']} rows ended in Error. Run the same command "
+              "again to retry only those.")
+    print(f"Results: {out_file}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
