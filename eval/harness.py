@@ -26,6 +26,17 @@ _restore_db_from_github, _init_db, _start_backup_loop), so the env guard
 below blanks the GitHub credentials and points DB_PATH at a scratch file
 BEFORE the import. Without that, an eval run could pull down and re-push
 the production SQLite. Same pattern as tests/test_pause_gate.py.
+
+Resumable runs: run_eval(run_id=...) compiles the graph with a
+checkpointer and runs each row on its own thread, "<run_id>:<row id>".
+Re-running the same run_id reuses every row that already finished with a
+real verdict (no model call), runs "Error" rows again from scratch, and
+continues a row that was cut off mid-graph from the node where it
+stopped. Real runs keep their checkpoints in eval/runs/checkpoints.sqlite,
+which is gitignored because it holds model outputs. The SQLite
+checkpointer (langgraph-checkpoint-sqlite, eval/requirements.txt) is
+imported only when such a run starts, so importing this module never
+needs it.
 """
 from __future__ import annotations
 
@@ -35,8 +46,9 @@ import re
 import sys
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Callable, Optional, TypedDict
+from typing import Any, Callable, Iterator, Optional, TypedDict
 
 # ---------------------------------------------------------------------------
 # Env guard - must run before `import app`.
@@ -59,6 +71,14 @@ from langgraph.graph import END, START, StateGraph  # noqa: E402
 import app  # noqa: E402
 
 DATA_FILE = Path(__file__).resolve().parent / "data" / "eval_set.json"
+
+# Resumable runs. Model outputs live here, so the folder is gitignored.
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
+CHECKPOINT_DB = RUNS_DIR / "checkpoints.sqlite"
+
+# A run id becomes part of each thread id ("<run_id>:<row id>"), so keep it
+# to plain characters.
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # Every function in app that can reach a real customer or the founder.
 _OUTBOUND = [
@@ -276,17 +296,37 @@ def judge_node(state: RowState) -> dict:
     return {"verdict": verdict, "reason": reason}
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     g = StateGraph(RowState)
     g.add_node("generate", generate_node)
     g.add_node("judge", judge_node)
     g.add_edge(START, "generate")
     g.add_edge("generate", "judge")
     g.add_edge("judge", END)
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
+# No checkpointer: what a run without a run_id uses.
 GRAPH = build_graph()
+
+
+@contextmanager
+def _sqlite_checkpointer() -> Iterator[Any]:
+    """Open the SQLite checkpointer at CHECKPOINT_DB, creating eval/runs/.
+
+    Imported here, not at module level: importing the harness (eval/api.py,
+    the tests, CI) must never need langgraph-checkpoint-sqlite.
+    """
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except ImportError as exc:
+        raise RuntimeError(
+            "Resumable runs need langgraph-checkpoint-sqlite. Install the eval "
+            "requirements: venv\\Scripts\\python.exe -m pip install -r eval/requirements.txt"
+        ) from exc
+    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as saver:
+        yield saver
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +343,92 @@ def load_rows(category: str | None = None,
     return rows
 
 
+def _result_row(out: dict) -> dict:
+    return {
+        "id": out["id"],
+        "channel": out["channel"],
+        "category": out["category"],
+        "question": out["question"],
+        "ideal_answer": out["ideal_answer"],
+        "fresh_answer": out.get("fresh_answer", ""),
+        "classification": out.get("classification", ""),
+        "verdict": out.get("verdict", "Error"),
+        "reason": out.get("reason", ""),
+        "human_verdict": out.get("human_verdict"),
+        "seconds": out.get("seconds", 0.0),
+    }
+
+
+def _row_config(run_id: str, row: dict) -> dict:
+    return {"configurable": {"thread_id": f"{run_id}:{row['id']}"}}
+
+
+def _check_run_settings(graph, rows: list[dict], run_id: str,
+                        judge: str, mode: str) -> None:
+    """Refuse to mix judges or modes within one run_id.
+
+    Reused rows keep the verdicts they were given, so a second judge on the
+    same run_id would silently blend two judges into one summary.
+    """
+    for row in rows:
+        saved = graph.get_state(_row_config(run_id, row)).values or {}
+        if saved and (saved.get("judge"), saved.get("mode")) != (judge, mode):
+            raise ValueError(
+                f"run {run_id!r} already has row {row['id']} with "
+                f"judge={saved.get('judge')!r} and mode={saved.get('mode')!r}. "
+                "Re-run it with those settings, or use a new run_id."
+            )
+
+
+def _run_row(graph, checkpointer, row: dict, judge: str, mode: str,
+             run_id: str) -> tuple[dict, bool]:
+    """Run one row on its own thread. Returns (final state, reused)."""
+    config = _row_config(run_id, row)
+    snapshot = graph.get_state(config)
+    saved = snapshot.values or {}
+
+    if snapshot.next:
+        # Cut off mid-graph (a crash, Ctrl+C): continue from the node that
+        # did not finish. Nodes that finished are not run again.
+        return graph.invoke(None, config, durability="sync"), False
+    if saved.get("verdict") and saved["verdict"] != "Error":
+        return saved, True
+    if saved:
+        # Ended in "Error": start the row over on a clean thread. Invoking a
+        # finished thread merges the new input over the old values, so a
+        # stale "error" would send the judge straight back to Error.
+        checkpointer.delete_thread(config["configurable"]["thread_id"])
+    state: RowState = {**row, "judge": judge, "mode": mode}
+    return graph.invoke(state, config, durability="sync"), False
+
+
+def _run_checkpointed(rows: list[dict], judge: str, mode: str, run_id: str,
+                      checkpointer) -> tuple[list[dict], int]:
+    opened = (nullcontext(checkpointer) if checkpointer is not None
+              else _sqlite_checkpointer())
+    with opened as saver:
+        graph = build_graph(saver)
+        _check_run_settings(graph, rows, run_id, judge, mode)
+        results, reused = [], 0
+        for row in rows:
+            out, was_reused = _run_row(graph, saver, row, judge, mode, run_id)
+            results.append(_result_row(out))
+            reused += was_reused
+    return results, reused
+
+
 def run_eval(judge: str = "groq", category: str | None = None,
              mode: str = "fresh", limit: int | None = None,
-             ideal_source: str | None = None) -> dict:
+             ideal_source: str | None = None,
+             run_id: str | None = None, checkpointer=None) -> dict:
+    """Score the eval set. Returns the summary and one result per row.
+
+    run_id makes the run resumable (see the module docstring): re-running
+    the same run_id continues where the last one stopped. Without it the
+    run is exactly as before: no checkpointer, same result shape.
+    checkpointer replaces eval/runs/checkpoints.sqlite, e.g. with
+    InMemorySaver in the tests. It needs a run_id.
+    """
     # Installed here, not at module import time: importing this module
     # (e.g. transitively, from anything that isn't actually starting an
     # eval run) must never touch app's send functions. See the Sep 2026
@@ -314,6 +437,12 @@ def run_eval(judge: str = "groq", category: str | None = None,
 
     if judge not in JUDGES:
         raise ValueError(f"unknown judge {judge!r}; expected one of {sorted(JUDGES)}")
+    if run_id is not None and not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            f"run_id {run_id!r} may only use letters, digits, '.', '_' and '-'"
+        )
+    if checkpointer is not None and run_id is None:
+        raise ValueError("a checkpointer needs a run_id")
 
     # In calibrate mode the as-sent rows are degenerate: their ideal IS the
     # recorded answer, so the judge would be comparing a string to itself.
@@ -333,23 +462,17 @@ def run_eval(judge: str = "groq", category: str | None = None,
         }
 
     started = time.time()
-    results = []
-    for row in rows:
-        state: RowState = {**row, "judge": judge, "mode": mode}
-        out = GRAPH.invoke(state)
-        results.append({
-            "id": out["id"],
-            "channel": out["channel"],
-            "category": out["category"],
-            "question": out["question"],
-            "ideal_answer": out["ideal_answer"],
-            "fresh_answer": out.get("fresh_answer", ""),
-            "classification": out.get("classification", ""),
-            "verdict": out.get("verdict", "Error"),
-            "reason": out.get("reason", ""),
-            "human_verdict": out.get("human_verdict"),
-            "seconds": out.get("seconds", 0.0),
-        })
+    resumable: dict = {}
+    if run_id is None:
+        results = []
+        for row in rows:
+            state: RowState = {**row, "judge": judge, "mode": mode}
+            results.append(_result_row(GRAPH.invoke(state)))
+    else:
+        results, rows_reused = _run_checkpointed(
+            rows, judge, mode, run_id, checkpointer
+        )
+        resumable = {"run_id": run_id, "rows_reused": rows_reused}
 
     return {
         "judge": judge,
@@ -357,6 +480,7 @@ def run_eval(judge: str = "groq", category: str | None = None,
         "mode": mode,
         "category": category,
         "ideal_source": ideal_source,
+        **resumable,
         "rows_scored": len(results),
         "elapsed_seconds": round(time.time() - started, 1),
         "summary": summarize(results, mode=mode),
