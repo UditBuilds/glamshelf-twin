@@ -4136,6 +4136,22 @@ def _whatsapp_circuit_close() -> None:
         print("[WATI-CIRCUIT] Closed — WATI accepted a send again")
 
 
+def _whatsapp_circuit_status() -> dict:
+    """The keyed /healthz "whatsapp" block. "open" lasts until a WATI send
+    succeeds: sends are skipped for WHATSAPP_CIRCUIT_OPEN_SECONDS after
+    opened_at, then the next one tries WATI again. No phone numbers."""
+    with _whatsapp_circuit_lock:
+        opened_at = _whatsapp_circuit["opened_at"]
+        reason = _whatsapp_circuit["reason"]
+    return {
+        "circuit": "closed" if opened_at is None else "open",
+        "reason": reason,
+        "opened_at": None if opened_at is None else (
+            datetime.fromtimestamp(opened_at, timezone.utc).isoformat(timespec="seconds")
+        ),
+    }
+
+
 def _whatsapp_permanent_error(error: str) -> bool:
     """True for a send_whatsapp_reply error that retrying can't fix: WATI
     refused the login (HTTP 401/403), the circuit is open, or WATI isn't
@@ -6675,6 +6691,9 @@ def healthz():
         # fallback counts as healthy. Keyed view only — the public answer
         # never turns 503 over RAG.
         "rag": _rag_health(),
+        # WhatsApp circuit (WATI refused the login): open/closed, WATI's
+        # status line and when it opened. Keyed view only.
+        "whatsapp": _whatsapp_circuit_status(),
         # Which pipeline answers Instagram text DMs (TWIN_USE_LANGGRAPH), and
         # why graph.py didn't load when the flag is ON but it failed.
         "reply_path": "langgraph" if _use_langgraph() else "legacy",
