@@ -4065,6 +4065,11 @@ def normalize_wa(number: str) -> str:
 # on its own (_whatsapp_permanent_error).
 WHATSAPP_CIRCUIT_OPEN_SECONDS = 6 * 60 * 60
 WHATSAPP_CIRCUIT_ERROR_PREFIX = "WhatsApp circuit open: "
+# Each open (and re-open after a failed probe) asks for the founder's
+# WhatsApp-down alert; _job_claim lets at most one through a day, and the
+# stamp in scheduled_jobs survives restarts (same as the RAG alert).
+WHATSAPP_DOWN_ALERT_JOB = "whatsapp_down_alert"
+WHATSAPP_DOWN_ALERT_INTERVAL_SECONDS = 24 * 60 * 60
 WATI_NOT_CONFIGURED_ERROR = "WATI_API_KEY or WATI_ENDPOINT not set"
 _whatsapp_circuit: dict = {"opened_at": None, "reason": None}
 _whatsapp_circuit_lock = threading.Lock()
@@ -4094,6 +4099,31 @@ def _whatsapp_circuit_trip(reason: str) -> None:
         f"[WATI-CIRCUIT] Open for {WHATSAPP_CIRCUIT_OPEN_SECONDS // 3600}h — {reason}. "
         "WhatsApp sends are skipped until then; the next send after that tries WATI again."
     )
+    _whatsapp_down_alert(reason)
+
+
+def _whatsapp_down_alert(reason: str) -> None:
+    """One Telegram alert per WHATSAPP_DOWN_ALERT_INTERVAL_SECONDS while
+    WATI refuses the login (restart-safe: the stamp is in scheduled_jobs).
+    Never names a customer. Never raises."""
+    try:
+        if not _job_claim(WHATSAPP_DOWN_ALERT_JOB, WHATSAPP_DOWN_ALERT_INTERVAL_SECONDS, time.time()):
+            print("[WATI-CIRCUIT] Already alerted in the last 24h")
+            return
+        if not TELEGRAM_CHAT_ID:
+            print("[WATI-CIRCUIT] Alert skipped: TELEGRAM_CHAT_ID not set")
+            return
+        _telegram_api("sendMessage", {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": (
+                f"⚠️ WhatsApp is down — WATI refused the login ({_redact_secrets(reason)[:200]}). "
+                "Twin is skipping WhatsApp messages, including shipping updates, "
+                "until it works again.\n\n"
+                "(At most one alert a day. The keyed /healthz shows the current state.)"
+            ),
+        })
+    except Exception as e:
+        print(f"[WATI-CIRCUIT] Down alert failed: {type(e).__name__}: {e}")
 
 
 def _whatsapp_circuit_close() -> None:
