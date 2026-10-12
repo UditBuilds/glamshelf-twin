@@ -4039,13 +4039,71 @@ def normalize_wa(number: str) -> str:
     return "".join(c for c in (number or "") if c.isdigit()).lstrip("0")
 
 
+# WhatsApp circuit breaker. WATI answering HTTP 401/403 means it refused
+# the login, and retrying can't fix that: every retry and every alert just
+# repeats the same news (Oct 2026: with the WATI account gone, one week of
+# shipping webhooks raised 34 "Shipping update FAILED" alerts). A 401/403
+# from a WATI send opens the circuit for WHATSAPP_CIRCUIT_OPEN_SECONDS:
+# sends then return at once, with no network call and no per-send alert.
+# After the window the next send is a real probe — success closes the
+# circuit, another 401/403 opens it again. In-memory on purpose: a restart
+# costs one real call. Missing WATI config never opens it: that path makes
+# no network call anyway, and the shipping helper treats it as permanent
+# on its own (_whatsapp_permanent_error).
+WHATSAPP_CIRCUIT_OPEN_SECONDS = 6 * 60 * 60
+WHATSAPP_CIRCUIT_ERROR_PREFIX = "WhatsApp circuit open: "
+WATI_NOT_CONFIGURED_ERROR = "WATI_API_KEY or WATI_ENDPOINT not set"
+_whatsapp_circuit: dict = {"opened_at": None, "reason": None}
+_whatsapp_circuit_lock = threading.Lock()
+
+
+def _whatsapp_circuit_blocking(now: float | None = None) -> str | None:
+    """The reason WhatsApp sends are being skipped right now, or None when
+    a send may go out (circuit closed, or its window has passed and this
+    send is the probe)."""
+    now = time.time() if now is None else now
+    with _whatsapp_circuit_lock:
+        opened_at = _whatsapp_circuit["opened_at"]
+        reason = _whatsapp_circuit["reason"]
+    if opened_at is not None and now - opened_at < WHATSAPP_CIRCUIT_OPEN_SECONDS:
+        return reason
+    return None
+
+
+def _whatsapp_circuit_trip(reason: str) -> None:
+    """Open (or re-open) the circuit after WATI refused the login. `reason`
+    is WATI's status line, e.g. "HTTP 401: (empty body)" — never a phone
+    number. Never raises."""
+    with _whatsapp_circuit_lock:
+        _whatsapp_circuit["opened_at"] = time.time()
+        _whatsapp_circuit["reason"] = reason
+    print(
+        f"[WATI-CIRCUIT] Open for {WHATSAPP_CIRCUIT_OPEN_SECONDS // 3600}h — {reason}. "
+        "WhatsApp sends are skipped until then; the next send after that tries WATI again."
+    )
+
+
+def _whatsapp_circuit_close() -> None:
+    """A WATI send worked: close the circuit if it was open."""
+    with _whatsapp_circuit_lock:
+        was_open = _whatsapp_circuit["opened_at"] is not None
+        _whatsapp_circuit["opened_at"] = None
+        _whatsapp_circuit["reason"] = None
+    if was_open:
+        print("[WATI-CIRCUIT] Closed — WATI accepted a send again")
+
+
 def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
     """Send an outbound WhatsApp text message to a customer via WATI.
 
     Returns (True, "") on a confirmed delivery, (False, error) on any
     failure — callers that log success MUST check this instead of
     assuming the send worked. Actual API/network failures also fire a
-    rate-limited Telegram alert via _alert_send_failure.
+    rate-limited Telegram alert via _alert_send_failure — except HTTP
+    401/403 (WATI refused the login), which opens the WhatsApp circuit
+    instead. While the circuit is open this returns
+    (False, "WhatsApp circuit open: <reason>") with no network call and
+    no alert.
 
     Endpoint choice — sendSessionMessage vs sendTemplateMessage:
       - /api/v1/sendSessionMessage/{wa_id} — used for replies WITHIN the
@@ -4072,8 +4130,8 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
     always return 200 to WATI to prevent retries / duplicate replies.
     """
     if not WATI_API_KEY or not WATI_ENDPOINT:
-        print("[WATI] Skipped: WATI_API_KEY or WATI_ENDPOINT not set")
-        return False, "WATI_API_KEY or WATI_ENDPOINT not set"
+        print(f"[WATI] Skipped: {WATI_NOT_CONFIGURED_ERROR}")
+        return False, WATI_NOT_CONFIGURED_ERROR
 
     # Defense in depth: never auto-send to the business or owner number,
     # even if some future change in the inbound filter ever lets one through.
@@ -4082,6 +4140,13 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
     if target and target in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
         print(f"[WATI] BLOCKED outbound to protected number {wa_id}")
         return False, "blocked: protected number"
+
+    # WATI refused the login recently: skip without a network call or an
+    # alert. Checked before the POST log line, which carries the number.
+    blocked = _whatsapp_circuit_blocking()
+    if blocked:
+        print(f"[WATI] Skipped: circuit open ({blocked})")
+        return False, WHATSAPP_CIRCUIT_ERROR_PREFIX + blocked
 
     endpoint = WATI_ENDPOINT.rstrip("/")
     url = f"{endpoint}/api/v1/sendSessionMessage/{wa_id}"
@@ -4112,6 +4177,15 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
         print(f"[WATI] HTTP {response.status_code}")
         print(f"[WATI] Response body: {body_preview}")
 
+        # WATI refused the login. Checked before the result=false branch
+        # so a 401 with a JSON body isn't mistaken for a one-off rejection.
+        # Opens the circuit instead of a per-send alert.
+        if response.status_code in (401, 403):
+            error = f"HTTP {response.status_code}: {body_preview[:120]}"
+            print(f"[WATI] Login refused — {error}")
+            _whatsapp_circuit_trip(error)
+            return False, error
+
         # Parse the response and surface result=false even on HTTP 200.
         try:
             data = response.json()
@@ -4126,6 +4200,7 @@ def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
             return False, error
         elif response.ok:
             print(f"[WATI] Sent reply to {wa_id} ({len(reply_text)} chars)")
+            _whatsapp_circuit_close()
             # Register the outbound so WATI's subsequent outbound webhook
             # (echoing this same message back) is identified as bot-originated
             # rather than Udit's manual reply — prevents HUMAN_UDIT mis-tagging
@@ -4268,6 +4343,8 @@ def send_whatsapp_template(
       True if WATI accepted the message (HTTP 2xx and result=true),
       False on any failure — network error, HTTP error, WATI rejection
       (e.g. template not approved, parameters mismatched), missing config.
+      Shares send_whatsapp_reply's circuit: False with no network call
+      while it is open, and an HTTP 401/403 here opens it.
       NEVER raises — caller can fall back to send_whatsapp_reply.
 
     Same auth + base URL as send_whatsapp_reply — only the path differs
@@ -4286,6 +4363,12 @@ def send_whatsapp_template(
     target = normalize_wa(wa_id)
     if target and target in {normalize_wa(BUSINESS_NUMBER), normalize_wa(OWNER_NUMBER)}:
         print(f"[WATI-TEMPLATE] BLOCKED outbound to protected number {wa_id}")
+        return False
+
+    # Same circuit as send_whatsapp_reply — same API key, same login.
+    blocked = _whatsapp_circuit_blocking()
+    if blocked:
+        print(f"[WATI-TEMPLATE] Skipped: circuit open ({blocked})")
         return False
 
     endpoint = WATI_ENDPOINT.rstrip("/")
@@ -4317,6 +4400,12 @@ def send_whatsapp_template(
         print(f"[WATI-TEMPLATE] HTTP {response.status_code}")
         print(f"[WATI-TEMPLATE] Response body: {body_preview}")
 
+        if response.status_code in (401, 403):
+            error = f"HTTP {response.status_code}: {body_preview[:120]}"
+            print(f"[WATI-TEMPLATE] Login refused — {error}")
+            _whatsapp_circuit_trip(error)
+            return False
+
         try:
             data = response.json()
         except ValueError:
@@ -4331,6 +4420,7 @@ def send_whatsapp_template(
             return False
 
         print(f"[WATI-TEMPLATE] Sent template {template_name!r} to {wa_id}")
+        _whatsapp_circuit_close()
 
         # Pre-register the outbound for HUMAN_UDIT echo detection. We
         # can't pre-register the rendered text (WATI renders the template
