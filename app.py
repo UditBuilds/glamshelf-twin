@@ -2337,6 +2337,9 @@ def _was_shipping_sent(order_id: str, message_type: str) -> bool:
 # the delays below. Pending Timers die on a Render restart — accepted:
 # the dedup key was never written, so any later webhook for the order
 # retries naturally (fails open to retry, never to permanent silence).
+# Permanent failures (_whatsapp_permanent_error: WATI refused the login,
+# the WhatsApp circuit is open, or WATI isn't configured) are skipped
+# instead: no retry, no per-order alert, no dedup key.
 # Rollback: SHIPPING_RETRY_DISABLED=1 restores the old send-once /
 # mark-always behavior without a redeploy.
 SHIPPING_SEND_MAX_ATTEMPTS = 3
@@ -2366,11 +2369,12 @@ def _send_shipping_with_retry(
     confirmed success.
 
     Returns True when this attempt delivered (and marked), False when it
-    failed — in which case a retry Timer is already scheduled, or the
-    exhaustion alert has fired. `also_mark` lists extra dedup keys to
-    write alongside message_type on success (the "shipped" message embeds
-    the tracking line, so its success must also suppress the separate
-    tracking follow-up).
+    failed — in which case a retry Timer is already scheduled, the
+    exhaustion alert has fired, or the error was permanent and the update
+    was skipped (logged as [SHIPPING-SKIP]). `also_mark` lists extra
+    dedup keys to write alongside message_type on success (the "shipped"
+    message embeds the tracking line, so its success must also suppress
+    the separate tracking follow-up).
 
     Never raises — Timer callbacks run on daemon threads where an
     exception would only kill the retry chain silently.
@@ -2405,6 +2409,14 @@ def _send_shipping_with_retry(
                 )
             return True
 
+        if _whatsapp_permanent_error(send_err):
+            # Retrying can't fix a refused login, an open circuit or missing
+            # WATI config, and "send it manually from WATI" is impossible
+            # then. No retry Timer, no per-order alert, and no dedup key:
+            # shipping_notifications only ever means "actually delivered".
+            print(f"[SHIPPING-SKIP] order {order_number} {message_type}: {send_err}")
+            return False
+
         if attempt < SHIPPING_SEND_MAX_ATTEMPTS:
             delay = SHIPPING_SEND_RETRY_DELAYS[attempt - 1]
             print(
@@ -2428,8 +2440,9 @@ def _send_shipping_with_retry(
             )
             # Distinct exhaustion alert (the per-failure rate-limited alert
             # already fired inside send_whatsapp_reply on every attempt).
-            # Dedup key stays unwritten so a manual resend or a later
-            # webhook can still deliver.
+            # Transient failures only — the WATI dashboard works then, so
+            # a manual resend is possible. Dedup key stays unwritten so a
+            # manual resend or a later webhook can still deliver.
             try:
                 _telegram_api("sendMessage", {
                     "chat_id": TELEGRAM_CHAT_ID,
@@ -4091,6 +4104,18 @@ def _whatsapp_circuit_close() -> None:
         _whatsapp_circuit["reason"] = None
     if was_open:
         print("[WATI-CIRCUIT] Closed — WATI accepted a send again")
+
+
+def _whatsapp_permanent_error(error: str) -> bool:
+    """True for a send_whatsapp_reply error that retrying can't fix: WATI
+    refused the login (HTTP 401/403), the circuit is open, or WATI isn't
+    configured. Everything else (5xx, timeouts, network errors, WATI
+    result=false) stays transient."""
+    error = error or ""
+    return (
+        error.startswith(("HTTP 401:", "HTTP 403:", WHATSAPP_CIRCUIT_ERROR_PREFIX))
+        or error == WATI_NOT_CONFIGURED_ERROR
+    )
 
 
 def send_whatsapp_reply(wa_id: str, reply_text: str) -> tuple[bool, str]:
