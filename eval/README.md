@@ -22,7 +22,8 @@ the founder's own written ground truth rather than a model's opinion of what sou
 - **Under test**: `app.draft_reply_logic()` — the real entry point, with the real brain, live
   Shopify inventory, live policies and RAG retrieval. Not a mock.
 - **Ground truth**: the founder's `Draft Ideal Answer`, with one repair described below.
-- **Judge**: an LLM that returns `Pass` / `Partial` / `Fail` plus a one-line reason.
+- **Judge**: an LLM that returns `Pass` / `Fail` plus a one-line reason. Until Sept 1 its
+  prompt also allowed `Partial`, and the parser still accepts it.
 
 Every row is scored with **no conversation history**. This measures baseline per-question
 correctness; thread-context behaviour is a separate kind of test.
@@ -50,6 +51,156 @@ here; on those rows the founder-approved text *is* the ideal.
 
 ## Results, and how to read them
 
+Two measurements so far, on different dates and with different judge prompts. Read the dates
+before comparing them.
+
+| Date | What was measured | Judge prompt | Run | Pass | Fail | Error | Pass rate |
+|------|-------------------|--------------|-----|-----:|-----:|------:|----------:|
+| Aug 27, 2026 | main on Aug 27 | Aug 27 prompt (Pass / Partial / Fail) | first run | 23 | 50 | 0 | **~31%** |
+| Oct 13, 2026 | main at `6020143` (after PR 63) | today's prompt (Pass / Fail, Sept 1) | run A | 25 | 48 | 0 | 34.2% |
+| Oct 13, 2026 | main at `6020143` (after PR 63) | today's prompt (Pass / Fail, Sept 1) | run B | 25 | 48 | 0 | 34.2% |
+| Oct 13, 2026 | | | **mean of A and B** | 25 | 48 | 0 | **34.2%** |
+
+All 73 rows, no conversation history, judged by `openai/gpt-oss-120b` on Groq at temperature 0
+both times.
+
+### Oct 13, 2026: re-run on today's main
+
+**There is no same-judge before/after.** Between the two dates only the judge's system prompt
+changed (commit `31aea62`, Sept 1: the three-way rubric became a two-dimension Pass/Fail one).
+The judge model, the user prompt, the verdict parsing and the Groq call are the same. The
+Aug 27 per-row answers were never saved (the harness then returned results over HTTP only;
+`eval/runs/` arrived on Oct 8), so they cannot be re-scored with today's prompt. The move from
+~31% to 34% mixes changes to the twin (the Sept 28 audit and the audit-batch PRs 49–58) with a
+change to the judge, and this data cannot separate the two.
+
+**The total repeated; the rows did not.** Runs A and B both scored 25 Pass, but 10 of the 73 rows
+changed verdict between them: rows 7, 15, 25, 32 and 75 passed only in run B, rows 37, 44, 50,
+74 and 77 only in run A. The twin's replies vary from run to run, and so does the judge: row 25
+got the identical reply in both runs and was failed in A, passed in B. Treat any single row's
+verdict, and any category with a handful of rows, as noisy.
+
+Split by where the ground truth came from:
+
+| Ground truth | n | Aug 27 (older prompt) | Oct 13, run A | Oct 13, run B | Oct 13, mean |
+|--------------|---|----------------------:|--------------:|--------------:|-------------:|
+| `founder-written` (the founder rewrote the reply) | 35 | 0.200 | 0.257 | 0.314 | 0.286 |
+| `as-sent` (the founder marked the reply Pass) | 38 | 0.421 | 0.421 | 0.368 | 0.395 |
+
+By category, Oct 13, most failures first. Most categories have one to three rows, so a single
+flip moves them a lot:
+
+| Category | Rows | Pass, run A | Pass, run B | Mean pass rate |
+|----------|-----:|------------:|------------:|---------------:|
+| Refund | 6 | 0 | 0 | 0.00 |
+| Bulk/Wholesale | 7 | 2 | 2 | 0.29 |
+| Sizing/Band | 7 | 2 | 3 | 0.36 |
+| Price | 7 | 3 | 3 | 0.43 |
+| Product Recommendation | 6 | 3 | 3 | 0.50 |
+| Collab | 3 | 0 | 0 | 0.00 |
+| Order Status/Payment | 3 | 0 | 0 | 0.00 |
+| Stock/Restock | 3 | 0 | 0 | 0.00 |
+| Discount/Offers | 2 | 0 | 0 | 0.00 |
+| Payment Method | 2 | 0 | 0 | 0.00 |
+| Price/Bestsellers | 2 | 0 | 0 | 0.00 |
+| Shipping/Delivery | 2 | 0 | 0 | 0.00 |
+| Order Status/Tracking | 2 | 1 | 0 | 0.25 |
+| Image/Vision | 4 | 2 | 4 | 0.75 |
+| Off-topic | 2 | 1 | 1 | 0.50 |
+| Product Info | 2 | 1 | 1 | 0.50 |
+| Complaint/Product Mismatch | 1 | 0 | 0 | 0.00 |
+| Photos Request | 1 | 0 | 0 | 0.00 |
+| Refund/Complaint | 1 | 0 | 0 | 0.00 |
+| Order/Purchase Link | 3 | 3 | 2 | 0.83 |
+| Order ID Lookup | 1 | 1 | 0 | 0.50 |
+| Allergy/Safety | 1 | 1 | 1 | 1.00 |
+| Cross-channel | 1 | 1 | 1 | 1.00 |
+| Damaged/Wrong Item | 1 | 1 | 1 | 1.00 |
+| Feedback/Testimonial | 1 | 1 | 1 | 1.00 |
+| Returns | 1 | 1 | 1 | 1.00 |
+| Shipping/Courier | 1 | 1 | 1 | 1.00 |
+
+**Judge agreement (Oct 13 calibrate run).** `--mode calibrate` re-scored the recorded answers of
+the 35 founder-written rows, 26 of which carry a founder verdict. Today's prompt agreed on
+**23 of 26 (88.5%)**, with 3 disagreements: row 32 (founder Partial, judge Fail), and rows 41
+and 60 (founder Fail, judge Pass; row 60 is the "Thank you for reaching out" case described
+under [Calibrating the judge](#calibrating-the-judge)). Today's prompt can only answer Pass or
+Fail, so row 32 can never agree and 25 of 26 is the ceiling. The Aug 27 figure was also 88.5%,
+from the older three-way prompt on the same 26 rows. The match is a coincidence, and the two
+are not directly comparable. **This is in-sample too:** today's prompt was adopted after a
+benchmark against these same labelled rows (commit `31aea62`), so it is a fit, not a held-out
+estimate of judge accuracy.
+
+**Failed only for a dropped follow-up question (Oct 13).** Reading each failed row's reply
+against its ideal, these rows got every fact right and failed only because the reply left out a
+closing question or offer that the ideal had:
+
+- Run A, 13 rows: 1, 4, 5, 6, 7, 25, 28, 32, 40, 41, 64, 65, 66
+- Run B, 10 rows: 4, 5, 6, 28, 35, 40, 41, 64, 65, 74
+
+Counting them as passes gives **52.1%** for run A (38/73), **47.9%** for run B (35/73), and a
+mean of **50.0%**. On Aug 27 the same adjustment covered eight rows and moved ~31% to ~42%.
+
+- In rows 40, 41, 64, 65 and 66 the missing question is "could you share your order ID?" on a
+  refund complaint the twin escalated. On Instagram an escalated reply's text is not sent at
+  all (see the caveats below), so for the Instagram rows 64, 65 and 66 the customer never sees
+  this text either way.
+- Row 25 in run A is a judge slip, not a missing question: the reply did ask which occasion it
+  was for, and the identical reply passed in run B.
+- Row 15 (run A) and row 39 also lack only a question, but there the question is the whole
+  ideal reply, so they are left out. Row 35 in run A also left out the dispatch time, so it is
+  left out too.
+- The list comes from reading the rows, not from the judge. As on Aug 27, whether a reply that
+  states the right facts but doesn't ask the next question is *wrong* is the founder's product
+  decision, not the judge's.
+
+**What the Oct 13 number does not cover.** Read these together with the Aug 27 points further
+down, which still apply:
+
+- **This scores the reply-writing step (draft_reply_logic, the LangGraph generate node). The
+  output guard and routing are covered by unit tests, not by this eval.** One concrete case: on
+  Instagram an ESCALATE reply's text is never sent. The customer gets a fixed holding line
+  instead, or nothing for a legal or press message, or the allergy line for a safety report
+  (`_ig_escalation_reply` in `app.py`). Rows 10, 36, 40, 41, 63, 64, 65, 66, 69 and 73
+  were classified ESCALATE in both runs. Six of them (63–66, 69, 73) are Instagram rows, so
+  for those the eval grades text no customer receives.
+- **Single-turn only: no conversation history.**
+- **An internal review on Sept 28 found this judge can pass replies containing invented product
+  claims, so a Pass means "matches the ideal", not "contains nothing false".**
+- **The judge sees only the reply text, not the classification.** A row whose ideal is a
+  routing instruction is graded on wording alone. Row 63's ideal says the request should be
+  flagged for the founder's decision. The twin escalated it in both runs, and it still failed.
+- **The ground truth is older than today's `brain.md` and today's stock.** The ideals were
+  written before the Sept 28 audit fixes, and some now contradict a deliberate rule or the live
+  inventory. Reading the rows, these failures follow today's rule where the ideal does not:
+  - Rows 30 and 48, and row 46 in run B: the ideal says GS3 is sold out and offers to take a
+    number. The live inventory, read right after the runs, listed GS3 in stock (run B's reply
+    to row 46 says the same), and `brain.md` now forbids taking numbers for restock alerts.
+  - Rows 21 and 54: the ideal ends with "we'll take it from there", a follow-up promise
+    `brain.md` now bans on AUTO replies. Row 21's ideal also quotes the ₹749 bulk rate for an
+    unspecified "20" without confirming trays, which the finding 3 rule now forbids.
+  - Row 60: the twin drafts `brain.md`'s collab line for the founder's approval, without the
+    ideal's "within a few hours".
+
+  Row 39 is left out. `brain.md` answers a general refund-timing question with the timings
+  alone, but escalates a customer asking about their own refund, and this single message could
+  be either. It cuts both ways. In row 31 (both runs) and row 46 (run A) the reply treats GS3 as
+  sold out, although the live inventory listed it in stock, and the judge didn't notice because
+  the ideal says the same. None of this is applied to the numbers above, and `eval_set.json` is unchanged.
+- **How the Oct 13 runs were made.** A plain `python -m eval.harness` run starts from an empty
+  scratch database and builds the RAG index in the background, so row 1 is answered without
+  RAG (seen in a 5-row smoke test). Both fresh runs therefore used a throwaway wrapper. It waited
+  for the 46-chunk index, then called `eval.harness.main` with the same arguments. The calibrate
+  run never calls the twin, so it used the plain command line. Each fresh run took about 5
+  minutes. It sent about 2.0M DeepSeek input tokens (about 27k per row, almost all of it the
+  system prompt) and about 5k output tokens.
+
+### Aug 27, 2026: the first run (older judge prompt)
+
+This run used the Aug 27 judge prompt, which commit `31aea62` replaced on Sept 1. The
+agreement figures in this table, and the calibration numbers further down, belong to that older
+prompt.
+
 First full run, 73 rows, no conversation history:
 
 | Judge | Pass rate | Agreement with founder verdicts |
@@ -71,7 +222,9 @@ Split by where the ground truth came from:
 The founder-written rows are cases the twin already got wrong once, so a low score there is
 expected rather than alarming.
 
-### Three things that number does not mean
+#### Three things the Aug 27 number does not mean
+
+Written for the Aug 27 run. All three still apply; points 1 and 2 have Oct 13 numbers above.
 
 **1. The 88.5% calibration figure is in-sample, not an accuracy estimate.** The completeness
 rule that produced it was written *after* looking at the same 26 labelled rows it is measured
@@ -94,6 +247,9 @@ real and appears verbatim in row 23's own ideal answer. The Fail was still corre
 different reason (the answer omitted the price range and the ₹799 threshold). The judge treats
 "not present in *this row's* ideal" as "invented", so it can mark down true information.
 **Anyone triaging failures from this output should read the row before acting on the reason.**
+It happened again on Oct 13. Row 22's reason in run B called the ₹749/tray bulk rate
+"incorrect pricing", and row 54's reason in run A called "200+ pairs" (20 trays of 10 pairs)
+"potentially incorrect". Both are true.
 
 ## Setup
 
@@ -156,13 +312,15 @@ The recorded answers (`actual_answer`) stay exactly as sent, so 7 of them quote 
 since changed (trays at ₹699, free shipping above ₹699, older single-pair, duo and trio prices) — on
 purpose, since calibration grades those exact texts against the founder's verdicts.
 
-What calibration actually caught, in order:
+What calibration actually caught, in order. The first three rows are from August, before the
+Sept 1 prompt change. The last row is today's prompt, measured on Oct 13:
 
 | Judge + rubric | Agreement with founder (26 labelled rows) |
 |----------------|--------------------------------------------|
 | `qwen3:8b`, first rubric | 27% |
 | `gpt-oss-120b`, first rubric | 54% |
 | `gpt-oss-120b`, + completeness rule | **88%** |
+| `gpt-oss-120b`, today's Pass/Fail prompt (Oct 13) | 88.5% (23/26; 25/26 is the ceiling, see [Results](#results-and-how-to-read-them)) |
 
 The jump from 54% to 88% was not a better model — it was fixing the rubric. The judge kept
 scoring `Partial` where the founder scored `Fail`, always with the same reason: *"omits X
