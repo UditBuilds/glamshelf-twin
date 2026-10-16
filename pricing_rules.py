@@ -101,6 +101,9 @@ _QUANTITY_RE = re.compile(
     r"\b(\d{1,5})\s*(pairs?|trays?)\b(?!\s+(?:each|per\b|in (?:a|one|each|every) tray))",
     re.IGNORECASE,
 )
+# "20+ trays" / "200+ pairs": the plus keeps _QUANTITY_RE from seeing them.
+# They count as their number (Argon finding 5).
+_PLUS_QUANTITY_RE = re.compile(r"\b(\d{1,5})\s*\+\s*(pairs?|trays?)\b", re.IGNORECASE)
 
 
 def _as_trays(count: int, unit: str) -> int | float:
@@ -150,11 +153,17 @@ _LIST_GAP_RE = re.compile(rf"\s+(?:of\s+)?({_PRODUCT})\s*,\s*", re.IGNORECASE)
 _LIST_NEXT_RE = re.compile(rf"\s+(?:of\s+)?({_PRODUCT})\b", re.IGNORECASE)
 
 
-def _quantities(message: str) -> list[tuple[int, str, int, int]]:
+def _quantities(message: str) -> list[tuple[int, str, int, int, bool]]:
     """Each pairs / trays quantity in the message, in order, as (count,
-    unit, start, end)."""
-    return [(int(m.group(1)), m.group(2), m.start(), m.end())
-            for m in _QUANTITY_RE.finditer(message or "")]
+    unit, start, end, plus); plus is True for "20+ trays"."""
+    found = [(int(m.group(1)), m.group(2), m.start(), m.end(), plus)
+             for regex, plus in ((_QUANTITY_RE, False), (_PLUS_QUANTITY_RE, True))
+             for m in regex.finditer(message or "")]
+    return sorted(found, key=lambda q: q[2])
+
+
+def _shown(count: int | float, plus: bool) -> str:
+    return f"{count:g}{'+' if plus else ''}"
 
 
 def _restates(a, b) -> bool:
@@ -176,15 +185,16 @@ def _adds_up(message: str, a, b) -> bool:
                 and re.sub(r"\W", "", listed.group(1).lower()) != re.sub(r"\W", "", following.group(1).lower()))
 
 
-def _tally(message: str) -> tuple[int | float | None, str, list]:
-    """(trays, how, amounts). `how` is "one" (a single quantity), "sum"
-    (clearly extra items, added up), "same" (one amount said twice) or
-    "max" (anything else: the largest single quantity). A pairs number
+def _tally(message: str) -> tuple[int | float | None, str, list, bool]:
+    """(trays, how, amounts, plus). `how` is "one" (a single quantity),
+    "sum" (clearly extra items, added up), "same" (one amount said twice)
+    or "max" (anything else: the largest single quantity). A pairs number
     equal to a trays number x10 with nothing but a connector between them
-    ("10 trays and 100 pairs") counts once."""
+    ("10 trays and 100 pairs") counts once. `plus`: the count includes a
+    "20+ trays" style amount."""
     found = _quantities(message)
     if not found:
-        return None, "", []
+        return None, "", [], False
     groups = [found[0]]
     adds = []
     for prev, q in zip(found, found[1:]):
@@ -192,13 +202,15 @@ def _tally(message: str) -> tuple[int | float | None, str, list]:
             continue
         adds.append(_adds_up(message, prev, q))
         groups.append(q)
-    amounts = [_as_trays(n, unit) for n, unit, _, _ in groups]
+    amounts = [_as_trays(q[0], q[1]) for q in groups]
     if len(amounts) > 1 and all(adds):
         total, how = sum(amounts), "sum"
+        plus = any(q[4] for q in groups)
     else:
         total = max(amounts)
         how = "one" if len(found) == 1 else ("same" if len(set(amounts)) == 1 else "max")
-    return (int(total) if float(total).is_integer() else total), how, amounts
+        plus = any(q[4] for q, a in zip(groups, amounts) if a == total)
+    return (int(total) if float(total).is_integer() else total), how, amounts, plus
 
 
 def trays_mentioned(message: str) -> int | float | None:
@@ -207,23 +219,18 @@ def trays_mentioned(message: str) -> int | float | None:
     -> 25. Quantities add up only when they're clearly extra items ("10
     trays of GS1 and 10 trays of GS2" -> 20); alternatives and restatements
     ("10 trays vs 12 trays", "is 10 trays 100 pairs?") give the largest
-    single quantity. None when no number carries a pairs or trays unit."""
+    single quantity. "20+ trays" and "200+ pairs" count as 20 (Argon
+    finding 5). None when no number carries a pairs or trays unit."""
     return _tally(message)[0]
 
 
-# "20+ trays" / "200+ pairs": the plus keeps _QUANTITY_RE from seeing them.
-_PLUS_QUANTITY_RE = re.compile(r"\b(\d{1,5})\s*\+\s*(pairs?|trays?)\b", re.IGNORECASE)
-
-
 def bulk_trays_asked(message: str) -> int | float | None:
-    """The trays a message asks about when that's 20+ (200+ pairs, at
-    PAIRS_PER_TRAY per tray), else None. "20+ trays" and "200+ pairs" count
-    as 20. Used for the founder's LEAD notice on a bulk question (founder
-    decision, 3 Oct 2026); it never changes the reply."""
-    counts = [trays_mentioned(message) or 0]
-    counts += [_as_trays(int(n), unit) for n, unit in _PLUS_QUANTITY_RE.findall(message or "")]
-    best = max(counts)
-    return best if best >= BULK_MIN_TRAYS else None
+    """The trays a message asks about (trays_mentioned) when that's 20+
+    (200+ pairs, at PAIRS_PER_TRAY per tray), else None. Used for the
+    founder's LEAD notice on a bulk question (founder decision, 3 Oct
+    2026); it never changes the reply."""
+    trays = trays_mentioned(message)
+    return trays if trays is not None and trays >= BULK_MIN_TRAYS else None
 
 
 def bulk_quantity_note(message: str) -> str:
@@ -240,23 +247,24 @@ def bulk_quantity_note(message: str) -> str:
     if not found:
         return ""
     pairs = [q for q in found if q[1].lower().startswith("pair")]
-    total, how, amounts = _tally(message)
+    total, how, amounts, plus = _tally(message)
     # A pair or two is a singles question; one tray is a plain price question.
     if (not pairs and total < 2) or (len(pairs) == len(found) and total < 1):
         return ""
+    shown = _shown(total, plus)
     parts = []
-    for n, unit, _, _ in found:
+    for n, unit, _, _, more in found:
         if unit.lower().startswith("pair"):
-            parts.append(f"{n} pairs = {_as_trays(n, unit):g} trays")
+            parts.append(f"{_shown(n, more)} pairs = {_shown(_as_trays(n, unit), more)} trays")
         else:
-            parts.append(f"{n} {'tray' if n == 1 else 'trays'}")
+            parts.append(f"{_shown(n, more)} {'tray' if n == 1 and not more else 'trays'}")
     line = "; ".join(parts)
     if how == "sum":
-        line += f" — {total:g} trays in all"
+        line += f" — {shown} trays in all"
     elif how == "same":
-        line += f" — the same amount said twice: {total:g} trays"
+        line += f" — the same amount said twice: {shown} trays"
     elif how == "max":
-        line += f" — these aren't added up; the largest is {total:g} trays"
+        line += f" — these aren't added up; the largest is {shown} trays"
     if pairs:
         line += " (trays come in 10 pairs each)"
     if total >= BULK_MIN_TRAYS:
@@ -266,7 +274,7 @@ def bulk_quantity_note(message: str) -> str:
         verdict = (f"That is 20+ trays, so the ₹{BULK_RATE_INR}/tray bulk rate applies. With the rate, "
                    f"say word for word: \"{BULK_FREE_SHIPPING_LINE}\".")
         if how == "max" and min(amounts) < BULK_MIN_TRAYS:
-            verdict += f" The ₹{BULK_RATE_INR} rate is only for the {total:g}-tray amount, not the smaller one."
+            verdict += f" The ₹{BULK_RATE_INR} rate is only for the {shown} trays, not the smaller amount."
     else:
         verdict = (f"That is under 20 trays (200 pairs), so the ₹{BULK_RATE_INR} bulk rate "
                    "does NOT apply — the regular tray price does.")

@@ -93,7 +93,7 @@ class Finding4AlternativesAreNotAddedUp(unittest.TestCase):
         note = bulk_quantity_note("How much for 10 trays vs 25 trays?")
         self.assertIn("the largest is 25 trays. That is 20+ trays", note)
         self.assertIn(f'"{BULK_FREE_SHIPPING_LINE}"', note)
-        self.assertIn("The ₹749 rate is only for the 25-tray amount, not the smaller one.", note)
+        self.assertIn("The ₹749 rate is only for the 25 trays, not the smaller amount.", note)
 
     def test_a_bulk_ask_with_no_quantity_still_gets_no_note(self):
         # brain.md: ask for the quantity first, never ₹749 upfront.
@@ -104,6 +104,44 @@ class Finding4AlternativesAreNotAddedUp(unittest.TestCase):
                 self.assertEqual(bulk_quantity_note(message), "")
                 self.assertIsNone(trays_mentioned(message))
                 self.assertIsNone(bulk_trays_asked(message))
+
+
+class Finding5PlusQuantitiesCount(unittest.TestCase):
+    """"20+ trays" / "200+ pairs" counted for the LEAD notice only; the
+    model's note ignored them."""
+
+    def assertBulkNote(self, note):
+        self.assertIn("That is 20+ trays, so the ₹749/tray bulk rate applies.", note)
+        self.assertIn(f'say word for word: "{BULK_FREE_SHIPPING_LINE}".', note)
+        self.assertNotIn("does NOT apply", note)
+
+    def test_a_past_purchase_and_a_20_plus_ask(self):
+        message = "I tried 2 trays, what's the rate for 20+ trays?"
+        self.assertEqual(trays_mentioned(message), 20)
+        self.assertEqual(bulk_trays_asked(message), 20)
+        note = bulk_quantity_note(message)
+        self.assertBulkNote(note)
+        self.assertTrue(note.startswith("2 trays; 20+ trays — these aren't added up; the largest is 20+ trays."))
+
+    def test_a_plain_20_plus_ask(self):
+        message = "What's the rate for 20+ trays?"
+        self.assertEqual(trays_mentioned(message), 20)
+        note = bulk_quantity_note(message)
+        self.assertBulkNote(note)
+        self.assertTrue(note.startswith("20+ trays. That is 20+ trays"))
+
+    def test_pairs_with_a_plus(self):
+        self.assertEqual(trays_mentioned("200+ pairs ka rate kya hai?"), 20)
+        note = bulk_quantity_note("200+ pairs ka rate kya hai?")
+        self.assertTrue(note.startswith("200+ pairs = 20+ trays (trays come in 10 pairs each)."))
+        self.assertBulkNote(note)
+        self.assertEqual(trays_mentioned("20+ trays (200+ pairs)"), 20)
+
+    def test_under_20_with_a_plus_is_still_under(self):
+        self.assertEqual(trays_mentioned("10+ trays ka rate?"), 10)
+        self.assertIsNone(bulk_trays_asked("10+ trays ka rate?"))
+        self.assertIn("does NOT apply", bulk_quantity_note("10+ trays ka rate?"))
+        self.assertEqual(bulk_quantity_note("2+ pairs"), "")
 
 
 if __name__ == "__main__":
