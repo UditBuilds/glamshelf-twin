@@ -238,5 +238,59 @@ class Finding6MoneyPromisesAreHeld(unittest.TestCase):
                 self.assertEqual(guard(text), [])
 
 
+def product_list_from_brain() -> str:
+    """brain.md's "Default product list reply" quoted block, as sent."""
+    after = BRAIN.split("**Default product list reply (in-stock only):**", 1)[1]
+    lines = []
+    for line in after[after.index('> "'):].splitlines():
+        if not line.startswith(">"):
+            break
+        lines.append(line[2:] if line.startswith("> ") else "")
+    return "\n".join(lines).strip('"')
+
+
+class Test7BulkFloorIsNotATrayPrice(unittest.TestCase):
+    """₹699 is in FIXED_ALLOWED_INR (the founder-only bulk floor) and is
+    the Mink Trio's live price, so a ₹699/tray offer passed rule 1."""
+
+    def assertFloorHeld(self, text):
+        reasons = guard(text)
+        self.assertTrue(any(r.startswith("rule 1") and "bulk floor" in r for r in reasons), (text, reasons))
+
+    def test_the_audit_example(self):
+        self.assertEqual(guard("Best I can do is ₹699/tray for 40 trays"),
+                         ["rule 1 (₹ amount not allowed): ₹699/tray (the founder-only bulk floor as a tray or pair price)"])
+
+    def test_per_tray_and_per_pair_forms(self):
+        for text in ("₹699/tray for 30 trays 🤍", "I can do ₹699 per tray", "That's ₹699 a tray 🤍",
+                     "They're ₹699 each", "₹699/pair", "Rs 699 per pair", "699 rupees per tray",
+                     # a per-unit ₹699 is never the Mink Trio's price, named or not
+                     "The Mink Trio is ₹699/tray"):
+            with self.subTest(text=text):
+                self.assertFloorHeld(text)
+
+    def test_in_a_sentence_about_trays(self):
+        for text in ("For 40 trays we can do ₹699 🤍", "40 trays at ₹699 works for us",
+                     "GS2 is ₹699 right now 🤍", "Trays are ₹849. For 40 trays I can go down to ₹699 🤍"):
+            with self.subTest(text=text):
+                self.assertFloorHeld(text)
+
+    def test_the_mink_trio_still_passes(self):
+        product_list = product_list_from_brain()
+        self.assertIn("• Mink Trio — ₹699 · 3 faux mink pairs", product_list)
+        self.assertIn("Trays (10 pairs)", product_list)
+        for text in (product_list,
+                     "The Mink Trio is ₹699 for 3 faux mink pairs 🤍",
+                     "The Mink Trio is ₹699 and our trays are ₹849 🤍",
+                     "MINK DUO — ₹499 | EVERYDAY + GLAM DUO — ₹499 | MINK TRIO — ₹699. GS1, GS2 & GS3 Luxe "
+                     "Light Lash Trays (10 pairs each) — ₹849."):
+            with self.subTest(text=text[:40]):
+                self.assertEqual(guard(text), [])
+
+    def test_the_bulk_quote_still_passes(self):
+        self.assertEqual(guard("Our bulk rate is ₹749/tray for orders of 20+ trays (200+ pairs) — and shipping is "
+                               f"{BULK_FREE_SHIPPING_LINE.split('shipping is ', 1)[1]} 🤍"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

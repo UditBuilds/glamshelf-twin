@@ -14,7 +14,10 @@ Rules (each returns a short reason naming the rule and what matched):
      per wear, glue — _FIXED_CONTEXT), never as a tray, product or
      shipping price. An order total also passes when it is a sum of up to
      MAX_ORDER_ITEMS live prices (repeats allowed) and at most ₹1,500 (the
-     Hard Money Threshold) — larger totals still go to a draft.
+     Hard Money Threshold) — larger totals still go to a draft. ₹699 (the
+     Mink Trio, and the founder-only bulk floor) is held as a per tray /
+     per pair / "each" price, and in a sentence about trays that doesn't
+     name the Mink Trio (_floor_as_tray_price).
   2. code, coupon, promo, discount, refund, cashback, "free",
      complimentary, "on us", waive, money back, reimburse, "paise wapas"
      or an amount off ("15% off", "₹100 off"), judged sentence by
@@ -100,6 +103,16 @@ _FIXED_CONTEXT = {
     17.0: re.compile(_PER_WEAR, re.IGNORECASE),
     50.0: re.compile(r"(?:\s+[a-z-]+){0,2}\s+glues?\b", re.IGNORECASE),
 }
+
+# ₹699 is the Mink Trio's price and also the founder-only bulk floor:
+# brain.md says the twin never negotiates between ₹749 and ₹699 (Argon
+# test 7: "Best I can do is ₹699/tray for 40 trays" was sent). As a per
+# tray / per pair / "each" price it is always held; in a sentence that
+# mentions trays (or GS1-3) it is held unless the sentence names the Mink
+# Trio, so the product list's "Mink Trio — ₹699 · 3 faux mink pairs" passes.
+_FLOOR_PER_UNIT_RE = re.compile(r"\s?(?:/\s?(?:tray|pair)|per (?:tray|pair)|an? (?:tray|pair)|each)\b", re.IGNORECASE)
+_TRAY_WORD_RE = re.compile(r"\btrays?\b|\bgs\s?[1-3]\b", re.IGNORECASE)
+_MINK_TRIO_RE = re.compile(r"\bmink\s+trio\b", re.IGNORECASE)
 
 # Rule 2 trigger words. An amount off ("15% off", "₹100 off") counts; "take
 # off" and "peel the glue off" carry no amount and pass (Argon finding 6).
@@ -415,6 +428,34 @@ def _order_amounts(text: str) -> list[float]:
     return [value for value, _, _, end in _amounts(text) if not _PER_UNIT_RE.match(text, end)]
 
 
+def _sentence_at(text: str, pos: int) -> str:
+    """The sentence (as rule 2 splits them) that holds position `pos`."""
+    start, end = 0, len(text)
+    for m in _SENTENCE_SPLIT_RE.finditer(text):
+        if m.end() <= pos:
+            start = m.end()
+        elif m.start() >= pos:
+            end = m.start()
+            break
+    return text[start:end]
+
+
+def _floor_as_tray_price(text: str) -> list[str]:
+    """₹699 stated as a tray or pair price (_FLOOR_PER_UNIT_RE, Argon test 7)."""
+    found = []
+    for value, written, start, end in _amounts(text):
+        if value != BULK_FLOOR_INR:
+            continue
+        unit = _FLOOR_PER_UNIT_RE.match(text, end)
+        if unit:
+            found.append(written + unit.group(0))
+            continue
+        sentence = _sentence_at(text, start)
+        if _TRAY_WORD_RE.search(sentence) and not _MINK_TRIO_RE.search(sentence):
+            found.append(written)
+    return found
+
+
 def _covered(clause: str, statements, words_re=_PROMO_WORDS_RE) -> bool:
     """One approved statement in the clause, and no trigger word outside it."""
     for pat in statements:
@@ -500,6 +541,7 @@ def check_reply(text: str, allowed_amounts, founder_notice: bool = False) -> lis
         return value in FIXED_ALLOWED_INR
 
     bad = [written for value, written, _, end in _amounts(text) if not amount_ok(value, end)]
+    bad += [f"{written} (the founder-only bulk floor as a tray or pair price)" for written in _floor_as_tray_price(text)]
     if bad:
         reasons.append(f"rule 1 (₹ amount not allowed): {', '.join(bad)}")
 
