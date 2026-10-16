@@ -54,6 +54,14 @@ Rules (each returns a short reason naming the rule and what matched):
      with the reply (`founder_notice`: an ORDER / RESTOCK heads-up or a
      LEAD notice); on a plain AUTO reply nobody is told, so they're held
      too.
+  8. An action only the founder can do, claimed as done, under way or
+     coming (Argon test 14): cancelling an order ("cancelling it for
+     you", "I've cancelled", "your order has been / is cancelled",
+     "cancel kar diya / denge"), or placing or booking one ("I've placed
+     your order", "booked 25 trays for you", "order book kar diya").
+     Policy and inability pass ("once dispatched we're unable to cancel
+     it", "the team can help cancel it if it hasn't shipped"), and so does
+     "your order is cancelled" in a clause with if / once / when.
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -377,6 +385,58 @@ def _followup_promises(text: str, founder_notice: bool) -> list[str]:
             if not any(s <= m.start() and m.end() <= e for s, e in allowed)]
 
 
+# Rule 8 (Argon test 14): only the founder cancels, places or books an
+# order. A reply saying Twin did, is doing or will do it is held:
+# "cancelling it for you", "I've cancelled order 1109", "we'll cancel it",
+# "cancel kar diya", "I've placed your order", "booked 25 trays for you".
+# Policy and inability pass — "once dispatched we're unable to cancel it",
+# "the team can help cancel it if it hasn't shipped" — and so does "we can
+# cancel it" (capability talk, as in rule 7).
+_ADVERBS = r"(?:(?:just|now|already|successfully|also|gone ahead and|went ahead and|go ahead and)\s+)*"
+_TWIN_DID = r"\b(?:i|we)(?:'ve| have| had|'d)?\s+" + _ADVERBS
+_TWIN_WILL = (r"\b(?:i'm|i am|we're|we are|i'll|i will|we'll|we will|let me|let us|let's)\s+"
+              r"(?:(?:going to|gonna)\s+)?" + _ADVERBS)
+_ORDER_OBJECT = (r"\s+(?:(?:your|the|an?|this|that|it|them)\s+)?(?:(?:\d+|new|bulk)\s+)?(?:[a-z0-9-]+\s+)?"
+                 r"(?:orders?|it|them|trays?|pairs?|sets?)\b")
+_ACTION_CLAIM_RE = re.compile(
+    rf"{_TWIN_DID}cancel(?:l)?ed\b"
+    rf"|{_TWIN_WILL}cancel(?:l)?(?:ing)?\b"
+    rf"|{_TWIN_DID}(?:placed|booked){_ORDER_OBJECT}"
+    rf"|{_TWIN_WILL}(?:plac(?:e|ing)|book(?:ing)?){_ORDER_OBJECT}"
+    # no subject: "Not a problem, cancelling it for you", "booked 25 trays
+    # for you" — the order right before "for you", so "once you've placed
+    # your order, we'll pack it for you" passes
+    r"|\b(?:cancel(?:l)?(?:ing|ed)|plac(?:ing|ed)|book(?:ing|ed))\s+"
+    r"(?:it|this|that|them|(?:your |the |this )?order(?:\s?#?\s?\d+)?|\d+\s+(?:trays?|pairs?|sets?)"
+    r"|(?:your|the|an?)\s+(?:[a-z0-9-]+\s+)?(?:orders?|trays?|pairs?|sets?))\s+for you\b"
+    # Hinglish: "cancel kar diya", "order book kar diya", "cancel kar denge"
+    r"|\b(?:cancel|book|place)\s+(?:kar|kr)\s*(?:diya|diye|di|denge|dunga|dungi|dete|deti|deta|chuke|chuki|chuka)\b",
+    re.IGNORECASE,
+)
+# The order said to be cancelled: "your order has been / is cancelled",
+# "order 1109 was cancelled", "cancel ho gaya". It passes in a clause with
+# if / once / when — "if your order is cancelled before it ships, …" is
+# the policy.
+_CANCELLED_STATE_RE = re.compile(
+    r"\b(?:(?:your|the|this) order|order\s?#?\s?\d+|it)(?:'s|\s+has|\s+have|\s+is|\s+was)\s+"
+    r"(?:(?:now|been|already|successfully|also)\s+)*cancel(?:l)?ed\b"
+    r"|\bcancel\s+ho\s+(?:gaya|gya|gayi|gyi|chuka|chuki|jayega|jaega|jayegi|jaegi)\b",
+    re.IGNORECASE,
+)
+_CONDITION_RE = re.compile(r"\b(?:if|once|when|whenever|unless|in case|agar|jab)\b", re.IGNORECASE)
+
+
+def _action_claims(text: str) -> list[str]:
+    """Rule 8's claims that Twin cancelled, placed or booked an order."""
+    text = (text or "").replace("’", "'")
+    found = [m.group(0) for m in _ACTION_CLAIM_RE.finditer(text)]
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        for clause in _CLAUSE_SPLIT_RE.split(sentence):
+            if not _CONDITION_RE.search(clause):
+                found += [m.group(0) for m in _CANCELLED_STATE_RE.finditer(clause)]
+    return found
+
+
 def _amount_value(digits: str, fraction: str | None) -> float:
     value = float(digits.replace(",", ""))
     if fraction:
@@ -584,5 +644,9 @@ def check_reply(text: str, allowed_amounts, founder_notice: bool = False) -> lis
     promises = _followup_promises(text, founder_notice)
     if promises:
         reasons.append(f"rule 7 (follow-up promise): {', '.join(promises)}")
+
+    claims = _action_claims(text)
+    if claims:
+        reasons.append(f"rule 8 (claims an order action only the founder can do): {', '.join(claims)}")
 
     return reasons

@@ -5,15 +5,23 @@ Finding 4: trays_mentioned() added up every quantity in a message, so
 alternatives and restatements ("10 trays vs 12 trays", "is 10 trays 100
 pairs?") got the ₹749 bulk note. Finding 5: "20+ trays" was left out of
 that note. Finding 6: output_guard.check_reply() sent money promises it
-had no word for ("15% off", "shipping is on us", "600 rupees").
+had no word for ("15% off", "shipping is on us", "600 rupees"). Test 7:
+"₹699/tray" passed as an allowed amount. Test 14: "Done, I've cancelled
+order 1109 for you" passed, and brain.md had an unlabelled "cancelling it
+for you" template.
 
-No live API call anywhere here.
+No live API call anywhere here: the handler tests stub the model, sends
+and Telegram (tests.test_output_guard's harness).
 
 Run:  python -m unittest tests.test_argon_money_guard
 """
+import io
+import os
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -290,6 +298,132 @@ class Test7BulkFloorIsNotATrayPrice(unittest.TestCase):
     def test_the_bulk_quote_still_passes(self):
         self.assertEqual(guard("Our bulk rate is ₹749/tray for orders of 20+ trays (200+ pairs) — and shipping is "
                                f"{BULK_FREE_SHIPPING_LINE.split('shipping is ', 1)[1]} 🤍"), [])
+
+
+def brain_quote_after(label: str) -> str:
+    """The "> ..." template on the line after `label` in brain.md."""
+    lines = BRAIN.splitlines()
+    i = lines.index(label)
+    return lines[i + 1][2:].strip('"')
+
+
+class Test14TwinCantCancelOrPlaceOrders(unittest.TestCase):
+    """brain.md's "Cancellation confirmation reply" says "cancelling it for
+    you", and "Done, I've cancelled order 1109 for you" passed the guard."""
+
+    LABEL = ("Cancellation confirmation reply (pre-dispatch): 🟡 DRAFT+APPROVE only — the founder sends this "
+             "after cancelling; never AUTO")
+
+    def assertRule8(self, text):
+        reasons = guard(text, founder_notice=True)
+        self.assertTrue(any(r.startswith("rule 8 (claims an order action only the founder can do)")
+                            for r in reasons), (text, reasons))
+
+    def test_the_audit_example(self):
+        self.assertEqual(guard("Done, I've cancelled order 1109 for you"),
+                         ["rule 8 (claims an order action only the founder can do): I've cancelled"])
+
+    def test_cancelling_claims(self):
+        for text in ("Not a problem, cancelling it for you 🤍", "I've cancelled it 🤍", "I have cancelled your order",
+                     "We've already cancelled it for you", "I'm cancelling it now 🤍", "We'll cancel it right away 🤍",
+                     "Let me cancel that for you", "Your order has been cancelled 🤍", "Your order is cancelled",
+                     "Order 1109 has been cancelled", "It's been cancelled 🤍",
+                     "Aapka order cancel kar diya hai 🤍", "Cancel kar di hai", "Hum cancel kar denge 🤍",
+                     "Order cancel ho gaya hai 🤍"):
+            with self.subTest(text=text):
+                self.assertRule8(text)
+
+    def test_placing_and_booking_claims(self):
+        for text in ("I've placed your order 🤍", "I have booked 25 trays for you 🤍", "Booked 25 trays for you!",
+                     "We've placed the order for 30 trays", "I'll book it for you 🤍", "Order book kar diya 🤍",
+                     "I'm placing your order now"):
+            with self.subTest(text=text):
+                self.assertRule8(text)
+
+    def test_policy_and_inability_pass(self):
+        for text in (
+            "Once dispatched we're unable to cancel it 🤍",
+            "The team can help cancel it if it hasn't shipped 🤍",
+            brain_quote_after("Cancellation request (post-dispatch):"),
+            brain_quote_after("Reply for address change / add item / cancel (pre-dispatch):"),
+            "I can't cancel orders myself, but the team can help — please share your order ID 🤍",
+            "I'll pass your cancellation request to the team 🤍",
+            "We can cancel it if it hasn't shipped yet — please share your order ID 🤍",
+            "If your order is cancelled before it ships, the team handles the rest 🤍",
+            "Agar order ship nahi hua hai toh cancel ho jayega 🤍",
+            "You can place your order on glamshelf.in 🤍",
+            "Once you've placed your order, you'll get a confirmation email 🤍",
+            "Once you've placed your order, we'll pack it for you 🤍",
+            "Booking a salon slot for you isn't something we offer — we're a product-only brand 🤍",
+            "So sorry to hear the wedding was cancelled 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse([r for r in guard(text, founder_notice=True) if r.startswith("rule 8")], text)
+
+    def test_brain_md_labels_the_template_draft_only(self):
+        self.assertIn(self.LABEL, BRAIN.splitlines())
+        template = brain_quote_after(self.LABEL)
+        # Kept, not deleted; held if the model ever sends it as AUTO.
+        self.assertTrue(template.startswith("Not a problem, cancelling it for you."))
+        reasons = guard(template)
+        self.assertTrue(any(r.startswith("rule 8") for r in reasons), reasons)
+        self.assertTrue(any(r.startswith("rule 2") for r in reasons), reasons)
+        self.assertEqual(BRAIN.count("cancelling it for you"), 1)
+
+
+import tests.test_output_guard as handler_tests  # noqa: E402  (imports app with its own DB)
+
+
+class Test14InTheHandler(unittest.TestCase):
+    """The guard only holds: the founder gets the reply unchanged as a
+    draft, the customer the handoff line; OUTPUT_GUARD_DISABLED sends it."""
+
+    setUp = handler_tests.InstagramHandlerTest.setUp
+    _send = handler_tests.InstagramHandlerTest._send
+    _draft = handler_tests.InstagramHandlerTest._draft
+    _model = handler_tests.InstagramHandlerTest._model
+    dm = handler_tests.InstagramHandlerTest.dm
+
+    REPLY = "Done, I've cancelled order 1109 for you 🤍"
+
+    def test_held_as_a_draft_never_rewritten(self):
+        self.reply = self.REPLY
+        self.dm("please cancel order 1109")
+        self.assertEqual(self.sends, [handler_tests.HANDOFF])
+        (draft,) = self.drafts
+        self.assertEqual(draft["reply_text"], self.REPLY)
+        self.assertIn("rule 8", draft["guard_note"])
+
+    def test_kill_switch_still_turns_it_off(self):
+        os.environ["OUTPUT_GUARD_DISABLED"] = "1"
+        self.addCleanup(os.environ.pop, "OUTPUT_GUARD_DISABLED", None)
+        self.reply = self.REPLY
+        self.dm("please cancel order 1109")
+        self.assertEqual(self.sends, [self.REPLY])
+        self.assertEqual(self.drafts, [])
+
+
+class Test14DraftCardShowsRule8(unittest.TestCase):
+    """The real Telegram draft card (send_draft_for_approval) with a rule 8
+    note, as tests.test_output_guard's TelegramDraftNoteTest does for rule 2."""
+
+    def test_the_note_is_on_the_card(self):
+        glam = handler_tests.glam
+        note = output_guard.check_reply(Test14InTheHandler.REPLY, LIVE_PRICES)[0]
+        telegram = Mock(return_value={"ok": True, "result": {"message_id": 1, "chat": {"id": 5}}})
+        glam._init_db()
+        with patch.object(glam, "TELEGRAM_BOT_TOKEN", "x"), \
+             patch.object(glam, "TELEGRAM_CHAT_ID", "5"), \
+             patch.object(glam, "_telegram_api", telegram), \
+             redirect_stdout(io.StringIO()):
+            self.assertTrue(glam.send_draft_for_approval(
+                customer_number="c", customer_name="", customer_message="please cancel order 1109",
+                reply_text=Test14InTheHandler.REPLY, channel="Instagram", guard_note=note,
+            ))
+        text = telegram.call_args_list[0].args[1]["text"]
+        self.assertIn("🛡️ Output guard held Twin's AUTO reply — rule 8 (claims an order action only the founder "
+                      "can do): I've cancelled", text)
+        self.assertIn(f'"{Test14InTheHandler.REPLY}"', text)
 
 
 if __name__ == "__main__":

@@ -468,7 +468,7 @@ Give the timings and stop. Add nothing after them: no offer to check, no request
 Reply for address change / add item / cancel (pre-dispatch):
 > "If your order hasn't shipped yet, the team can help. Please share your order ID and what you need changed, and I'll pass it to them to sort before it ships. Once dispatched, we're unable to make changes 🤍"
 
-Cancellation confirmation reply (pre-dispatch):
+Cancellation confirmation reply (pre-dispatch): 🟡 DRAFT+APPROVE only — the founder sends this after cancelling; never AUTO
 > "Not a problem, cancelling it for you. Since it hasn't shipped yet, your full refund will be initiated in 24–48 hours and reflect in your account in 5–7 working days 🤍"
 
 Cancellation request (post-dispatch):
