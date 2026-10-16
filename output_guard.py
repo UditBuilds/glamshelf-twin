@@ -7,13 +7,18 @@ and routed to DRAFT+APPROVE by the caller (app._ig_output_guard), so the
 founder sees exactly what the model wrote.
 
 Rules (each returns a short reason naming the rule and what matched):
-  1. A ₹ / Rs / INR amount that isn't allowed. The caller passes the live
-     Shopify prices; FIXED_ALLOWED_INR adds brain.md's fixed amounts. An
-     order total also passes when it is a sum of up to MAX_ORDER_ITEMS
-     live prices (repeats allowed) and at most ₹1,500 (the Hard Money
-     Threshold) — larger totals still go to a draft.
-  2. code, coupon, promo, discount, refund, cashback or "free", judged
-     sentence by sentence (_rule2_words): a clause with one of these words
+  1. A ₹ / Rs / INR amount that isn't allowed, written before the number
+     or after it ("600 rupees", "600 rs", "600/-"). The caller passes the
+     live Shopify prices; FIXED_ALLOWED_INR adds brain.md's fixed amounts,
+     and ₹85, ₹12, ₹17 and ₹50 pass only in their own context (per pair,
+     per wear, glue — _FIXED_CONTEXT), never as a tray, product or
+     shipping price. An order total also passes when it is a sum of up to
+     MAX_ORDER_ITEMS live prices (repeats allowed) and at most ₹1,500 (the
+     Hard Money Threshold) — larger totals still go to a draft.
+  2. code, coupon, promo, discount, refund, cashback, "free",
+     complimentary, "on us", waive, money back, reimburse, "paise wapas"
+     or an amount off ("15% off", "₹100 off"), judged sentence by
+     sentence (_rule2_words): a clause with one of these words
      passes only when it is one of brain.md's approved policy statements —
      free shipping above ₹799, no discount / no codes, the refund
      timeline, shipping charges being non-refundable, a replacement or
@@ -78,19 +83,43 @@ BRAND_HANDLE = "glamshelfstore"
 
 # ₹849 / ₹ 1,500 / Rs. 849 / INR 849 / ₹849.00
 _AMOUNT_RE = re.compile(r"(?:₹|\bRs\.?|\bINR)\s?(\d[\d,]*\d|\d)(\.\d{1,2})?", re.IGNORECASE)
+# The unit after the number: 600 rupees / 600 rs / 600/- (Argon finding 6).
+_AMOUNT_AFTER_RE = re.compile(
+    r"(?<![\w₹.,])(\d[\d,]*\d|\d)(\.\d{1,2})?\s?(?:rupees?\b|rupaye\b|rupaiye\b|rs\b\.?|inr\b|/-)",
+    re.IGNORECASE,
+)
 
-# Rule 2 trigger words.
+# brain.md's fixed amounts that are never a price of their own pass only in
+# their own context, right after the amount (Argon finding 6): "₹85 per
+# pair", "₹12–17 per wear", "cheap ₹50 white glues". "A tray is ₹50",
+# "Shipping is ₹50" and "Each pair is ₹85" are held.
+_PER_WEAR = r"\s?(?:/\s?wear|per wear|a wear)\b"
+_FIXED_CONTEXT = {
+    85.0: re.compile(r"\s?(?:/\s?pair|per pair|a pair)\b", re.IGNORECASE),
+    12.0: re.compile(rf"(?:\s?(?:-|–|—|to)\s?(?:₹\s?)?17)?{_PER_WEAR}", re.IGNORECASE),
+    17.0: re.compile(_PER_WEAR, re.IGNORECASE),
+    50.0: re.compile(r"(?:\s+[a-z-]+){0,2}\s+glues?\b", re.IGNORECASE),
+}
+
+# Rule 2 trigger words. An amount off ("15% off", "₹100 off") counts; "take
+# off" and "peel the glue off" carry no amount and pass (Argon finding 6).
 _PROMO_WORDS_RE = re.compile(
-    r"\b(codes?|coupons?|promos?|promo[- ]?codes?|discount\w*|refund\w*|cashbacks?|free\w*)\b",
+    r"\b(codes?|coupons?|promos?|promo[- ]?codes?|discount\w*|refund\w*|cashbacks?|free\w*"
+    r"|complimentary|waiv\w*|reimburs\w*|money[- ]back|pais[ae]\s+(?:wapas|vapas|wapis|vapis)|on us)\b"
+    r"|(?<![\w.])\d+(?:\.\d+)?\s?(?:%|percent\b|per cent\b)\s?off\b"
+    r"|(?:₹|\brs\.?|\binr)\s?\d[\d,]*(?:\.\d{1,2})?\s?off\b"
+    r"|\b\d[\d,]*\s?(?:rupees?|rs\.?|inr)\s?off\b",
     re.IGNORECASE,
 )
 # Exempt wherever they appear, as since T1-4: cruelty-free (a product fact)
 # and the discount decline — neither promises anything. Free shipping used
 # to be here too; it now needs the ₹799 threshold (_FREE_SHIPPING_RULE).
+# "count on us" / "rely on us" aren't "on us" (free).
 _EXEMPT_PHRASES_RE = re.compile(
     r"cruelty[- ]free"
     r"|no (?:additional|extra|other) discounts?(?: (?:available|at the moment|right now))?"
-    r"|no active discount codes?",
+    r"|no active discount codes?"
+    r"|\b(?:rely|relying|count|counting|depend|depending|bank|banking) on us\b",
     re.IGNORECASE,
 )
 
@@ -369,10 +398,21 @@ def _normalize(clause: str) -> str:
     return re.sub(r"[\s.!?🤍\"']+$", "", c)
 
 
+def _amounts(text: str) -> list[tuple[float, str, int, int]]:
+    """Every ₹ amount in the reply, in order, as (value, as written, start,
+    end): "₹849", "Rs 849", "INR 849", and with the unit after the number,
+    "600 rupees", "600 rs", "600/-". "Rs 600/-" counts once."""
+    text = text or ""
+    found = [(m.start(), m.end(), m) for m in _AMOUNT_RE.finditer(text)]
+    for m in _AMOUNT_AFTER_RE.finditer(text):
+        if not any(s < m.end() and m.start() < e for s, e, _ in found):
+            found.append((m.start(), m.end(), m))
+    return [(_amount_value(m.group(1), m.group(2)), m.group(0), s, e) for s, e, m in sorted(found, key=lambda f: f[0])]
+
+
 def _order_amounts(text: str) -> list[float]:
     """₹ amounts in the reply that aren't per-unit prices."""
-    return [_amount_value(m.group(1), m.group(2)) for m in _AMOUNT_RE.finditer(text or "")
-            if not _PER_UNIT_RE.match(text, m.end())]
+    return [value for value, _, _, end in _amounts(text) if not _PER_UNIT_RE.match(text, end)]
 
 
 def _covered(clause: str, statements, words_re=_PROMO_WORDS_RE) -> bool:
@@ -447,15 +487,19 @@ def check_reply(text: str, allowed_amounts, founder_notice: bool = False) -> lis
     prices (_order_totals_paise). `founder_notice`: a founder notice goes
     out with this reply (rule 7)."""
     text = text or ""
-    allowed = set(FIXED_ALLOWED_INR) | {float(a) for a in allowed_amounts or ()}
+    live = {float(a) for a in allowed_amounts or ()}
     totals = _order_totals_paise(allowed_amounts)
     reasons: list[str] = []
 
-    def amount_ok(value: float) -> bool:
-        return value in allowed or round(value * 100) in totals
+    def amount_ok(value: float, end: int) -> bool:
+        if value in live or round(value * 100) in totals:
+            return True
+        context = _FIXED_CONTEXT.get(value)
+        if context is not None:
+            return bool(context.match(text, end))
+        return value in FIXED_ALLOWED_INR
 
-    bad = [m.group(0) for m in _AMOUNT_RE.finditer(text)
-           if not amount_ok(_amount_value(m.group(1), m.group(2)))]
+    bad = [written for value, written, _, end in _amounts(text) if not amount_ok(value, end)]
     if bad:
         reasons.append(f"rule 1 (₹ amount not allowed): {', '.join(bad)}")
 

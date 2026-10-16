@@ -186,7 +186,7 @@ class FalsePromisesStayHeld(unittest.TestCase):
 
     def test_an_approved_sentence_does_not_cover_another_one(self):
         self.assertEqual(rule2("Free shipping above ₹799. Use code GLAM20 for 20% off 🤍"),
-                         ["rule 2 (code/discount/refund/free words): code"])
+                         ["rule 2 (code/discount/refund/free words): code, 20% off"])
         self.assertTrue(rule2("Free shipping does apply on orders above ₹799, and you'll get a free pair 🤍"))
         self.assertTrue(rule2("There are no coupon codes right now. I'll refund you right away 🤍"))
         self.assertTrue(rule2("no coupon code needed — you get 20% off automatically"))
@@ -249,10 +249,15 @@ class FalsePromisesStayHeld(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertTrue(rule2(line))
 
-    def test_trigger_words_are_unchanged(self):
-        self.assertEqual(
-            output_guard._PROMO_WORDS_RE.pattern,
-            r"\b(codes?|coupons?|promos?|promo[- ]?codes?|discount\w*|refund\w*|cashbacks?|free\w*)\b")
+    def test_trigger_words_are_kept(self):
+        # Finding 7 approved statements; it never dropped a trigger word.
+        # Argon finding 6 added words ("on us", "15% off"...), so this checks
+        # every original word still triggers rather than the exact pattern.
+        for word in ("code", "codes", "coupon", "coupons", "promo", "promos", "promo code", "promo-codes",
+                     "discount", "discounted", "refund", "refundable", "cashback", "cashbacks",
+                     "free", "freebie"):
+            with self.subTest(word=word):
+                self.assertEqual(output_guard._PROMO_WORDS_RE.fullmatch(word).group(0), word)
 
 
 class BrainTemplates(unittest.TestCase):

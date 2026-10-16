@@ -3,7 +3,9 @@ Argon tests 7 and 14), checked against the code.
 
 Finding 4: trays_mentioned() added up every quantity in a message, so
 alternatives and restatements ("10 trays vs 12 trays", "is 10 trays 100
-pairs?") got the ₹749 bulk note.
+pairs?") got the ₹749 bulk note. Finding 5: "20+ trays" was left out of
+that note. Finding 6: output_guard.check_reply() sent money promises it
+had no word for ("15% off", "shipping is on us", "600 rupees").
 
 No live API call anywhere here.
 
@@ -16,6 +18,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+import output_guard  # noqa: E402
 from pricing_rules import (  # noqa: E402
     BULK_FREE_SHIPPING_LINE,
     bulk_quantity_note,
@@ -24,6 +27,8 @@ from pricing_rules import (  # noqa: E402
 )
 
 BRAIN = (REPO / "brain" / "brain.md").read_text(encoding="utf-8")
+# brain.md's product table, the startup prices before the first Shopify fetch.
+LIVE_PRICES = {249.0, 299.0, 499.0, 699.0, 849.0}
 
 
 class Finding4AlternativesAreNotAddedUp(unittest.TestCase):
@@ -142,6 +147,95 @@ class Finding5PlusQuantitiesCount(unittest.TestCase):
         self.assertIsNone(bulk_trays_asked("10+ trays ka rate?"))
         self.assertIn("does NOT apply", bulk_quantity_note("10+ trays ka rate?"))
         self.assertEqual(bulk_quantity_note("2+ pairs"), "")
+
+
+def guard(text, founder_notice=False):
+    return output_guard.check_reply(text, LIVE_PRICES, founder_notice=founder_notice)
+
+
+class Finding6MoneyPromisesAreHeld(unittest.TestCase):
+    """check_reply() returned [] for these, so they went out as AUTO."""
+
+    def assertHeldBy(self, text, rule, matched):
+        reasons = guard(text)
+        self.assertTrue(any(r.startswith(rule) and matched in r for r in reasons), (text, reasons))
+
+    def test_the_audit_examples(self):
+        for text, rule, matched in (
+            ("We can give you 15% off on this order!", "rule 2", "15% off"),
+            ("Shipping is complimentary on your order.", "rule 2", "complimentary"),
+            ("Shipping is on us for this one.", "rule 2", "on us"),
+            ("Paise wapas mil jayenge.", "rule 2", "Paise wapas"),
+            ("We will give you your money back.", "rule 2", "money back"),
+            ("It costs 600 rupees per tray.", "rule 1", "600 rupees"),
+            ("Each pair is ₹85 and a tray is ₹50.", "rule 1", "₹50"),
+            ("Shipping is ₹50 to Mumbai.", "rule 1", "₹50"),
+        ):
+            with self.subTest(text=text):
+                self.assertHeldBy(text, rule, matched)
+
+    def test_more_money_words(self):
+        for text, matched in (
+            ("We'll waive the shipping fee for you 🤍", "waive"),
+            ("We'll reimburse the shipping 🤍", "reimburse"),
+            ("Flat ₹100 off on your next order 🤍", "₹100 off"),
+            ("Get 20 percent off today", "20 percent off"),
+            ("Aapke paisa wapas aa jayenge", "paisa wapas"),
+            ("Shipping's on us 🤍", "on us"),
+        ):
+            with self.subTest(text=text):
+                self.assertHeldBy(text, "rule 2", matched)
+
+    def test_amounts_written_after_the_number(self):
+        for text, matched in (("That's 600 rs per tray", "600 rs"), ("It's just 600/- for the tray", "600/-"),
+                              ("GS1 is Rs 600/- only", "Rs 600")):
+            with self.subTest(text=text):
+                self.assertHeldBy(text, "rule 1", matched)
+        # Written once, counted once; a live price still passes either way.
+        self.assertEqual(guard("GS1 is Rs 849/-, GS2 is 849 rupees 🤍"), [])
+        self.assertEqual(guard("Rs 600/-"), ["rule 1 (₹ amount not allowed): Rs 600"])
+
+    def test_fixed_amounts_only_in_their_own_context(self):
+        for text, matched in (("A tray is ₹85", "₹85"), ("Each pair is ₹85", "₹85"),
+                              ("The Mink Duo is ₹12 per set", "₹12"), ("GS1 is ₹17", "₹17"),
+                              ("Delivery is ₹50", "₹50"), ("The Kawaii pair is ₹50 off", "₹50")):
+            with self.subTest(text=text):
+                self.assertHeldBy(text, "rule 1", matched)
+
+    def test_brain_md_uses_of_the_fixed_amounts_still_pass(self):
+        for text in (
+            "A tray works out to around ₹85 per pair, ~₹12–17 per wear 🤍",
+            "That's ~₹85/pair and ₹12 to ₹17 per wear 🤍",
+            "Just avoid the cheap ₹50 white glues 🤍",
+            "Cheaper lashes typically have heavy bands, shed after one wear, and the glue won't stick a second "
+            "time. Ours are reusable 5–7 times, lightweight, and a tray works out to around ₹85 per pair — "
+            "the math genuinely works out better long-term 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_normal_lash_talk_passes(self):
+        for text in (
+            "Peel the glue off gently, then take off the lash from the outer corner 🤍",
+            "Let the glue dry for 30 seconds before you put them on, and take them off slowly 🤍",
+            "You can always count on us for soft, lightweight lashes 🤍",
+            "Glue off the lash band first, then store them back in the tray 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
+
+    def test_the_approved_statements_still_send(self):
+        for text in (
+            "Refunds are initiated within 24–48 hours of approval, then reach UPI/bank accounts in 5–7 working "
+            "days and cards in 7–10 working days 🤍",
+            "There are no active discount codes at the moment 🤍",
+            "Our prices are already reduced from the original MRP — there's no additional discount available "
+            "at the moment. Free shipping does apply on orders above ₹799 though 🤍",
+            "Yes — 25 trays qualifies for our bulk rate of ₹749/tray (20+ trays, 200+ pairs) — "
+            f"{BULK_FREE_SHIPPING_LINE} 🤍",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard(text), [])
 
 
 if __name__ == "__main__":
