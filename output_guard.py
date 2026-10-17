@@ -7,13 +7,21 @@ and routed to DRAFT+APPROVE by the caller (app._ig_output_guard), so the
 founder sees exactly what the model wrote.
 
 Rules (each returns a short reason naming the rule and what matched):
-  1. A ₹ / Rs / INR amount that isn't allowed. The caller passes the live
-     Shopify prices; FIXED_ALLOWED_INR adds brain.md's fixed amounts. An
-     order total also passes when it is a sum of up to MAX_ORDER_ITEMS
-     live prices (repeats allowed) and at most ₹1,500 (the Hard Money
-     Threshold) — larger totals still go to a draft.
-  2. code, coupon, promo, discount, refund, cashback or "free", judged
-     sentence by sentence (_rule2_words): a clause with one of these words
+  1. A ₹ / Rs / INR amount that isn't allowed, written before the number
+     or after it ("600 rupees", "600 rs", "600/-"). The caller passes the
+     live Shopify prices; FIXED_ALLOWED_INR adds brain.md's fixed amounts,
+     and ₹85, ₹12, ₹17 and ₹50 pass only in their own context (per pair,
+     per wear, glue — _FIXED_CONTEXT), never as a tray, product or
+     shipping price. An order total also passes when it is a sum of up to
+     MAX_ORDER_ITEMS live prices (repeats allowed) and at most ₹1,500 (the
+     Hard Money Threshold) — larger totals still go to a draft. ₹699 (the
+     Mink Trio, and the founder-only bulk floor) is held as a per tray /
+     per pair / "each" price, and in a sentence about trays that doesn't
+     name the Mink Trio (_floor_as_tray_price).
+  2. code, coupon, promo, discount, refund, cashback, "free",
+     complimentary, "on us", waive, money back, reimburse, "paise wapas"
+     or an amount off ("15% off", "₹100 off"), judged sentence by
+     sentence (_rule2_words): a clause with one of these words
      passes only when it is one of brain.md's approved policy statements —
      free shipping above ₹799, no discount / no codes, the refund
      timeline, shipping charges being non-refundable, a replacement or
@@ -46,6 +54,14 @@ Rules (each returns a short reason naming the rule and what matched):
      with the reply (`founder_notice`: an ORDER / RESTOCK heads-up or a
      LEAD notice); on a plain AUTO reply nobody is told, so they're held
      too.
+  8. An action only the founder can do, claimed as done, under way or
+     coming (Argon test 14): cancelling an order ("cancelling it for
+     you", "I've cancelled", "your order has been / is cancelled",
+     "cancel kar diya / denge"), or placing or booking one ("I've placed
+     your order", "booked 25 trays for you", "order book kar diya").
+     Policy and inability pass ("once dispatched we're unable to cancel
+     it", "the team can help cancel it if it hasn't shipped"), and so does
+     "your order is cancelled" in a clause with if / once / when.
 
 Rollback: OUTPUT_GUARD_DISABLED=1 (see app._ig_output_guard).
 """
@@ -78,19 +94,53 @@ BRAND_HANDLE = "glamshelfstore"
 
 # ₹849 / ₹ 1,500 / Rs. 849 / INR 849 / ₹849.00
 _AMOUNT_RE = re.compile(r"(?:₹|\bRs\.?|\bINR)\s?(\d[\d,]*\d|\d)(\.\d{1,2})?", re.IGNORECASE)
+# The unit after the number: 600 rupees / 600 rs / 600/- (Argon finding 6).
+_AMOUNT_AFTER_RE = re.compile(
+    r"(?<![\w₹.,])(\d[\d,]*\d|\d)(\.\d{1,2})?\s?(?:rupees?\b|rupaye\b|rupaiye\b|rs\b\.?|inr\b|/-)",
+    re.IGNORECASE,
+)
 
-# Rule 2 trigger words.
+# brain.md's fixed amounts that are never a price of their own pass only in
+# their own context, right after the amount (Argon finding 6): "₹85 per
+# pair", "₹12–17 per wear", "cheap ₹50 white glues". "A tray is ₹50",
+# "Shipping is ₹50" and "Each pair is ₹85" are held.
+_PER_WEAR = r"\s?(?:/\s?wear|per wear|a wear)\b"
+_FIXED_CONTEXT = {
+    85.0: re.compile(r"\s?(?:/\s?pair|per pair|a pair)\b", re.IGNORECASE),
+    12.0: re.compile(rf"(?:\s?(?:-|–|—|to)\s?(?:₹\s?)?17)?{_PER_WEAR}", re.IGNORECASE),
+    17.0: re.compile(_PER_WEAR, re.IGNORECASE),
+    50.0: re.compile(r"(?:\s+[a-z-]+){0,2}\s+glues?\b", re.IGNORECASE),
+}
+
+# ₹699 is the Mink Trio's price and also the founder-only bulk floor:
+# brain.md says the twin never negotiates between ₹749 and ₹699 (Argon
+# test 7: "Best I can do is ₹699/tray for 40 trays" was sent). As a per
+# tray / per pair / "each" price it is always held; in a sentence that
+# mentions trays (or GS1-3) it is held unless the sentence names the Mink
+# Trio, so the product list's "Mink Trio — ₹699 · 3 faux mink pairs" passes.
+_FLOOR_PER_UNIT_RE = re.compile(r"\s?(?:/\s?(?:tray|pair)|per (?:tray|pair)|an? (?:tray|pair)|each)\b", re.IGNORECASE)
+_TRAY_WORD_RE = re.compile(r"\btrays?\b|\bgs\s?[1-3]\b", re.IGNORECASE)
+_MINK_TRIO_RE = re.compile(r"\bmink\s+trio\b", re.IGNORECASE)
+
+# Rule 2 trigger words. An amount off ("15% off", "₹100 off") counts; "take
+# off" and "peel the glue off" carry no amount and pass (Argon finding 6).
 _PROMO_WORDS_RE = re.compile(
-    r"\b(codes?|coupons?|promos?|promo[- ]?codes?|discount\w*|refund\w*|cashbacks?|free\w*)\b",
+    r"\b(codes?|coupons?|promos?|promo[- ]?codes?|discount\w*|refund\w*|cashbacks?|free\w*"
+    r"|complimentary|waiv\w*|reimburs\w*|money[- ]back|pais[ae]\s+(?:wapas|vapas|wapis|vapis)|on us)\b"
+    r"|(?<![\w.])\d+(?:\.\d+)?\s?(?:%|percent\b|per cent\b)\s?off\b"
+    r"|(?:₹|\brs\.?|\binr)\s?\d[\d,]*(?:\.\d{1,2})?\s?off\b"
+    r"|\b\d[\d,]*\s?(?:rupees?|rs\.?|inr)\s?off\b",
     re.IGNORECASE,
 )
 # Exempt wherever they appear, as since T1-4: cruelty-free (a product fact)
 # and the discount decline — neither promises anything. Free shipping used
 # to be here too; it now needs the ₹799 threshold (_FREE_SHIPPING_RULE).
+# "count on us" / "rely on us" aren't "on us" (free).
 _EXEMPT_PHRASES_RE = re.compile(
     r"cruelty[- ]free"
     r"|no (?:additional|extra|other) discounts?(?: (?:available|at the moment|right now))?"
-    r"|no active discount codes?",
+    r"|no active discount codes?"
+    r"|\b(?:rely|relying|count|counting|depend|depending|bank|banking) on us\b",
     re.IGNORECASE,
 )
 
@@ -335,6 +385,58 @@ def _followup_promises(text: str, founder_notice: bool) -> list[str]:
             if not any(s <= m.start() and m.end() <= e for s, e in allowed)]
 
 
+# Rule 8 (Argon test 14): only the founder cancels, places or books an
+# order. A reply saying Twin did, is doing or will do it is held:
+# "cancelling it for you", "I've cancelled order 1109", "we'll cancel it",
+# "cancel kar diya", "I've placed your order", "booked 25 trays for you".
+# Policy and inability pass — "once dispatched we're unable to cancel it",
+# "the team can help cancel it if it hasn't shipped" — and so does "we can
+# cancel it" (capability talk, as in rule 7).
+_ADVERBS = r"(?:(?:just|now|already|successfully|also|gone ahead and|went ahead and|go ahead and)\s+)*"
+_TWIN_DID = r"\b(?:i|we)(?:'ve| have| had|'d)?\s+" + _ADVERBS
+_TWIN_WILL = (r"\b(?:i'm|i am|we're|we are|i'll|i will|we'll|we will|let me|let us|let's)\s+"
+              r"(?:(?:going to|gonna)\s+)?" + _ADVERBS)
+_ORDER_OBJECT = (r"\s+(?:(?:your|the|an?|this|that|it|them)\s+)?(?:(?:\d+|new|bulk)\s+)?(?:[a-z0-9-]+\s+)?"
+                 r"(?:orders?|it|them|trays?|pairs?|sets?)\b")
+_ACTION_CLAIM_RE = re.compile(
+    rf"{_TWIN_DID}cancel(?:l)?ed\b"
+    rf"|{_TWIN_WILL}cancel(?:l)?(?:ing)?\b"
+    rf"|{_TWIN_DID}(?:placed|booked){_ORDER_OBJECT}"
+    rf"|{_TWIN_WILL}(?:plac(?:e|ing)|book(?:ing)?){_ORDER_OBJECT}"
+    # no subject: "Not a problem, cancelling it for you", "booked 25 trays
+    # for you" — the order right before "for you", so "once you've placed
+    # your order, we'll pack it for you" passes
+    r"|\b(?:cancel(?:l)?(?:ing|ed)|plac(?:ing|ed)|book(?:ing|ed))\s+"
+    r"(?:it|this|that|them|(?:your |the |this )?order(?:\s?#?\s?\d+)?|\d+\s+(?:trays?|pairs?|sets?)"
+    r"|(?:your|the|an?)\s+(?:[a-z0-9-]+\s+)?(?:orders?|trays?|pairs?|sets?))\s+for you\b"
+    # Hinglish: "cancel kar diya", "order book kar diya", "cancel kar denge"
+    r"|\b(?:cancel|book|place)\s+(?:kar|kr)\s*(?:diya|diye|di|denge|dunga|dungi|dete|deti|deta|chuke|chuki|chuka)\b",
+    re.IGNORECASE,
+)
+# The order said to be cancelled: "your order has been / is cancelled",
+# "order 1109 was cancelled", "cancel ho gaya". It passes in a clause with
+# if / once / when — "if your order is cancelled before it ships, …" is
+# the policy.
+_CANCELLED_STATE_RE = re.compile(
+    r"\b(?:(?:your|the|this) order|order\s?#?\s?\d+|it)(?:'s|\s+has|\s+have|\s+is|\s+was)\s+"
+    r"(?:(?:now|been|already|successfully|also)\s+)*cancel(?:l)?ed\b"
+    r"|\bcancel\s+ho\s+(?:gaya|gya|gayi|gyi|chuka|chuki|jayega|jaega|jayegi|jaegi)\b",
+    re.IGNORECASE,
+)
+_CONDITION_RE = re.compile(r"\b(?:if|once|when|whenever|unless|in case|agar|jab)\b", re.IGNORECASE)
+
+
+def _action_claims(text: str) -> list[str]:
+    """Rule 8's claims that Twin cancelled, placed or booked an order."""
+    text = (text or "").replace("’", "'")
+    found = [m.group(0) for m in _ACTION_CLAIM_RE.finditer(text)]
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        for clause in _CLAUSE_SPLIT_RE.split(sentence):
+            if not _CONDITION_RE.search(clause):
+                found += [m.group(0) for m in _CANCELLED_STATE_RE.finditer(clause)]
+    return found
+
+
 def _amount_value(digits: str, fraction: str | None) -> float:
     value = float(digits.replace(",", ""))
     if fraction:
@@ -369,10 +471,49 @@ def _normalize(clause: str) -> str:
     return re.sub(r"[\s.!?🤍\"']+$", "", c)
 
 
+def _amounts(text: str) -> list[tuple[float, str, int, int]]:
+    """Every ₹ amount in the reply, in order, as (value, as written, start,
+    end): "₹849", "Rs 849", "INR 849", and with the unit after the number,
+    "600 rupees", "600 rs", "600/-". "Rs 600/-" counts once."""
+    text = text or ""
+    found = [(m.start(), m.end(), m) for m in _AMOUNT_RE.finditer(text)]
+    for m in _AMOUNT_AFTER_RE.finditer(text):
+        if not any(s < m.end() and m.start() < e for s, e, _ in found):
+            found.append((m.start(), m.end(), m))
+    return [(_amount_value(m.group(1), m.group(2)), m.group(0), s, e) for s, e, m in sorted(found, key=lambda f: f[0])]
+
+
 def _order_amounts(text: str) -> list[float]:
     """₹ amounts in the reply that aren't per-unit prices."""
-    return [_amount_value(m.group(1), m.group(2)) for m in _AMOUNT_RE.finditer(text or "")
-            if not _PER_UNIT_RE.match(text, m.end())]
+    return [value for value, _, _, end in _amounts(text) if not _PER_UNIT_RE.match(text, end)]
+
+
+def _sentence_at(text: str, pos: int) -> str:
+    """The sentence (as rule 2 splits them) that holds position `pos`."""
+    start, end = 0, len(text)
+    for m in _SENTENCE_SPLIT_RE.finditer(text):
+        if m.end() <= pos:
+            start = m.end()
+        elif m.start() >= pos:
+            end = m.start()
+            break
+    return text[start:end]
+
+
+def _floor_as_tray_price(text: str) -> list[str]:
+    """₹699 stated as a tray or pair price (_FLOOR_PER_UNIT_RE, Argon test 7)."""
+    found = []
+    for value, written, start, end in _amounts(text):
+        if value != BULK_FLOOR_INR:
+            continue
+        unit = _FLOOR_PER_UNIT_RE.match(text, end)
+        if unit:
+            found.append(written + unit.group(0))
+            continue
+        sentence = _sentence_at(text, start)
+        if _TRAY_WORD_RE.search(sentence) and not _MINK_TRIO_RE.search(sentence):
+            found.append(written)
+    return found
 
 
 def _covered(clause: str, statements, words_re=_PROMO_WORDS_RE) -> bool:
@@ -447,15 +588,20 @@ def check_reply(text: str, allowed_amounts, founder_notice: bool = False) -> lis
     prices (_order_totals_paise). `founder_notice`: a founder notice goes
     out with this reply (rule 7)."""
     text = text or ""
-    allowed = set(FIXED_ALLOWED_INR) | {float(a) for a in allowed_amounts or ()}
+    live = {float(a) for a in allowed_amounts or ()}
     totals = _order_totals_paise(allowed_amounts)
     reasons: list[str] = []
 
-    def amount_ok(value: float) -> bool:
-        return value in allowed or round(value * 100) in totals
+    def amount_ok(value: float, end: int) -> bool:
+        if value in live or round(value * 100) in totals:
+            return True
+        context = _FIXED_CONTEXT.get(value)
+        if context is not None:
+            return bool(context.match(text, end))
+        return value in FIXED_ALLOWED_INR
 
-    bad = [m.group(0) for m in _AMOUNT_RE.finditer(text)
-           if not amount_ok(_amount_value(m.group(1), m.group(2)))]
+    bad = [written for value, written, _, end in _amounts(text) if not amount_ok(value, end)]
+    bad += [f"{written} (the founder-only bulk floor as a tray or pair price)" for written in _floor_as_tray_price(text)]
     if bad:
         reasons.append(f"rule 1 (₹ amount not allowed): {', '.join(bad)}")
 
@@ -498,5 +644,9 @@ def check_reply(text: str, allowed_amounts, founder_notice: bool = False) -> lis
     promises = _followup_promises(text, founder_notice)
     if promises:
         reasons.append(f"rule 7 (follow-up promise): {', '.join(promises)}")
+
+    claims = _action_claims(text)
+    if claims:
+        reasons.append(f"rule 8 (claims an order action only the founder can do): {', '.join(claims)}")
 
     return reasons
