@@ -8,3 +8,7 @@ sqlite-vec==0.1.9
 numpy==2.5.3
 fastembed==0.8.0
 langgraph==1.2.12
+fastapi==0.142.4
+starlette==1.7.0
+uvicorn==0.54.0
+a2wsgi==1.10.10
